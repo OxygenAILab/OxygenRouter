@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxygenrouter-core",
+    "crates/oxygenrouter-proxy",
+    "crates/oxygenrouter-webui",
+    "crates/oxygenrouter-bin",
+]
+
+[workspace.package]
+version     = "0.1.0-alpha.1"
+edition     = "2021"
+authors     = ["OxygenAILab"]
+license     = "MIT"
+homepage    = "https://github.com/OxygenAILab/OxygenRouter"
+repository  = "https://github.com/OxygenAILab/OxygenRouter"
+description = "OpenAI-compatible API gateway with channel rotation, model routing, and WebUI"
+rust-version = "1.75"
+
+[workspace.metadata.release]
+sign-commit = true

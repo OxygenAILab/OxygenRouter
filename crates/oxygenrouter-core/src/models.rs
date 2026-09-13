@@ -1,0 +1,650 @@
+//! Data models for OxygenRouter
+//!
+//! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default = "default_weight")]
+    pub weight: i32,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_test_model")]
+    pub test_model: String,
+    #[serde(default = "default_group_name")]
+    pub group_name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub model_list: Vec<String>,
+    #[serde(default)]
+    pub response_headers: serde_json::Value,
+    #[serde(default)]
+    pub status_code_mapping: serde_json::Value,
+    #[serde(default)]
+    pub override_parameters: serde_json::Value,
+    #[serde(default)]
+    pub balance_micros: i64,
+    #[serde(default)]
+    pub last_test_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub info: ChannelInfo,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Multi-key bookkeeping, mirrors NewAPI's ChannelInfo JSON column.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChannelInfo {
+    #[serde(default)]
+    pub is_multi_key: bool,
+    #[serde(default)]
+    pub multi_key_size: usize,
+    /// key index -> status (1 enabled, 2 manually disabled, 3 auto disabled)
+    #[serde(default)]
+    pub multi_key_status_list: std::collections::BTreeMap<usize, i32>,
+    #[serde(default)]
+    pub multi_key_disabled_reason: std::collections::BTreeMap<usize, String>,
+    #[serde(default)]
+    pub multi_key_disabled_time: std::collections::BTreeMap<usize, i64>,
+    #[serde(default)]
+    pub multi_key_polling_index: usize,
+    /// "random" | "polling"
+    #[serde(default = "default_multi_key_mode")]
+    pub multi_key_mode: String,
+}
+
+fn default_multi_key_mode() -> String {
+    "random".to_string()
+}
+
+impl Channel {
+    /// All keys of this channel (newline separated, blanks removed).
+    pub fn keys(&self) -> Vec<String> {
+        self.api_key
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Status of a key index (missing entry means enabled).
+    pub fn key_status(&self, index: usize) -> i32 {
+        self.info.multi_key_status_list.get(&index).copied().unwrap_or(1)
+    }
+
+    /// Next enabled key index (random or polling), mirrors NewAPI semantics.
+    pub fn next_enabled_key(&self) -> Option<(String, usize)> {
+        let keys = self.keys();
+        if keys.is_empty() {
+            return None;
+        }
+        if !self.info.is_multi_key || keys.len() == 1 {
+            return Some((keys[0].clone(), 0));
+        }
+        let enabled: Vec<usize> = (0..keys.len()).filter(|index| self.key_status(*index) == 1).collect();
+        if enabled.is_empty() {
+            return None;
+        }
+        let pick = if self.info.multi_key_mode == "polling" {
+            let start = self.info.multi_key_polling_index % keys.len();
+            enabled
+                .iter()
+                .copied()
+                .find(|index| *index >= start)
+                .unwrap_or(enabled[0])
+        } else {
+            // deterministic spread using current UTC nanoseconds as the entropy source
+            let seed = Utc::now().timestamp_nanos_opt().unwrap_or(0) as usize;
+            enabled[seed % enabled.len()]
+        };
+        Some((keys[pick].clone(), pick))
+    }
+
+    pub fn enabled_key_count(&self) -> usize {
+        let keys = self.keys();
+        (0..keys.len()).filter(|index| self.key_status(*index) == 1).count()
+    }
+}
+
+fn default_provider() -> String {
+    "openai".to_string()
+}
+
+fn default_weight() -> i32 {
+    1
+}
+fn default_true() -> bool {
+    true
+}
+fn default_test_model() -> String {
+    "gpt-3.5-turbo".to_string()
+}
+fn default_group_name() -> String {
+    "default".to_string()
+}
+
+impl Channel {
+    pub fn new(
+        name: String,
+        base_url: String,
+        api_key: String,
+        priority: i32,
+        weight: i32,
+        test_model: String,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            provider: "openai".to_string(),
+            base_url,
+            api_key,
+            priority,
+            weight,
+            enabled: true,
+            test_model,
+            group_name: default_group_name(),
+            tags: Vec::new(),
+            model_list: Vec::new(),
+            response_headers: serde_json::Value::Object(Default::default()),
+            status_code_mapping: serde_json::Value::Object(Default::default()),
+            override_parameters: serde_json::Value::Object(Default::default()),
+            balance_micros: 0,
+            last_test_at: None,
+            info: ChannelInfo::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMap {
+    #[serde(default)]
+    pub id: String,
+    pub channel_id: String,
+    pub pattern: String,
+    pub target_model: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+}
+
+impl ModelMap {
+    pub fn new(channel_id: String, pattern: String, target_model: String) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            channel_id,
+            pattern,
+            target_model,
+            enabled: true,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteRule {
+    pub id: String,
+    pub name: String,
+    pub rule_type: RouteType,
+    pub priority: i32,
+    pub enabled: bool,
+    pub config: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteType {
+    AutoHeuristic,
+    KeywordMatch,
+    TypeRouting,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub key: String,
+    pub name: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub quota_micros: i64,
+    #[serde(default)]
+    pub used_micros: i64,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    #[serde(default)]
+    pub ip_allowlist: Vec<String>,
+    #[serde(default = "default_group_name")]
+    pub group_name: String,
+    #[serde(default = "default_true")]
+    pub cross_group_retry: bool,
+}
+
+impl ApiKey {
+    pub fn new(key: String, name: String) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            key,
+            name,
+            priority: 0,
+            enabled: true,
+            created_at: Utc::now(),
+            expires_at: None,
+            quota_micros: 0,
+            used_micros: 0,
+            allowed_models: Vec::new(),
+            ip_allowlist: Vec::new(),
+            group_name: default_group_name(),
+            cross_group_retry: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLog {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub model: Option<String>,
+    pub channel_id: Option<String>,
+    pub api_key_id: Option<String>,
+    pub status_code: Option<u16>,
+    pub error: Option<String>,
+    pub tokens_used: Option<i64>,
+    pub duration_ms: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub listen_host: String,
+    pub listen_port: u16,
+    pub local_api_token: String,
+    pub open_browser_on_start: bool,
+    pub db_path: String,
+    pub log_level: String,
+    pub max_retries: i32,
+    pub retry_delay_ms: i64,
+    pub retry_backoff: String,
+    pub upstream_timeout_ms: u64,
+    pub user_agent: String,
+    pub max_concurrent_requests: i32,
+    pub request_log_retention_days: i32,
+    pub theme: String,
+    pub language: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 3001,
+            local_api_token: Uuid::new_v4().to_string(),
+            open_browser_on_start: true,
+            db_path: "oxygenrouter.db".to_string(),
+            log_level: "info".to_string(),
+            max_retries: 3,
+            retry_delay_ms: 500,
+            retry_backoff: "exponential".to_string(),
+            upstream_timeout_ms: 120_000,
+            user_agent: "OxygenRouter/0.1.0".to_string(),
+            max_concurrent_requests: 64,
+            request_log_retention_days: 30,
+            theme: "dark".to_string(),
+            language: "auto".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    pub model: String,
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelTestResult {
+    pub channel_id: String,
+    pub success: bool,
+    pub latency_ms: Option<i64>,
+    pub error: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemStatus {
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub total_channels: i64,
+    pub enabled_channels: i64,
+    pub total_requests: i64,
+    pub active_requests: i64,
+    pub local_api_token: String,
+    pub listen_host: String,
+    pub listen_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSnapshot {
+    pub range_start: String,
+    pub range_end: String,
+    pub bucket_seconds: i64,
+    pub total_requests: i64,
+    pub successful_requests: i64,
+    pub failed_requests: i64,
+    pub success_rate: f64,
+    pub average_latency_ms: f64,
+    pub today_requests: i64,
+    pub today_errors: i64,
+    pub total_tokens: i64,
+    pub active_channels: i64,
+    pub model_breakdown: Vec<DashboardBreakdown>,
+    pub channel_breakdown: Vec<DashboardBreakdown>,
+    pub api_key_breakdown: Vec<DashboardBreakdown>,
+    pub recent_requests: Vec<RequestLog>,
+    pub time_series: Vec<TimeBucket>,
+    pub model_time_series: Vec<ModelTimeBucket>,
+    pub api_key_time_series: Vec<ModelTimeBucket>,
+    pub channel_perf: Vec<ChannelPerf>,
+    pub time_range: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeBucket {
+    pub label: String,
+    pub requests: i64,
+    pub errors: i64,
+    pub latency_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTimeBucket {
+    pub label: String,
+    pub model: String,
+    pub requests: i64,
+    pub errors: i64,
+    pub tokens: i64,
+    pub latency_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AnalyticsFilters {
+    pub model: Option<String>,
+    pub channel_id: Option<String>,
+    pub api_key_id: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsFlow {
+    pub range_start: String,
+    pub range_end: String,
+    pub nodes: Vec<AnalyticsFlowNode>,
+    pub links: Vec<AnalyticsFlowLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsFlowNode {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsFlowLink {
+    pub source: String,
+    pub target: String,
+    pub request_count: i64,
+    pub tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPerf {
+    pub channel_id: String,
+    pub channel_name: String,
+    pub requests: i64,
+    pub errors: i64,
+    pub latency_ms: f64,
+    pub last_error: Option<String>,
+    pub last_test_at: Option<i64>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardBreakdown {
+    pub name: String,
+    pub requests: i64,
+    pub errors: i64,
+    pub average_latency_ms: f64,
+    pub tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiResponse<T> {
+    pub success: bool,
+    pub data: Option<T>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyUsage {
+    pub api_key_id: String,
+    pub api_key_name: String,
+    pub enabled: bool,
+    pub total_requests: i64,
+    pub successful_requests: i64,
+    pub total_tokens: i64,
+    pub average_latency_ms: f64,
+}
+
+/// Persistent model metadata registry (NewAPI `models` table parity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMetadata {
+    #[serde(default)]
+    pub id: String,
+    pub model_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    /// 0 exact, 1 prefix, 2 contains, 3 suffix
+    #[serde(default)]
+    pub name_rule: i32,
+    #[serde(default = "default_one")]
+    pub status: i32,
+    #[serde(default = "default_one")]
+    pub sync_official: i32,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
+    pub updated_at: DateTime<Utc>,
+}
+
+fn default_one() -> i32 {
+    1
+}
+
+/// Multi-key management view for a single key slot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelKeyStatus {
+    pub index: usize,
+    pub preview: String,
+    pub status: i32,
+    pub disabled_reason: Option<String>,
+    pub disabled_time: Option<i64>,
+}
+
+impl<T> ApiResponse<T> {
+    pub fn ok(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
+    }
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(msg.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    Admin,
+    User,
+}
+
+impl UserRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::User => "user",
+        }
+    }
+    pub fn from_db(value: &str) -> Self {
+        if value == "admin" {
+            Self::Admin
+        } else {
+            Self::User
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    pub email: String,
+    pub role: UserRole,
+    pub status: String,
+    pub balance_micros: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSession {
+    pub id: String,
+    pub user_id: String,
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: String,
+    pub user_id: String,
+    pub amount_micros: i64,
+    pub balance_after_micros: i64,
+    pub kind: String,
+    pub description: String,
+    pub reference_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionPlan {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub price_micros: i64,
+    pub quota_micros: i64,
+    pub duration_days: i64,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subscription {
+    pub id: String,
+    pub user_id: String,
+    pub plan_id: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedemptionCode {
+    pub id: String,
+    pub code: String,
+    pub amount_micros: i64,
+    pub plan_id: Option<String>,
+    pub enabled: bool,
+    pub max_uses: i64,
+    pub used_count: i64,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentOrder {
+    pub id: String,
+    pub user_id: String,
+    pub amount_micros: i64,
+    pub provider: String,
+    pub status: String,
+    pub external_reference: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthenticatedUser {
+    pub user: User,
+    pub expires_at: DateTime<Utc>,
+}

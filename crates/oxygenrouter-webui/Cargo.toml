@@ -1,0 +1,28 @@
+[package]
+name          = "oxygenrouter-webui"
+version.workspace = true
+edition.workspace = true
+
+[features]
+embed-webui = ["dep:include_dir"]
+
+[dependencies]
+tokio       = { version = "1", features = ["full"] }
+axum        = { version = "0.7", features = ["macros"] }
+tower        = { version = "0.4", features = ["util"] }
+tower-http   = { version = "0.5", features = ["fs", "cors"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+futures-util = "0.3"
+reqwest     = { version = "0.12", features = ["json"] }
+async-stream = "0.3"
+uuid        = { version = "1", features = ["v4"] }
+chrono       = { version = "0.4", features = ["serde"] }
+parking_lot  = "0.12"
+include_dir  = { version = "0.7", optional = true }
+mime_guess   = "2"
+bytes        = "1"
+rusqlite     = "0.31"
+
+oxygenrouter-core  = { path = "../oxygenrouter-core" }
+oxygenrouter-proxy = { path = "../oxygenrouter-proxy" }

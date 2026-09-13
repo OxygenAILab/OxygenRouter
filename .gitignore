@@ -1,0 +1,45 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Frontend
+node_modules/
+**/node_modules/
+**/dist/
+**/.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data (DO NOT commit user secrets)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+config.json
+
+# Session files
+.opencode-data/
+.claude/
+.cherry_migration/
+.trae/
+.qwen-agent-sessions/
+.devlogs/*.log
+
+# Releases
+releases/
+release/
+
+# Development artifacts (screenshots, session outputs, verification scripts)
+.devlogs/
+*.png
+xbenefit_*/
+xbenefit_*.png
