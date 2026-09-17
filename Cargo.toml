@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/oxygenrouter-core",
     "crates/oxygenrouter-proxy",
+    "crates/oxygenrouter-relay",
     "crates/oxygenrouter-webui",
     "crates/oxygenrouter-bin",
 ]

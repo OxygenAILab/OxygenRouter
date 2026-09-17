@@ -178,10 +178,15 @@ For documentation files (`*.md`), put it on a comment line near the top.
 - [ ] `git status` is clean (no stray build artifacts)
 - [ ] `CHANGELOG.md` updated with this Alpha's notable changes
 
-## 12. Known limitations (Alpha 1)
+## 12. Known limitations (Alpha 1 → Alpha 2)
 
-- No multi-user / quota / billing
-- Only OpenAI-compatible upstream (no Anthropic / Gemini adapters yet)
+- ✅ Multi-user / quota / billing / subscriptions (SaaS stack) — landed in Alpha 1
+- ✅ Provider adapter layer `oxygenrouter-relay` — 9 adaptors (OpenAI, Anthropic,
+  Gemini, Bedrock+SigV4, Vertex, Ollama, Cohere, Azure, AdvancedCustom) with
+  bidirectional OpenAI↔Claude / OpenAI↔Gemini conversion and SSE translation.
+  See `docs/SUPERSET_ROADMAP.md` for the NewAPI-parity plan.
+- Relay crate is built and tested but NOT yet wired into the live proxy path —
+  `oxygenrouter-webui/src/proxy.rs` still uses the legacy pass-through client
 - Local API key check is permissive — any `Bearer xxx` accepted (only channel credentials are validated upstream)
 - No HTTPS for local server (rely on local trust)
 - Model map uses simple glob patterns; no full regex
