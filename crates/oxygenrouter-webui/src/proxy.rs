@@ -65,6 +65,8 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "GET  /v1/models",
     "GET  /v1/models/:model",
     "DELETE /v1/models/:model",
+    "GET  /v1beta/models",
+    "GET  /v1beta/openai/models",
 ];
 
 pub fn router(state: std::sync::Arc<AppState>) -> Router {
@@ -85,6 +87,11 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         // --- Google Gemini native inbound ---------------------------------
         // A client that speaks Gemini posts to /v1beta/models/<model>:<verb>.
         .route("/v1beta/models/*path", any(gemini_inbound))
+        // Service discovery: the Gemini client asks for the catalogue here, so
+        // without this route a Gemini SDK cannot list models at all.
+        .route("/v1beta/models", any(list_models_gemini))
+        // The OpenAI-compatible alias the reference also serves.
+        .route("/v1beta/openai/models", any(list_models))
         // --- Audio ---------------------------------------------------------
         .route("/v1/audio/speech", any(audio_speech))
         .route("/v1/audio/transcriptions", any(audio_transcription))
@@ -465,10 +472,21 @@ fn build_streaming_response(body: Vec<u8>, status: u16, headers: &[(String, Stri
 /// `owned_by` is the channel's provider for source 1, and the registry vendor
 /// (falling back to the provider) for source 2. The synthetic `auto` entry is
 /// always present because the router accepts it.
-async fn list_models(State(state): State<std::sync::Arc<AppState>>) -> Response {
+/// Collect the catalogue, keeping the endpoint families each model supports.
+///
+/// Channels are consulted first so a callable model wins over catalogued
+/// metadata; metadata then fills in models no enabled channel serves, which is
+/// what lets the console show a catalogue before any channel is configured.
+fn model_catalogue(state: &AppState) -> Vec<crate::model_list::ModelEntry> {
+    use crate::model_list::ModelEntry;
     use std::collections::BTreeMap;
 
-    let mut owned: BTreeMap<String, String> = BTreeMap::new();
+    // The reference stamps every model with the same fixed epoch
+    // (`controller.ListModels`); matching it keeps this field stable across
+    // listings rather than churning per request.
+    const CATALOGUE_EPOCH: i64 = 1626777600;
+
+    let mut entries: BTreeMap<String, ModelEntry> = BTreeMap::new();
 
     if let Ok(channels) = state.db.get_enabled_channels() {
         for channel in channels {
@@ -482,7 +500,14 @@ async fn list_models(State(state): State<std::sync::Arc<AppState>>) -> Response 
                 if model.is_empty() {
                     continue;
                 }
-                owned.entry(model.to_string()).or_insert(provider.clone());
+                entries.entry(model.to_string()).or_insert_with(|| ModelEntry {
+                    id: model.to_string(),
+                    owned_by: provider.clone(),
+                    created: CATALOGUE_EPOCH,
+                    display_name: model.to_string(),
+                    description: None,
+                    endpoints: Vec::new(),
+                });
             }
         }
     }
@@ -497,35 +522,96 @@ async fn list_models(State(state): State<std::sync::Arc<AppState>>) -> Response 
             } else {
                 entry.vendor.clone()
             };
-            owned.entry(entry.id.clone()).or_insert(vendor);
+            let display_name = if entry.model_name.trim().is_empty() {
+                entry.id.clone()
+            } else {
+                entry.model_name.clone()
+            };
+            let description = entry
+                .description
+                .trim()
+                .is_empty()
+                .then_some(())
+                .map_or(Some(entry.description.clone()), |_| None);
+            entries
+                .entry(entry.id.clone())
+                .and_modify(|existing| {
+                    // A channel already claims it, but the registry may still
+                    // carry the richer endpoint list and description.
+                    if !entry.endpoints.is_empty() {
+                        existing.endpoints = entry.endpoints.clone();
+                    }
+                    if existing.description.is_none() {
+                        existing.description = description.clone();
+                    }
+                })
+                .or_insert_with(|| ModelEntry {
+                    id: entry.id.clone(),
+                    owned_by: vendor,
+                    created: CATALOGUE_EPOCH,
+                    display_name,
+                    description,
+                    endpoints: entry.endpoints.clone(),
+                });
         }
     }
 
-    let mut data: Vec<serde_json::Value> = owned
-        .into_iter()
-        .map(|(id, owner)| {
-            serde_json::json!({
-                "id": id,
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": owner,
-            })
-        })
-        .collect();
-    data.push(serde_json::json!({
-        "id": "auto",
-        "object": "model",
-        "created": 1700000000,
-        "owned_by": "system",
-    }));
+    // `auto` is our routing heuristic, not a model anyone serves, so it is
+    // advertised alongside the real catalogue.
+    entries
+        .entry("auto".to_string())
+        .or_insert_with(|| ModelEntry {
+            id: "auto".to_string(),
+            owned_by: "system".to_string(),
+            created: CATALOGUE_EPOCH,
+            display_name: "auto".to_string(),
+            description: Some("Automatic model routing".to_string()),
+            endpoints: vec!["openai".to_string()],
+        });
 
-    let payload = serde_json::json!({ "object": "list", "data": data });
+    entries.into_values().collect()
+}
+
+/// `GET /v1/models`, in the dialect the client's credentials imply.
+async fn list_models(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let query = request.uri().query().unwrap_or("").to_string();
+    let query_key = query.split('&').find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(k, _)| *k == "key")
+            .map(|(_, v)| v.to_string())
+    });
+    let dialect =
+        crate::model_list::dialect_from_headers(request.headers(), query_key.as_deref());
+
+    let catalogue = model_catalogue(&state);
+    let payload = crate::model_list::render(&catalogue, dialect);
+    json_ok(payload)
+}
+
+/// A 200 JSON response.
+fn json_ok(payload: serde_json::Value) -> Response {
     (
         StatusCode::OK,
         [("content-type", "application/json")],
         serde_json::to_string(&payload).unwrap_or_default(),
     )
         .into_response()
+}
+
+/// `GET /v1beta/models` — the Gemini client's service-discovery endpoint.
+///
+/// Gemini shape is implied by the route itself, so the credential headers are not
+/// inspected: a client that reaches this path wants Gemini shape even if it
+/// authenticated with a bearer token.
+async fn list_models_gemini(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    let catalogue = model_catalogue(&state);
+    json_ok(crate::model_list::render(
+        &catalogue,
+        crate::model_list::ModelListDialect::Gemini,
+    ))
 }
 
 /// Shared dispatch helper for the OpenAI-style proxy endpoints.
@@ -1559,28 +1645,188 @@ mod tests {
 #[test]
     fn every_supported_endpoint_is_registered_in_the_router() {
         // Regression guard: a handler can exist, compile and be listed in
-        // SUPPORTED_ENDPOINTS while its route was never added, in which case
-        // the request falls through to the 404 fallback. This asserts the
-        // router actually carries one route per advertised endpoint.
-        let advertised: Vec<&str> = SUPPORTED_ENDPOINTS
-            .iter()
-            .map(|entry| {
-                entry
-                    .split_once(' ')
-                    .map(|(_, path)| path)
-                    .unwrap_or(entry)
-            })
-            .collect();
+        // SUPPORTED_ENDPOINTS while its route was never added, in which case the
+        // request falls through to the 404 fallback. Asserting against the
+        // advertised list only proves the two agree, not that either is right, so
+        // this drives real requests through the real router and checks that none
+        // of them reach the fallback.
+        //
+        // A 404 body carrying `known_endpoints` is the fallback's signature.
+        let app = router(test_state());
+        let runtime = test_runtime();
 
-        // Paths handled outside this module (the static WebUI) are excluded.
-        assert!(advertised.contains(&"/v1/chat/completions"));
-        assert!(advertised.contains(&"/v1/files"));
-        assert!(advertised.contains(&"/v1/batches"));
-        assert!(advertised.contains(&"/v1/fine-tunes"));
-        assert!(advertised.contains(&"/v1beta/models/*path"));
-        assert!(advertised.contains(&"/v1/messages/count_tokens"));
-        assert!(advertised.contains(&"/v1/moderations"));
-        assert!(advertised.contains(&"/v1/engines/:model/embeddings"));
+        for entry in SUPPORTED_ENDPOINTS {
+            let (method, path) = entry
+                .split_once(' ')
+                .expect("SUPPORTED_ENDPOINTS entries are `METHOD /path`");
+            let path = path.trim().replace(":model", "x").replace(":id", "x");
+
+            let (status, text) = call(&app, &runtime, method.trim(), &path);
+            assert!(
+                !text.contains("known_endpoints"),
+                "{entry} fell through to the 404 fallback (status {status})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_model_listing_routes_answer_their_own_dialect() {
+        // A route can exist while resolving to the *wrong* handler. `/v1beta/models`
+        // sits beside the `/v1beta/models/*path` wildcard, and the wildcard happily
+        // swallows `/v1beta/models` too -- so a missing exact route is invisible
+        // from the status code alone (the wildcard answers 200 with an error body).
+        // The observable difference is the shape, so the shape is what is asserted.
+        let app = router(test_state());
+        let runtime = test_runtime();
+
+        let (status, body) = call(&app, &runtime, "GET", "/v1beta/models");
+        assert_eq!(status, 200, "Gemini catalogue route: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(
+            parsed.get("models").is_some(),
+            "`/v1beta/models` must answer the Gemini envelope, not the wildcard's body: {body}"
+        );
+        assert!(parsed["models"].is_array());
+
+        let (status, body) = call(&app, &runtime, "GET", "/v1beta/openai/models");
+        assert_eq!(status, 200, "Gemini-compatible OpenAI route: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            parsed["object"], "list",
+            "`/v1beta/openai/models` must answer OpenAI shape: {body}"
+        );
+    }
+
+    #[test]
+    fn the_model_list_dialect_follows_the_client_credentials() {
+        // `/v1/models` is one route serving three shapes, chosen by the
+        // credential headers. Asserting through the router (rather than calling
+        // the detector directly) is what proves the handler actually consults
+        // them: a handler that hard-coded OpenAI shape would pass a detector-only
+        // test and still break every Anthropic and Gemini SDK.
+        let app = router(test_state());
+        let runtime = test_runtime();
+
+        let (status, body) = call_with(
+            &app,
+            &runtime,
+            "GET",
+            "/v1/models",
+            &[
+                ("x-api-key", "test-token"),
+                ("anthropic-version", "2023-06-01"),
+            ],
+        );
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            parsed["data"][0]["type"], "model",
+            "an Anthropic credential must yield Anthropic shape: {body}"
+        );
+        assert!(
+            parsed.get("object").is_none(),
+            "the OpenAI envelope must not leak into the Anthropic shape: {body}"
+        );
+        assert!(parsed.get("first_id").is_some());
+
+        let (status, body) = call_with(
+            &app,
+            &runtime,
+            "GET",
+            "/v1/models",
+            &[("x-goog-api-key", "test-token")],
+        );
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(
+            parsed["models"].is_array(),
+            "a Gemini credential must yield the Gemini envelope: {body}"
+        );
+
+        // The default client still gets OpenAI shape.
+        let (status, body) = call(&app, &runtime, "GET", "/v1/models");
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["object"], "list");
+        assert!(parsed["data"][0].get("object").is_some());
+    }
+
+    /// Drive one request through the real router and return (status, body).
+    fn call(app: &Router, runtime: &tokio::runtime::Runtime, method: &str, path: &str) -> (u16, String) {
+        call_with(app, runtime, method, path, &[])
+    }
+
+    /// As [`call`], but with extra request headers. An empty name/value pair is
+    /// the empty list; `authorization` is always sent.
+    fn call_with(
+        app: &Router,
+        runtime: &tokio::runtime::Runtime,
+        method: &str,
+        path: &str,
+        extra: &[(&str, &str)],
+    ) -> (u16, String) {
+        let app = app.clone();
+        let (method, path) = (method.to_string(), path.to_string());
+        let extra: Vec<(String, String)> = extra
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let response = runtime.block_on(async move {
+            use tower::ServiceExt;
+            let mut builder = axum::http::Request::builder()
+                .method(method.as_str())
+                .uri(&path)
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json");
+            for (k, v) in &extra {
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+            let request = builder
+                .body(axum::body::Body::from("{}"))
+                .expect("request builds");
+            app.oneshot(request).await.expect("router responds")
+        });
+        let status = response.status().as_u16();
+        let body = runtime.block_on(async {
+            axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap_or_default()
+        });
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    /// A real `AppState` backed by a temporary database, for router tests.
+    fn test_state() -> std::sync::Arc<AppState> {
+        use oxygenrouter_core::ChannelSelector;
+        use oxygenrouter_proxy::{ChannelScheduler, RelayClient};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("router-test.db");
+        // The directory is leaked deliberately: `AppState` holds only the path,
+        // and the file must outlive this function for the router to serve reads.
+        let config_path = dir.path().join("config.json");
+        std::mem::forget(dir);
+
+        let db = std::sync::Arc::new(
+            oxygenrouter_core::Database::new(&db_path).expect("database opens"),
+        );
+        let selector = ChannelSelector::new(std::sync::Arc::clone(&db));
+        let relay = RelayClient::new("OxygenRouter-test".to_string(), 5_000);
+        let scheduler = ChannelScheduler::new(selector, relay);
+        std::sync::Arc::new(AppState::new(
+            db,
+            db_path,
+            scheduler,
+            "test-token".to_string(),
+            config_path,
+        ))
     }
 
     #[test]

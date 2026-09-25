@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P4 — model listing dialects)
+- **`GET /v1/models` now answers in the client's own dialect, and the Gemini
+  discovery routes exist.** Ours returned OpenAI shape to everyone, so an
+  Anthropic or Gemini SDK could not parse the list; `GET /v1beta/models` — the
+  Gemini client's service-discovery route — 404'd outright. The dialect is
+  resolved from the credential headers the same way the reference does
+  (`router/relay-router.go:25-43`): `x-api-key` + `anthropic-version` is
+  Anthropic, `x-goog-api-key` or `?key=` is Gemini, anything else OpenAI.
+  New `crates/oxygenrouter-webui/src/model_list.rs`; routes `GET /v1beta/models`
+  and `GET /v1beta/openai/models` added.
+- OpenAI items now carry `supported_endpoint_types`, the field that tells an SDK
+  which dialects a model id may be called through.
+
+### Verified (P4 — model listing dialects)
+- Field names are an exact match against the live reference, checked by comparing
+  key sets rather than by eye. OpenAI: `data`/`object`/`success`, items with
+  `created`/`id`/`object`/`owned_by`/`supported_endpoint_types`. Anthropic:
+  `data`/`first_id`/`has_more`/`last_id`, items with
+  `created_at`/`display_name`/`id`/`type`. Gemini: `models`/`nextPageToken`, items
+  with all thirteen fields the reference emits. `created_at` is RFC 3339
+  (`2021-07-20T10:40:00Z`), not a unix integer — the type is what an Anthropic SDK
+  validates. All three credential styles and both new routes verified live.
+- The router test drives real requests through the real `Router`, because
+  `/v1beta/models` sits beside the `/v1beta/models/*path` wildcard, which answers
+  the exact path too — so a missing exact route returns `200` with the wrong body
+  and a status check cannot see it. The guard asserts the shape instead. Removing
+  either route, or bypassing the dialect detection, makes it fail (all three
+  mutation-verified).
+- `cargo test --workspace` → **302 passed / 0 failed**, zero warnings.
+
 ### Added (P4 — Gemini dialect)
 - **A Gemini client can now use an OpenAI channel.** `convert/gemini_to_openai_request.rs`
   translates `generateContent` shape both ways — request (`contents[].role` `model`→

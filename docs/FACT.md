@@ -39,7 +39,8 @@ This document records verified project facts. Update it whenever a fact changes.
 - `/v1/fine_tuning/jobs` (+ `:id`, `:id/cancel`, `:id/events`)
 - `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`
 - `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations`
-- `/v1/models`, `/v1/models/:model` (both derived from the database)
+- `/v1/models` (three dialects), `/v1beta/models`, `/v1beta/openai/models`,
+  `/v1/models/:model` (both list routes derived from the database)
 
 ### Client dialect is honoured on an OpenAI channel (verified 2026-09-26)
 
@@ -154,13 +155,47 @@ as an upstream channel:
 | Non-streaming chat via the OpenAI adaptor | `200`, real usage `prompt=18 completion=16` |
 | Streaming chat (SSE) | `200 text/event-stream`, 25 `data:` frames |
 | Channel configured as `provider=anthropic` (Claude path) | `200`, Claude→OpenAI response conversion, usage preserved |
-| `GET /v1/models` | DB-derived: the channel's model plus `auto` |
+| `GET /v1/models` | DB-derived, three dialects (see below): channel models, registry entries, plus `auto` |
 | Request log | every attempt recorded with channel id, status, duration |
 
 **Still open:** the relay client buffers streaming bodies before adaptor
-translation, so time-to-first-token is not yet incremental; and inbound-format
-selection is wired but response shaping for native `/v1/messages` clients still
-returns OpenAI-shaped JSON. Both are tracked in the superset analysis (§5.2).
+translation, so time-to-first-token is not yet incremental. (The other item that
+was listed here — native `/v1/messages` clients receiving OpenAI-shaped JSON — is
+fixed; see "Client dialect is honoured on an OpenAI channel".)
+
+### Model listing speaks three dialects (2026-09-26)
+
+`GET /v1/models` answered OpenAI shape to every client, so an Anthropic or Gemini
+SDK could not parse it, and `GET /v1beta/models` — the Gemini client's
+service-discovery route — 404'd outright. The reference resolves the dialect from
+the credential headers (`router/relay-router.go:25-43`): `x-api-key` plus
+`anthropic-version` means Anthropic, `x-goog-api-key` (or `?key=`) means Gemini.
+We now do the same, in `crates/oxygenrouter-webui/src/model_list.rs`.
+
+Field names are an exact match against the live reference, verified by comparing
+the key sets rather than eyeballing the output:
+
+| Dialect | Top level | Item |
+|---|---|---|
+| OpenAI | `data`, `object`, `success` | `created`, `id`, `object`, `owned_by`, `supported_endpoint_types` |
+| Anthropic | `data`, `first_id`, `has_more`, `last_id` | `created_at`, `display_name`, `id`, `type` |
+| Gemini | `models`, `nextPageToken` | `baseModelId`, `description`, `displayName`, `inputTokenLimit`, `maxTemperature`, `name`, `outputTokenLimit`, `supportedGenerationMethods`, `temperature`, `thinking`, `topK`, `topP`, `version` |
+
+`created_at` is RFC 3339 (`2021-07-20T10:40:00Z`), not a unix integer — the field
+type, not just its name, is what an Anthropic SDK validates.
+
+Routes added: `GET /v1beta/models` (Gemini discovery) and
+`GET /v1beta/openai/models` (the OpenAI-compatible alias the reference also
+serves). Verified live: all three credential styles return their own dialect, and
+both new routes answer the right shape.
+
+**A route can exist and still be wrong.** `/v1beta/models` sits beside the
+`/v1beta/models/*path` wildcard, which swallows the exact path too — so a missing
+exact route answers `200` with the wildcard's body and an http-status check cannot
+see it. The guard therefore asserts the *shape* through the real router:
+`proxy::tests::the_model_listing_routes_answer_their_own_dialect` and
+`…::the_model_list_dialect_follows_the_client_credentials`. Removing either route,
+or bypassing the dialect detection, makes them fail (all three mutation-verified).
 
 ### Admin / user API
 60 routes in `crates/oxygenrouter-webui/src/api.rs`. Groups: channels, keys,

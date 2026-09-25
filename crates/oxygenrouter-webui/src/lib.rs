@@ -5,6 +5,7 @@
 pub mod api;
 pub mod billing_store;
 pub mod embed;
+pub mod model_list;
 pub mod proxy;
 mod state;
 
