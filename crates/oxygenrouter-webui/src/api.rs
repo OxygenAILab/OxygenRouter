@@ -1275,6 +1275,7 @@ async fn create_key(
         ip_allowlist: k.ip_allowlist,
         group_name: k.group_name,
         cross_group_retry: k.cross_group_retry,
+        user_id: k.user_id,
     };
     Json(match s.db.upsert_api_key(&k) {
         Ok(()) => ApiResponse::ok(k),

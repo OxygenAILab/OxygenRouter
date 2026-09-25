@@ -229,6 +229,11 @@ pub struct ApiKey {
     pub name: String,
     #[serde(default)]
     pub priority: i32,
+    /// Owning user, whose wallet pays for requests made with this key.
+    ///
+    /// Empty when the key is not wallet-backed.
+    #[serde(default)]
+    pub user_id: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "Utc::now")]
@@ -265,7 +270,21 @@ impl ApiKey {
             ip_allowlist: Vec::new(),
             group_name: default_group_name(),
             cross_group_retry: true,
+            user_id: String::new(),
         }
+    }
+
+    /// Bind this key to an owning user, whose wallet pays for its requests.
+    pub fn owned_by(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = user_id.into();
+        self
+    }
+
+    /// Set the key's spend ceiling in micros. `0` means unlimited, matching
+    /// NewAPI's semantics for a token without a quota ceiling.
+    pub fn with_quota(mut self, quota_micros: i64) -> Self {
+        self.quota_micros = quota_micros.max(0);
+        self
     }
 }
 

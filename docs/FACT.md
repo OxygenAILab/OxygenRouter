@@ -99,11 +99,47 @@ Subscriptions, Admin Users, Admin Billing.
 `subscriptions`, `redemption_codes`, `redemption_uses`, `payment_orders`.
 
 ### Test & build baseline (2026-09-25)
-- `cargo test --workspace` → **126 passed / 0 failed**
-  (`billing` 78 unit + 3 oracle-differential, `relay` 15 unit + 20 adaptor-contract,
-  `core` 5 unit + 5 config-compat, `proxy`/`webui` component tests)
+- `cargo test --workspace` → **163 passed / 0 failed**, zero build warnings
+  (`billing` 102 unit + 3 oracle-differential, `relay` 15 unit + 20 adaptor-contract,
+  `webui` 8 billing-store + 5 usage-mapping, `core` 5 unit + 5 config-compat)
 - `npm run build` (tsc + vite) → **passes** (2,032 modules)
 - `cargo check --workspace` → clean
+
+### Billing is live on the request path (verified end to end)
+
+Pre-consume → settle → refund now runs on real requests. Verified against a live
+upstream (the running NewAPI instance) on an isolated instance:
+
+| Check | Evidence |
+|---|---|
+| Wallet debited | `100,000,000 → 99,999,969` µ$ for one chat request |
+| Key usage moved | `api_keys.used_micros 0 → 31` |
+| Tokens recorded | `request_logs.tokens_used = 30` (was always `NULL` before) |
+| Charge arithmetic | `p=14, c=16` → `(14 + 16*3)/1e6 * 500000` = **31** ✓ |
+| Ledger written | `consume -31 "glm-5.3-flash via openai (tiered_expr)"` |
+| Ledger ⇄ wallet reconcile | `sum(ledger.amount_micros) == balance` exactly |
+| Streaming billed | SSE `200 text/event-stream`, 26 frames, `tokens_used=38`, charge `-43` |
+| **Failure refunds in full** | forced `502` from a dead upstream left the wallet **unchanged** (no ledger entry) |
+| Per-call models | `dall-e-3` charges with zero tokens |
+
+Three real gaps were found and fixed while wiring this, none of which unit tests
+alone would have caught:
+
+1. **`chat_completions` bypassed billing entirely.** Four handlers
+   (`chat_completions`, `text_completions`, `embeddings`, `image_generations`)
+   each re-implemented the dispatch logic instead of using the shared helper, so
+   the billing added to that helper never ran for the most-used endpoint. They
+   now delegate to one path (~240 duplicated lines removed).
+2. **Streaming was charged zero.** `dispatch_openai` hard-coded `stream: false`
+   when building the upstream request, so an SSE request was billed as an empty
+   non-streaming one and the response lost its `text/event-stream` content type.
+3. **`api_keys` had no owner.** Billing needs to know whose wallet pays; the
+   table had no `user_id`, so no request could be attributed. Added as an
+   idempotent migration, with `ApiKey::owned_by` for construction.
+
+Also fixed: the `Footer` option default leaked another project's watermark
+(`GitHub@NDBlockConnect | BlockConnect@StarsailsClover`); it now carries this
+repository's mark.
 
 ### Billing engine (P2) — verified against live production traffic
 

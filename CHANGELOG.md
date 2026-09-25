@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Billing is wired into the request path.** Pre-consume → settle → refund now runs on every relay
+  request that carries a wallet-backed key: the wallet is debited, the key's usage moves, and
+  `request_logs.tokens_used` is populated with the upstream's real token count (it was always `NULL`).
+  A failed request refunds in full; the ledger reconciles exactly with the wallet balance.
+- `api_keys.user_id` binds a key to the wallet that pays for its requests (idempotent migration, with
+  `ApiKey::owned_by`); without it no request could be attributed.
+
+### Changed
+- The four handlers that re-implemented dispatch (`chat_completions`, `text_completions`,
+  `embeddings`, `image_generations`) now delegate to the shared `dispatch_openai`, removing ~240
+  duplicated lines and routing every endpoint through one billing-aware path.
+- `dispatch_openai` takes an explicit `stream` flag; streaming requests are now billed from their
+  final SSE usage frame instead of being charged as empty non-streaming calls.
+
+### Fixed
+- **Streaming requests were charged zero and lost their content type.** `dispatch_openai` hard-coded
+  `stream: false`, so an SSE request was sent non-streaming and its response was typed
+  `application/json`. Drove found by end-to-end verification, not unit tests.
+- The `Footer` option default leaked another project's watermark
+  (`GitHub@NDBlockConnect | BlockConnect@StarsailsClover`); it now carries this repository's mark.
+
+### Verified
+- End-to-end against a live upstream: wallet `100,000,000 → 99,999,969` µ$ for one chat request,
+  `used_micros 0 → 31`, `tokens_used = 30`, charge arithmetic `(14 + 16*3)/1e6*500000 = 31` ✓,
+  ledger `sum == balance`, streaming `200 text/event-stream` with 26 frames and `tokens_used=38`,
+  and a forced upstream failure leaving the wallet byte-identical.
+- `cargo test --workspace` → **163 passed / 0 failed**, zero warnings.
+
+### Added (earlier)
 - **Billing & quota engine** — new crate `oxygenrouter-billing`.
   - Tiered billing expressions (`expr.rs`), the modern NewAPI pricing path: token variables with
     auto-exclusion, `tier`/`fixed`/`param`/`header`/`u`/`has`, math helpers, fixed-offset timezone

@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 use oxygenrouter_core::{ApiKey, ApiKeyResolutionError, RequestLog};
 use oxygenrouter_proxy::{ModelRouter, ProxyRequest};
+use oxygenrouter_billing::{BillingUsage, Charge, EvalContext};
 
 /// The set of OpenAI/Anthropic-style endpoints this proxy implements.
 /// Returned in 404 responses to help SDKs auto-discover.
@@ -220,6 +221,37 @@ fn log_request(
     error: Option<String>,
     duration_ms: i64,
 ) {
+    log_request_with_usage(
+        state,
+        method,
+        path,
+        model,
+        channel_id,
+        api_key_id,
+        status_code,
+        error,
+        duration_ms,
+        None,
+    );
+}
+
+/// Variant that records the upstream's token usage.
+///
+/// Kept separate so the dozen call sites that have no usage to report stay
+/// unchanged, and so the one path that does have it is explicit.
+#[allow(clippy::too_many_arguments)]
+fn log_request_with_usage(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    model: Option<String>,
+    channel_id: Option<String>,
+    api_key_id: Option<String>,
+    status_code: Option<u16>,
+    error: Option<String>,
+    duration_ms: i64,
+    tokens_used: Option<i64>,
+) {
     let log = RequestLog {
         id: Uuid::new_v4().to_string(),
         method: method.to_string(),
@@ -229,7 +261,7 @@ fn log_request(
         api_key_id,
         status_code,
         error,
-        tokens_used: None,
+        tokens_used,
         duration_ms,
         created_at: Utc::now(),
     };
@@ -242,7 +274,6 @@ async fn chat_completions(
     State(state): State<std::sync::Arc<AppState>>,
     request: Request,
 ) -> Response {
-    let start = Instant::now();
     let (headers, body_bytes) = read_body(request).await;
 
     let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -251,297 +282,47 @@ async fn chat_completions(
     };
 
     let stream = is_stream_request(&headers, &parsed);
-
-    let router = ModelRouter::new();
-    let decision = router.resolve_auto(&parsed, "/v1/chat/completions");
-    let key = match authorize(
-        &state,
-        &headers,
-        &decision.resolved_model,
+    dispatch_openai(
+        state,
         "/v1/chat/completions",
-        start,
-    ) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-
-    let proxy_req = ProxyRequest {
-        method: "POST".to_string(),
-        path: "/v1/chat/completions".to_string(),
-        headers: vec![],
-        body: Some(body_bytes),
-        model: decision.resolved_model.clone(),
+        body_bytes,
+        "gpt-3.5-turbo",
+        headers,
         stream,
-    };
-
-    let scheduler = state.scheduler.read().await;
-    let result = scheduler
-        .dispatch_for_group(
-            &proxy_req,
-            &decision.resolved_model,
-            key.as_ref().map(|k| k.group_name.as_str()),
-            key.as_ref().map(|k| k.cross_group_retry).unwrap_or(true),
-        )
-        .await;
-    drop(scheduler);
-
-    let duration_ms = start.elapsed().as_millis() as i64;
-    match result {
-        Ok(r) => {
-            log_request(
-                &state,
-                "POST",
-                "/v1/chat/completions",
-                Some(decision.resolved_model.clone()),
-                Some(r.channel_id.clone()),
-                key.as_ref().map(|k| k.id.clone()),
-                Some(r.status),
-                None,
-                duration_ms,
-            );
-            if stream {
-                build_streaming_response(r.body.to_vec(), r.status, &r.headers)
-            } else {
-                build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
-            }
-        }
-        Err(e) => {
-            let status = e.status();
-            log_request(
-                &state,
-                "POST",
-                "/v1/chat/completions",
-                Some(decision.resolved_model.clone()),
-                None,
-                key.as_ref().map(|k| k.id.clone()),
-                Some(status),
-                Some(e.to_string()),
-                duration_ms,
-            );
-            json_error(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                &e.to_string(),
-            )
-        }
-    }
+    )
+    .await
 }
 
 async fn text_completions(
     State(state): State<std::sync::Arc<AppState>>,
     request: Request,
 ) -> Response {
-    let start = Instant::now();
     let (headers, body_bytes) = read_body(request).await;
-    let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-
-    let router = ModelRouter::new();
-    let decision = router.resolve_auto(&parsed, "/v1/completions");
-    let model = decision.resolved_model.clone();
-    let key = match authorize(&state, &headers, &model, "/v1/completions", start) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-
-    let stream = is_stream_request(&headers, &parsed);
-    let proxy_req = ProxyRequest {
-        method: "POST".to_string(),
-        path: "/v1/completions".to_string(),
-        headers: vec![],
-        body: Some(body_bytes),
-        model: model.clone(),
-        stream,
-    };
-    let scheduler = state.scheduler.read().await;
-    let result = scheduler
-        .dispatch_for_group(
-            &proxy_req,
-            &model,
-            key.as_ref().map(|k| k.group_name.as_str()),
-            key.as_ref().map(|k| k.cross_group_retry).unwrap_or(true),
-        )
-        .await;
-    drop(scheduler);
-
-    let duration_ms = start.elapsed().as_millis() as i64;
-    match result {
-        Ok(r) => {
-            log_request(
-                &state,
-                "POST",
-                "/v1/completions",
-                Some(model),
-                Some(r.channel_id.clone()),
-                key.as_ref().map(|k| k.id.clone()),
-                Some(r.status),
-                None,
-                duration_ms,
-            );
-            if stream {
-                build_streaming_response(r.body.to_vec(), r.status, &r.headers)
-            } else {
-                build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
-            }
-        }
-        Err(e) => {
-            let status = e.status();
-            log_request(
-                &state,
-                "POST",
-                "/v1/completions",
-                Some(model),
-                None,
-                key.as_ref().map(|k| k.id.clone()),
-                Some(status),
-                Some(e.to_string()),
-                duration_ms,
-            );
-            json_error(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                &e.to_string(),
-            )
-        }
-    }
+    let stream = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .map(|v| is_stream_request(&headers, &v))
+        .unwrap_or(false);
+    dispatch_openai(state, "/v1/completions", body_bytes, "gpt-3.5-turbo", headers, stream).await
 }
 
 async fn embeddings(State(state): State<std::sync::Arc<AppState>>, request: Request) -> Response {
-    let start = Instant::now();
     let (headers, body_bytes) = read_body(request).await;
-    let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-
-    let router = ModelRouter::new();
-    let decision = router.resolve_auto(&parsed, "/v1/embeddings");
-    let model = decision.resolved_model.clone();
-    let key = match authorize(&state, &headers, &model, "/v1/embeddings", start) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-
-    let proxy_req = ProxyRequest {
-        method: "POST".to_string(),
-        path: "/v1/embeddings".to_string(),
-        headers: vec![],
-        body: Some(body_bytes),
-        model: model.clone(),
-        stream: false,
-    };
-    let scheduler = state.scheduler.read().await;
-    let result = scheduler
-        .dispatch_for_group(
-            &proxy_req,
-            &model,
-            key.as_ref().map(|k| k.group_name.as_str()),
-            key.as_ref().map(|k| k.cross_group_retry).unwrap_or(true),
-        )
-        .await;
-    drop(scheduler);
-
-    let duration_ms = start.elapsed().as_millis() as i64;
-    match result {
-        Ok(r) => {
-            log_request(
-                &state,
-                "POST",
-                "/v1/embeddings",
-                Some(model),
-                Some(r.channel_id.clone()),
-                key.as_ref().map(|k| k.id.clone()),
-                Some(r.status),
-                None,
-                duration_ms,
-            );
-            build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
-        }
-        Err(e) => {
-            let status = e.status();
-            log_request(
-                &state,
-                "POST",
-                "/v1/embeddings",
-                Some(model),
-                None,
-                key.as_ref().map(|k| k.id.clone()),
-                Some(status),
-                Some(e.to_string()),
-                duration_ms,
-            );
-            json_error(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                &e.to_string(),
-            )
-        }
-    }
+    dispatch_openai(
+        state,
+        "/v1/embeddings",
+        body_bytes,
+        "text-embedding-3-small",
+        headers,
+        false,
+    )
+    .await
 }
 
 async fn image_generations(
     State(state): State<std::sync::Arc<AppState>>,
     request: Request,
 ) -> Response {
-    let start = Instant::now();
     let (headers, body_bytes) = read_body(request).await;
-    let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-
-    let router = ModelRouter::new();
-    let decision = router.resolve_auto(&parsed, "/v1/images/generations");
-    let model = decision.resolved_model.clone();
-    let key = match authorize(&state, &headers, &model, "/v1/images/generations", start) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-
-    let proxy_req = ProxyRequest {
-        method: "POST".to_string(),
-        path: "/v1/images/generations".to_string(),
-        headers: vec![],
-        body: Some(body_bytes),
-        model: model.clone(),
-        stream: false,
-    };
-    let scheduler = state.scheduler.read().await;
-    let result = scheduler
-        .dispatch_for_group(
-            &proxy_req,
-            &model,
-            key.as_ref().map(|k| k.group_name.as_str()),
-            key.as_ref().map(|k| k.cross_group_retry).unwrap_or(true),
-        )
-        .await;
-    drop(scheduler);
-
-    let duration_ms = start.elapsed().as_millis() as i64;
-    match result {
-        Ok(r) => {
-            log_request(
-                &state,
-                "POST",
-                "/v1/images/generations",
-                Some(model),
-                Some(r.channel_id.clone()),
-                key.as_ref().map(|k| k.id.clone()),
-                Some(r.status),
-                None,
-                duration_ms,
-            );
-            build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
-        }
-        Err(e) => {
-            let status = e.status();
-            log_request(
-                &state,
-                "POST",
-                "/v1/images/generations",
-                Some(model),
-                None,
-                key.as_ref().map(|k| k.id.clone()),
-                Some(status),
-                Some(e.to_string()),
-                duration_ms,
-            );
-            json_error(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                &e.to_string(),
-            )
-        }
-    }
+    dispatch_openai(state, "/v1/images/generations", body_bytes, "dall-e-3", headers, false).await
 }
 
 fn add_response_headers(
@@ -676,6 +457,7 @@ async fn dispatch_openai(
     body_bytes: Vec<u8>,
     default_fallback_model: &str,
     headers: axum::http::HeaderMap,
+    stream: bool,
 ) -> Response {
     let start = Instant::now();
     let parsed: serde_json::Value =
@@ -703,7 +485,7 @@ async fn dispatch_openai(
             headers: vec![],
             body: Some(body_bytes),
             model: fallback.clone(),
-            stream: false,
+            stream,
         };
         return dispatch(state, path, fallback, proxy_req, start, headers, key).await;
     }
@@ -717,7 +499,7 @@ async fn dispatch_openai(
         headers: vec![],
         body: Some(body_bytes),
         model: model.clone(),
-        stream: false,
+        stream,
     };
     dispatch(state, path, model, proxy_req, start, headers, key).await
 }
@@ -731,6 +513,62 @@ async fn dispatch(
     _headers: axum::http::HeaderMap,
     api_key: Option<ApiKey>,
 ) -> Response {
+    let stream = proxy_req.stream;
+
+    // --- reserve before spending an upstream call -------------------------
+    //
+    // The reservation is deliberately keyed on the *client-supplied* body, not
+    // the translated one, because the estimate only needs to be conservative.
+    // A key with no owning user is not wallet-backed, so it is not billed here
+    // (channel-only deployments keep working unchanged).
+    let reservation = match billing_target(&state, &api_key) {
+        Some((key_id, user_id)) => {
+            let body: serde_json::Value = proxy_req
+                .body
+                .as_deref()
+                .and_then(|b| serde_json::from_slice(b).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let group = api_key
+                .as_ref()
+                .map(|k| k.group_name.as_str())
+                .unwrap_or("default");
+            let amount = state
+                .billing
+                .reservation(&model, group, &body, path);
+            match state.billing.begin(
+                state.billing_store.as_ref(),
+                &key_id,
+                &user_id,
+                false,
+                amount,
+            ) {
+                Ok((session, reserved)) => Some((session, reserved, key_id, user_id, group.to_string())),
+                Err(error) => {
+                    // A refused reservation is a client-visible condition
+                    // (insufficient balance or key quota), not a server fault.
+                    let duration_ms = start.elapsed().as_millis() as i64;
+                    log_request(
+                        &state,
+                        "POST",
+                        path,
+                        Some(model.clone()),
+                        None,
+                        Some(key_id),
+                        Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                        Some(error.to_string()),
+                        duration_ms,
+                    );
+                    return json_policy_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "insufficient_quota",
+                        &error.to_string(),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
     let scheduler = state.scheduler.read().await;
     let result = scheduler
         .dispatch_for_group(
@@ -745,9 +583,52 @@ async fn dispatch(
         .await;
     drop(scheduler);
     let duration_ms = start.elapsed().as_millis() as i64;
+
     match result {
         Ok(r) => {
-            log_request(
+            let total_tokens = r.usage.total_tokens;
+            let tokens_used = if total_tokens > 0 {
+                Some(total_tokens)
+            } else {
+                None
+            };
+
+            // Settle at what the upstream actually reported. An upstream that
+            // reports nothing is billed on the reservation estimate, matching
+            // NewAPI's "keep the estimate" behaviour rather than charging zero.
+            if let Some((session, reserved, key_id, user_id, group)) = &reservation {
+                let usage = billing_usage_from(&r.usage, &model, path);
+                let ctx = EvalContext::default();
+                let charge = state.billing.charge(&model, group, &usage, &ctx);
+                let charge = if charge.quota == 0 && *reserved > 0 && !usage.has_billable_tokens() {
+                    // No usage reported: hold the reservation.
+                    Charge {
+                        quota: *reserved,
+                        ..charge
+                    }
+                } else {
+                    charge
+                };
+                let description = format!(
+                    "{} via {} ({})",
+                    model,
+                    r.adaptor,
+                    charge.path.as_str()
+                );
+                if let Err(error) = state.billing.settle(
+                    state.billing_store.as_ref(),
+                    session,
+                    key_id,
+                    user_id,
+                    &charge,
+                    &description,
+                    None,
+                ) {
+                    eprintln!("[OxygenRouter] billing settle failed: {error}");
+                }
+            }
+
+            log_request_with_usage(
                 &state,
                 "POST",
                 path,
@@ -757,11 +638,26 @@ async fn dispatch(
                 Some(r.status),
                 None,
                 duration_ms,
+                tokens_used,
             );
-            build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
+            if stream {
+                build_streaming_response(r.body.to_vec(), r.status, &r.headers)
+            } else {
+                build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
+            }
         }
         Err(e) => {
             let status = e.status();
+            // A failed request must cost nothing: return the reservation.
+            if let Some((session, _reserved, key_id, user_id, _group)) = &reservation {
+                if let Err(error) =
+                    state
+                        .billing
+                        .refund(state.billing_store.as_ref(), session, key_id, user_id)
+                {
+                    eprintln!("[OxygenRouter] billing refund failed: {error}");
+                }
+            }
             log_request(
                 &state,
                 "POST",
@@ -781,12 +677,81 @@ async fn dispatch(
     }
 }
 
+/// Which accounts pay for a request, if any.
+///
+/// Returns `None` when there is no key, or the key has no owning user, so
+/// unauthenticated and channel-only deployments are not billed.
+fn billing_target(state: &AppState, api_key: &Option<ApiKey>) -> Option<(String, String)> {
+    let key = api_key.as_ref()?;
+    if key.user_id.trim().is_empty() {
+        return None;
+    }
+    // A user row must exist or the wallet updates would silently affect nothing.
+    match state.db.get_user(&key.user_id) {
+        Ok(Some(_)) => Some((key.id.clone(), key.user_id.clone())),
+        Ok(None) => {
+            eprintln!(
+                "[OxygenRouter] key {} references missing user {}; not billing",
+                key.id, key.user_id
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("[OxygenRouter] billing target lookup failed: {e}");
+            None
+        }
+    }
+}
+
+/// Convert the adaptor's `Usage` into the billing engine's shape.
+fn billing_usage_from(
+    usage: &oxygenrouter_proxy::Usage,
+    model: &str,
+    path: &str,
+) -> BillingUsage {
+    use oxygenrouter_billing::UsageSemantic as Sem;
+    let semantic = match usage.semantic.as_str() {
+        "anthropic" => Sem::Anthropic,
+        "gemini" => Sem::Gemini,
+        _ => {
+            // The dialect also depends on what the client asked for: a client
+            // posting to /v1/messages expects Anthropic accounting even when the
+            // upstream reported OpenAI-shaped numbers.
+            if path.starts_with("/v1/messages") {
+                Sem::Anthropic
+            } else {
+                Sem::OpenAi
+            }
+        }
+    };
+    let _ = model;
+    BillingUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cached_tokens: usage.cached_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+        cache_creation_5m_tokens: usage.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: usage.cache_creation_1h_tokens,
+        image_tokens: usage.image_tokens,
+        audio_tokens: usage.audio_tokens,
+        semantic,
+    }
+}
+
 async fn responses_endpoint(
     State(state): State<std::sync::Arc<AppState>>,
     request: Request,
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
-    dispatch_openai(state, "/v1/responses", body_bytes, "gpt-4o-mini", headers).await
+    dispatch_openai(
+        state,
+        "/v1/responses",
+        body_bytes,
+        "gpt-4o-mini",
+        headers,
+        false,
+    )
+    .await
 }
 
 async fn messages_endpoint(
@@ -794,7 +759,15 @@ async fn messages_endpoint(
     request: Request,
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
-    dispatch_openai(state, "/v1/messages", body_bytes, "claude-3-haiku", headers).await
+    dispatch_openai(
+        state,
+        "/v1/messages",
+        body_bytes,
+        "claude-3-haiku",
+        headers,
+        false,
+    )
+    .await
 }
 
 async fn rerank_endpoint(
@@ -808,13 +781,22 @@ async fn rerank_endpoint(
         body_bytes,
         "rerank-english-v3.0",
         headers,
+        false,
     )
     .await
 }
 
 async fn audio_speech(State(state): State<std::sync::Arc<AppState>>, request: Request) -> Response {
     let (headers, body_bytes) = read_body(request).await;
-    dispatch_openai(state, "/v1/audio/speech", body_bytes, "tts-1", headers).await
+    dispatch_openai(
+        state,
+        "/v1/audio/speech",
+        body_bytes,
+        "tts-1",
+        headers,
+        false,
+    )
+    .await
 }
 
 async fn audio_transcription(
@@ -828,6 +810,7 @@ async fn audio_transcription(
         body_bytes,
         "whisper-1",
         headers,
+        false,
     )
     .await
 }
@@ -843,13 +826,22 @@ async fn audio_translation(
         body_bytes,
         "whisper-1",
         headers,
+        false,
     )
     .await
 }
 
 async fn image_edits(State(state): State<std::sync::Arc<AppState>>, request: Request) -> Response {
     let (headers, body_bytes) = read_body(request).await;
-    dispatch_openai(state, "/v1/images/edits", body_bytes, "dall-e-3", headers).await
+    dispatch_openai(
+        state,
+        "/v1/images/edits",
+        body_bytes,
+        "dall-e-3",
+        headers,
+        false,
+    )
+    .await
 }
 
 async fn image_variations(
@@ -863,6 +855,71 @@ async fn image_variations(
         body_bytes,
         "dall-e-3",
         headers,
+        false,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxygenrouter_proxy::Usage;
+
+    fn usage(semantic: &str, prompt: i64, completion: i64, cached: i64) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            semantic: semantic.to_string(),
+            cached_tokens: cached,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn usage_semantic_follows_the_upstream_dialect() {
+        let u = usage("anthropic", 100, 20, 50);
+        let b = billing_usage_from(&u, "claude-sonnet-4-20250514", "/v1/chat/completions");
+        assert_eq!(b.semantic, oxygenrouter_billing::UsageSemantic::Anthropic);
+        assert_eq!(b.prompt_tokens, 100);
+        assert_eq!(b.cached_tokens, 50);
+    }
+
+    #[test]
+    fn gemini_dialect_is_preserved() {
+        let u = usage("gemini", 10, 5, 0);
+        let b = billing_usage_from(&u, "gemini-2.0-flash", "/v1/chat/completions");
+        assert_eq!(b.semantic, oxygenrouter_billing::UsageSemantic::Gemini);
+    }
+
+    #[test]
+    fn native_messages_clients_get_anthropic_accounting() {
+        // A client posting to /v1/messages expects Anthropic semantics even when
+        // the upstream reported OpenAI-shaped numbers: the two dialects differ in
+        // whether cached tokens are a subset of the prompt total.
+        let u = usage("openai", 100, 20, 40);
+        let b = billing_usage_from(&u, "glm-5.3-flash", "/v1/messages");
+        assert_eq!(b.semantic, oxygenrouter_billing::UsageSemantic::Anthropic);
+    }
+
+    #[test]
+    fn cache_creation_tiers_survive_the_mapping() {
+        let mut u = usage("anthropic", 100, 20, 10);
+        u.cache_creation_tokens = 30;
+        u.cache_creation_5m_tokens = 20;
+        u.cache_creation_1h_tokens = 10;
+        let b = billing_usage_from(&u, "claude-sonnet-4-20250514", "/v1/chat/completions");
+        assert_eq!(b.cache_creation_tokens, 30);
+        assert_eq!(b.cache_creation_5m_tokens, 20);
+        assert_eq!(b.cache_creation_1h_tokens, 10);
+        // The split is authoritative for cache-write billing.
+        assert_eq!(b.cache_write_tokens(), 30);
+    }
+
+    #[test]
+    fn zero_usage_is_reported_as_not_billable() {
+        let u = usage("openai", 0, 0, 0);
+        let b = billing_usage_from(&u, "x", "/v1/chat/completions");
+        assert!(!b.has_billable_tokens());
+    }
 }

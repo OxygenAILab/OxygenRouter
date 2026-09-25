@@ -52,6 +52,7 @@ fn map_api_key(row: &rusqlite::Row<'_>) -> SqliteResult<ApiKey> {
         ip_allowlist: json_value(&row.get::<_, String>(10)?),
         group_name: row.get(11)?,
         cross_group_retry: row.get::<_, i32>(12)? != 0,
+        user_id: row.get(13)?,
     })
 }
 
@@ -274,6 +275,10 @@ impl Database {
             "ALTER TABLE api_keys ADD COLUMN ip_allowlist TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE api_keys ADD COLUMN group_name TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE api_keys ADD COLUMN cross_group_retry INTEGER NOT NULL DEFAULT 1",
+            // Billing needs to know whose wallet pays for a token. NewAPI binds
+            // every token to a user row; an empty value means the key is not
+            // wallet-backed (channel-only / pre-auth deployments).
+            "ALTER TABLE api_keys ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE channels ADD COLUMN group_name TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE channels ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE channels ADD COLUMN model_list TEXT NOT NULL DEFAULT '[]'",
@@ -595,17 +600,17 @@ impl Database {
 
     pub fn upsert_api_key(&self, k: &ApiKey) -> SqliteResult<()> {
         self.conn.lock().execute(
-            r#"INSERT INTO api_keys (id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+            r#"INSERT INTO api_keys (id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry,user_id)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
                ON CONFLICT(id) DO UPDATE SET
-                    key=?2, name=?3, priority=?4, enabled=?5, expires_at=?7, quota_micros=?8, allowed_models=?10, ip_allowlist=?11, group_name=?12, cross_group_retry=?13"#,
+                    key=?2, name=?3, priority=?4, enabled=?5, expires_at=?7, quota_micros=?8, allowed_models=?10, ip_allowlist=?11, group_name=?12, cross_group_retry=?13, user_id=?14"#,
             params![
                 k.id,
                 k.key,
                 k.name,
                 k.priority,
                 k.enabled as i32,
-                k.created_at.to_rfc3339(), k.expires_at.map(|v| v.to_rfc3339()), k.quota_micros, k.used_micros, json_string(&k.allowed_models), json_string(&k.ip_allowlist), k.group_name, k.cross_group_retry as i32
+                k.created_at.to_rfc3339(), k.expires_at.map(|v| v.to_rfc3339()), k.quota_micros, k.used_micros, json_string(&k.allowed_models), json_string(&k.ip_allowlist), k.group_name, k.cross_group_retry as i32, k.user_id
             ],
         )?;
         Ok(())
@@ -627,7 +632,7 @@ impl Database {
         )?;
         let offset = (page.max(1) - 1) * page_size.max(1);
         let mut s = conn.prepare(&format!(
-            "SELECT id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry
+            "SELECT id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry,user_id
              FROM api_keys {where_clause} ORDER BY priority DESC, created_at DESC LIMIT ?2 OFFSET ?3"
         ))?;
         let rows = s.query_map(params![search, page_size.max(1), offset], map_api_key)?;
@@ -638,7 +643,7 @@ impl Database {
     pub fn list_api_keys(&self) -> SqliteResult<Vec<ApiKey>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
-            "SELECT id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry FROM api_keys ORDER BY priority DESC",
+            "SELECT id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry,user_id FROM api_keys ORDER BY priority DESC",
         )?;
         let rows = s.query_map([], map_api_key)?;
         rows.collect()
@@ -647,7 +652,7 @@ impl Database {
     pub fn find_api_key_by_token(&self, token: &str) -> SqliteResult<Option<ApiKey>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
-            "SELECT id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry FROM api_keys WHERE key=?1 AND enabled=1 LIMIT 1",
+            "SELECT id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry,user_id FROM api_keys WHERE key=?1 AND enabled=1 LIMIT 1",
         )?;
         let mut rows = s.query(params![token])?;
         if let Some(r) = rows.next()? {
@@ -667,6 +672,7 @@ impl Database {
                 ip_allowlist: json_value(&r.get::<_, String>(10)?),
                 group_name: r.get(11)?,
                 cross_group_retry: r.get::<_, i32>(12)? != 0,
+                user_id: r.get(13)?,
             }))
         } else {
             Ok(None)

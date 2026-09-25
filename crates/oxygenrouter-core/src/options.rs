@@ -69,7 +69,7 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("SiteName", Site, String, "OxygenRouter", "Display name of this instance"),
     schema!("ServerAddress", Site, String, "http://127.0.0.1:3001", "Public base address used in examples"),
     schema!("Notice", Site, String, "", "Announcement shown on the overview page"),
-    schema!("Footer", Site, String, "GitHub@NDBlockConnect | BlockConnect@StarsailsClover", "Footer watermark text"),
+    schema!("Footer", Site, String, "GitHub@OxygenAILab | OxygenAILab@StarsailsClover", "Footer watermark text"),
     // Auth
     schema!("RegistrationEnabled", Auth, Bool, "true", "Allow new users to register"),
     schema!("PasswordLoginEnabled", Auth, Bool, "true", "Allow password based sign-in"),

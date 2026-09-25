@@ -224,9 +224,29 @@ For documentation files (`*.md`), put it on a comment line near the top.
   Gemini, Bedrock+SigV4, Vertex, Ollama, Cohere, Azure, AdvancedCustom) with
   bidirectional OpenAI↔Claude / OpenAI↔Gemini conversion and SSE translation.
   See `docs/SUPERSET_ROADMAP.md` for the NewAPI-parity plan.
-- Relay crate is built and tested but NOT yet wired into the live proxy path —
-  `oxygenrouter-webui/src/proxy.rs` still uses the legacy pass-through client
+- ✅ Relay layer is wired into the live proxy path (`oxygenrouter-proxy/src/dispatch.rs`)
+  and billing runs on it: pre-consume → settle → refund, with the wallet, key usage
+  and `request_logs.tokens_used` all moving on real requests. See `docs/FACT.md`.
+- Still open: relay streaming is buffered before adaptor translation (time-to-first-token),
+  and response shaping for native `/v1/messages` clients returns OpenAI-shaped JSON.
 - Local API key check is permissive — any `Bearer xxx` accepted (only channel credentials are validated upstream)
 - No HTTPS for local server (rely on local trust)
 - Model map uses simple glob patterns; no full regex
 - Logs are in SQLite only; no streaming export
+
+## 13. Billing invariants (do not break these)
+
+The quota engine (`oxygenrouter-billing`) and its storage primitives
+(`oxygenrouter-core/src/db.rs`) encode decisions that are easy to regress:
+
+1. **Reserve atomically.** `try_reserve_key_quota` / `try_reserve_wallet` perform the guard and the
+   mutation in one statement. Never split them into a read-then-write; concurrent requests would
+   over-spend.
+2. **The billing session owns balance movement.** `record_charge` / `append_ledger_entry` are
+   **audit-only** writes. Moving money in both the session and the ledger double-charges.
+3. **A settled session never refunds.** Otherwise success followed by a late failure is free.
+4. **A failed request costs nothing.** Refund in full on the error path.
+5. **`credit_tx` rejects negative balances; settlement does not.** Top-ups and admin credits must
+   not go below zero, while a stream that overran its reservation must be able to record the debt.
+6. **Zero `quota_micros` means unlimited** for a key, matching NewAPI. A per-call model price
+   (`model_price`) counts as priced even with no token ratio.

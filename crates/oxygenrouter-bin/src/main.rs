@@ -119,6 +119,8 @@ async fn main() {
     ));
 
     state.reload_scheduler_maps().await;
+    // Apply this instance's own pricing overrides on top of the shipped pack.
+    state.reload_pricing();
 
     let app = Router::new()
         .route("/", get(index_handler))

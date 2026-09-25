@@ -66,7 +66,7 @@ pub struct PricingTables {
 }
 
 /// The shipped pricing document: metadata plus the tables.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PricingDocument {
     #[serde(default)]
     pub meta: PricingMeta,

@@ -15,3 +15,6 @@ pub use router::{ModelRouter, RouteDecision};
 pub use scheduler::ChannelScheduler;
 pub use tester::test_channel;
 pub use upstream::{ModelContextExceeded, ProxyError, ProxyRequest, ProxyResult};
+/// Re-exported so downstream crates can name the usage type without depending on
+/// `oxygenrouter-relay` directly.
+pub use oxygenrouter_relay::Usage;

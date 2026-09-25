@@ -26,3 +26,7 @@ rusqlite     = "0.31"
 
 oxygenrouter-core  = { path = "../oxygenrouter-core" }
 oxygenrouter-proxy = { path = "../oxygenrouter-proxy" }
+oxygenrouter-billing = { path = "../oxygenrouter-billing" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

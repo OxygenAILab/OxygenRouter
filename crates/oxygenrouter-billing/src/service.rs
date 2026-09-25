@@ -93,10 +93,11 @@ pub trait BillingStore: Send + Sync {
 struct DualStore<'a> {
     store: &'a dyn BillingStore,
     key_id: String,
-    wallet_id: String,
 }
 
 impl QuotaStore for DualStore<'_> {
+    /// Any account name other than the key is the wallet: a `BillingSession` is
+    /// only ever constructed with exactly these two accounts.
     fn try_reserve(&self, account: &str, amount: i64) -> Result<bool, BillingError> {
         if account == self.key_id {
             self.store.try_reserve_key(account, amount)
@@ -324,7 +325,6 @@ impl BillingService {
         let dual = DualStore {
             store,
             key_id: key_id.to_string(),
-            wallet_id: user_id.to_string(),
         };
         let reserved = session.pre_consume(&dual, reservation)?;
         Ok((session, reserved))
@@ -344,7 +344,6 @@ impl BillingService {
         let dual = DualStore {
             store,
             key_id: key_id.to_string(),
-            wallet_id: user_id.to_string(),
         };
         session.note_clamp(charge.clamp.clone());
         // The session owns every balance movement (it holds the reservation and
@@ -356,17 +355,21 @@ impl BillingService {
     }
 
     /// Refund a failed request.
+    /// Return a failed request's reservation.
+    ///
+    /// `user_id` is accepted for symmetry with `settle` and for callers that log
+    /// the refund; the session already holds both account names, so the refund
+    /// itself does not need it.
     pub fn refund(
         &self,
         store: &dyn BillingStore,
         session: &BillingSession,
         key_id: &str,
-        user_id: &str,
+        _user_id: &str,
     ) -> Result<(), BillingError> {
         let dual = DualStore {
             store,
             key_id: key_id.to_string(),
-            wallet_id: user_id.to_string(),
         };
         session.refund(&dual)
     }
