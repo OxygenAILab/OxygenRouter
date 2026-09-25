@@ -11,10 +11,10 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
 
 use crate::adaptor::{AdaptedResponse, Adaptor, UpstreamResponse};
-use crate::convert::{claude_to_openai_request, gemini_to_openai_request};
 use crate::error::RelayError;
-use crate::usage::extract_openai_usage;
-use crate::value::{RelayFormat, RelayInfo, RelayValue, Usage};
+use crate::value::{RelayInfo, RelayValue, Usage};
+
+use super::openai_compat;
 
 pub struct OpenAiAdaptor;
 
@@ -39,21 +39,9 @@ impl Adaptor for OpenAiAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
-        // A client speaking Anthropic (`/v1/messages`) or Gemini
-        // (`/v1beta/models/...`) is addressing a route an OpenAI upstream does
-        // not implement at all. Appending that path verbatim sent a
-        // non-OpenAI body to whatever answered there, and the reply was then run
-        // through the OpenAI->native converter, which found no `choices` and
-        // returned an empty result. Such a request must be aimed at the chat
-        // completions route the translated body is shaped for.
-        if matches!(
-            info.relay_format,
-            RelayFormat::Claude | RelayFormat::Gemini
-        ) {
-            return Ok(Self::join_url(&info.base_url, "/v1/chat/completions"));
-        }
-        // OpenAI convention is `{base}/{path}`, collapsing a duplicated `/v1`.
-        Ok(Self::join_url(&info.base_url, &info.request_path))
+        // A native Anthropic/Gemini client is re-aimed at the chat route; an
+        // OpenAI client's own path is used as-is. See `openai_compat`.
+        Ok(openai_compat::request_url(info))
     }
 
     fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
@@ -73,29 +61,10 @@ impl Adaptor for OpenAiAdaptor {
     ) -> Result<RelayValue, RelayError> {
         // Native Anthropic/Gemini inbound has to be translated, not forwarded:
         // the body and the URL above are both OpenAI chat completions shape.
-        match info.relay_format {
-            RelayFormat::Claude => {
-                return Ok(RelayValue::Raw(claude_to_openai_request::convert(
-                    body,
-                    &info.upstream_model,
-                    info.is_stream,
-                )?));
-            }
-            RelayFormat::Gemini => {
-                return Ok(RelayValue::Raw(gemini_to_openai_request::convert(
-                    body,
-                    &info.upstream_model,
-                    info.is_stream,
-                )?));
-            }
-            _ => {}
+        if let Some(translated) = openai_compat::convert_request(info, body)? {
+            return Ok(translated);
         }
-        let mut obj = body.as_object().cloned().unwrap_or_default();
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(info.upstream_model.clone()),
-        );
-        Ok(RelayValue::Raw(serde_json::Value::Object(obj)))
+        Ok(openai_compat::rewrite_model(info, body))
     }
 
     fn convert_response(
@@ -103,54 +72,7 @@ impl Adaptor for OpenAiAdaptor {
         info: &RelayInfo,
         resp: &UpstreamResponse,
     ) -> Result<AdaptedResponse, RelayError> {
-        if info.is_stream && resp.is_stream {
-            let (body, usage) = crate::sse::openai::extract_stream_usage(&resp.body);
-            // A Claude client posting to /v1/messages must receive Anthropic SSE
-            // even when the upstream speaks OpenAI.
-            if info.relay_format == RelayFormat::Claude {
-                let converted = crate::sse::openai::to_claude_events(&body);
-                return Ok(AdaptedResponse {
-                    body: converted.into(),
-                    usage,
-                });
-            }
-            if info.relay_format == RelayFormat::Gemini {
-                // The usage is re-derived from the terminal chunk, because the
-                // Gemini frame carries it in its own shape.
-                let mut conv = gemini_to_openai_request::OpenAiToGeminiStream::new();
-                let (converted, gemini_usage) = conv.run(&body);
-                return Ok(AdaptedResponse {
-                    body: converted,
-                    usage: gemini_usage,
-                });
-            }
-            return Ok(AdaptedResponse { body, usage });
-        }
-        let usage = extract_openai_usage(&resp.body);
-        if info.relay_format == RelayFormat::Claude {
-            let body = crate::convert::openai_to_claude_response::convert_response(
-                &resp.body,
-                &info.origin_model,
-            )?;
-            return Ok(AdaptedResponse {
-                body: body.into(),
-                usage,
-            });
-        }
-        if info.relay_format == RelayFormat::Gemini {
-            let body = gemini_to_openai_request::convert_response(
-                &resp.body,
-                &info.origin_model,
-            )?;
-            return Ok(AdaptedResponse {
-                body: body.into(),
-                usage,
-            });
-        }
-        Ok(AdaptedResponse {
-            body: resp.body.clone(),
-            usage,
-        })
+        openai_compat::convert_response(info, resp)
     }
 
     fn model_list(&self) -> Vec<String> {

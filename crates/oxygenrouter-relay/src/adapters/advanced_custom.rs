@@ -13,8 +13,9 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 use crate::adaptor::{AdaptedResponse, Adaptor, UpstreamResponse};
 use crate::error::RelayError;
-use crate::usage::extract_openai_usage;
 use crate::value::{RelayInfo, RelayValue};
+
+use super::openai_compat;
 
 pub struct AdvancedCustomAdaptor;
 
@@ -25,7 +26,12 @@ impl Adaptor for AdvancedCustomAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
-        let action = info.request_path.trim_start_matches('/').to_string();
+        // A native Anthropic/Gemini client must be sent to the chat-completions
+        // action, the same re-aiming every OpenAI-compatible channel now does.
+        let action = match openai_compat::dialect_target_path(info.relay_format) {
+            Some(path) => path.trim_start_matches('/').to_string(),
+            None => info.request_path.trim_start_matches('/').to_string(),
+        };
         Ok(info
             .base_url
             .replace("{model}", &info.upstream_model)
@@ -47,12 +53,10 @@ impl Adaptor for AdvancedCustomAdaptor {
         info: &RelayInfo,
         body: &serde_json::Value,
     ) -> Result<RelayValue, RelayError> {
-        let mut obj = body.as_object().cloned().unwrap_or_default();
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(info.upstream_model.clone()),
-        );
-        Ok(RelayValue::Raw(serde_json::Value::Object(obj)))
+        if let Some(translated) = openai_compat::convert_request(info, body)? {
+            return Ok(translated);
+        }
+        Ok(openai_compat::rewrite_model(info, body))
     }
 
     fn convert_response(
@@ -60,14 +64,6 @@ impl Adaptor for AdvancedCustomAdaptor {
         info: &RelayInfo,
         resp: &UpstreamResponse,
     ) -> Result<AdaptedResponse, RelayError> {
-        if info.is_stream && resp.is_stream {
-            let (body, usage) = crate::sse::openai::extract_stream_usage(&resp.body);
-            return Ok(AdaptedResponse { body, usage });
-        }
-        let usage = extract_openai_usage(&resp.body);
-        Ok(AdaptedResponse {
-            body: resp.body.clone(),
-            usage,
-        })
+        openai_compat::convert_response(info, resp)
     }
 }

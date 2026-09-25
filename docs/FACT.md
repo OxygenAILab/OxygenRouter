@@ -354,14 +354,36 @@ a concurrent 20-thread test proves reservation cannot overspend).
 - **License constraint:** NewAPI is AGPL-3.0; this project is MIT. NewAPI may be
   read as a behavioral specification only — its code must never be copied.
 
+### Shared by every OpenAI-compatible channel (2026-09-26)
+
+The dialect handling described above originally lived in `OpenAiAdaptor` alone,
+which meant the same defect remained reachable on the other channels that speak
+OpenAI: `Ollama`, `AdvancedCustom`, and every `ApiType::OpenAi` fallback
+(OpenRouter, DeepSeek, vLLM, SGLang, LiteLLM …). Copying the logic into each
+adaptor would have invited it back, so it now lives once, in
+`crates/oxygenrouter-relay/src/adapters/openai_compat.rs`, and the three adaptors
+delegate to it: `request_url`, `convert_request`, `rewrite_model`,
+`convert_response`.
+
+Verified live against the reference instance, one channel per adaptor type:
+
+| Channel provider | Claude client | Gemini client | OpenAI client |
+|---|---|---|---|
+| `openai` | `'PING'` | `'PING'` | `'PING'` |
+| `ollama` | `'PING'` | `'PING'` | `'PING'` |
+| `58` (`advanced_custom`, `{action}` template) | `'PING'` | `'PING'` | — |
+
+The guard is registry-driven rather than a hand-written list:
+`tests/all_openai_compatible_adaptors_share_dialect_support.rs` iterates the
+adaptors and asserts the **exact** upstream URL each produces (not merely that
+`/v1/messages` is absent — that would pass on a wrong-but-different URL), plus
+translation and response shaping in both native dialects. A new
+OpenAI-compatible adaptor is covered as soon as it is registered. Reverting
+`Ollama`'s `request_url` or `convert_request` to the old verbatim behaviour makes
+it fail (mutation-verified).
+
 ## Open questions
-- **The remaining OpenAI-compatible shims still append the client path verbatim.**
-  `AdvancedCustom`, `Ollama` and the other `ApiType::OpenAi` fallbacks do not
-  reshape a Claude or Gemini client's request the way `OpenAiAdaptor` now does, so
-  a native-dialect client on one of those channels hits the wrong route. Both
-  converters exist and are reusable, so each fix is a routing branch plus the
-  translation call; not yet done, and no live channel of those types was available
-  to verify against. Found by reading the reference, not by a failing test.
+- _None recorded_
 
 ## Pending decisions
 - _None recorded_

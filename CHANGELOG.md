@@ -42,6 +42,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `openai_channel_serves_gemini_clients` fail, so both are load-bearing.
 - `cargo test --workspace` → **281 passed / 0 failed**, zero warnings.
 
+### Changed (P4 — shared dialect handling)
+- **The Anthropic/Gemini dialect handling is now shared by every OpenAI-compatible
+  channel.** It had lived in `OpenAiAdaptor` alone, which left the same defect
+  reachable on `Ollama`, `AdvancedCustom` and the `ApiType::OpenAi` fallbacks
+  (OpenRouter, DeepSeek, vLLM, SGLang, LiteLLM …): a native-dialect client's own
+  path was forwarded verbatim to an upstream that does not serve it. Copying the
+  logic per adaptor would have invited the bug back, so it moved once into
+  `adapters/openai_compat.rs` and the three adaptors delegate to it
+  (`request_url`, `convert_request`, `rewrite_model`, `convert_response`).
+
+### Verified (P4 — shared dialect handling)
+- Live against the reference, one channel per adaptor type — `openai`, `ollama`
+  and `advanced_custom` (a `{action}` template) each serve an Anthropic client, a
+  Gemini client and an OpenAI client, all returning `'PING'`.
+- The guard is registry-driven, so a newly registered OpenAI-compatible adaptor is
+  covered automatically: `tests/all_openai_compatible_adaptors_share_dialect_support.rs`
+  asserts the **exact** upstream URL (not merely the absence of `/v1/messages`,
+  which a wrong-but-different URL would satisfy) plus translation and response
+  shaping in both native dialects. Reverting `Ollama` to the old behaviour makes it
+  fail (mutation-verified, both the URL and the translation).
+- `cargo test --workspace` → **290 passed / 0 failed**, zero warnings.
+
 ### Fixed (P4 — client dialect)
 - **A Claude client routed to an OpenAI channel received an empty answer.** The OpenAI
   adaptor appended the client's path to the base URL, so `POST /v1/messages` was forwarded

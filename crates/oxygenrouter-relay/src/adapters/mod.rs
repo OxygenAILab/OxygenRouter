@@ -10,4 +10,5 @@ pub mod cohere;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;
+pub mod openai_compat;
 pub mod vertex;

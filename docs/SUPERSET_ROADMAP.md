@@ -416,12 +416,13 @@ Add missing endpoints on top of P1. Status as of `7f553df`:
 - ❌ Codex credential refresh + usage endpoints
 - ❌ vLLM / SGLang per-channel metrics
 
-**Still open from the dialect work:** the OpenAI adaptor is the only one that
-reshapes a Claude or Gemini client's request. Anthropic/Azure/Bedrock have their
-own correct routing, but `AdvancedCustom`, `Ollama` and the OpenAI-compatible
-shims still append `info.request_path` verbatim, so a Claude or Gemini client on
-those channels has the same wrong-route hazard that was just fixed for `OpenAI`.
-Both now have a converter to reuse, so the fix is a routing branch each.
+**Dialect handling is shared, not per-adaptor.** `adapters/openai_compat.rs` holds
+the Anthropic/Gemini re-routing and translation once, and `OpenAiAdaptor`,
+`OllamaAdaptor` and `AdvancedCustomAdaptor` all delegate to it, so an
+OpenAI-compatible channel added later inherits it rather than repeating the bug.
+`tests/all_openai_compatible_adaptors_share_dialect_support.rs` enforces this off
+the registry. Verified live on `openai`, `ollama` and `advanced_custom` channels
+with all three client dialects.
 
 ---
 

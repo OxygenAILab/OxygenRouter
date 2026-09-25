@@ -11,8 +11,9 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 use crate::adaptor::{AdaptedResponse, Adaptor, UpstreamResponse};
 use crate::error::RelayError;
-use crate::usage::extract_openai_usage;
 use crate::value::{RelayInfo, RelayValue};
+
+use super::openai_compat;
 
 pub struct OllamaAdaptor;
 
@@ -23,10 +24,9 @@ impl Adaptor for OllamaAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
-        Ok(crate::adapters::openai::OpenAiAdaptor::join_url(
-            &info.base_url,
-            &info.request_path,
-        ))
+        // Ollama's OpenAI-compatible shim, so a native Anthropic/Gemini client is
+        // re-aimed at the chat route exactly as it is for any other OpenAI channel.
+        Ok(openai_compat::request_url(info))
     }
 
     fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
@@ -46,12 +46,10 @@ impl Adaptor for OllamaAdaptor {
         info: &RelayInfo,
         body: &serde_json::Value,
     ) -> Result<RelayValue, RelayError> {
-        let mut obj = body.as_object().cloned().unwrap_or_default();
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(info.upstream_model.clone()),
-        );
-        Ok(RelayValue::Raw(serde_json::Value::Object(obj)))
+        if let Some(translated) = openai_compat::convert_request(info, body)? {
+            return Ok(translated);
+        }
+        Ok(openai_compat::rewrite_model(info, body))
     }
 
     fn convert_response(
@@ -59,15 +57,7 @@ impl Adaptor for OllamaAdaptor {
         info: &RelayInfo,
         resp: &UpstreamResponse,
     ) -> Result<AdaptedResponse, RelayError> {
-        if info.is_stream && resp.is_stream {
-            let (body, usage) = crate::sse::openai::extract_stream_usage(&resp.body);
-            return Ok(AdaptedResponse { body, usage });
-        }
-        let usage = extract_openai_usage(&resp.body);
-        Ok(AdaptedResponse {
-            body: resp.body.clone(),
-            usage,
-        })
+        openai_compat::convert_response(info, resp)
     }
 
     fn model_list(&self) -> Vec<String> {
