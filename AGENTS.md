@@ -17,22 +17,25 @@ This document is for AI agents and human contributors working on OxygenRouter. I
 
 ```
 OxygenRouter/
-├── Cargo.toml                       # workspace root
+├── Cargo.toml                       # workspace root (5 member crates)
 ├── README.md
 ├── CHANGELOG.md
 ├── AGENTS.md
 ├── .gitignore
 ├── .devdocs/                        # design notes
-├── .devlogs/                        # development session logs
+├── .devlogs/                        # development session logs (gitignored)
 ├── docs/                            # long-form documentation
+│   └── research/                    # verified upstream comparison studies
+├── release/                         # packaged build output (gitignored)
 ├── releases/                        # built binaries (gitignored)
-├── src/
-│   └── bin/oxygenrouter/main.rs     # CLI entry, Windows console subsystem
+├── main.rs                          # legacy CLI entry (see crates/oxygenrouter-bin)
 └── crates/
     ├── oxygenrouter-core/           # data models + SQLite
     ├── oxygenrouter-proxy/          # upstream client + scheduler + router
-    └── oxygenrouter-webui/          # axum REST API + static webui
-        └── web/                     # React 18 + Vite + Tailwind
+    ├── oxygenrouter-relay/          # provider adapters + protocol converters + SSE
+    ├── oxygenrouter-webui/          # axum REST API + static webui
+    │   └── web/                     # React 18 + Vite + Tailwind
+    └── oxygenrouter-bin/            # CLI entry, Windows console subsystem
 ```
 
 ## 3. Tech stack & versions
@@ -49,35 +52,70 @@ OxygenRouter/
 
 ## 4. Data model (SQLite)
 
-| Table         | Purpose                                            |
-|---------------|----------------------------------------------------|
-| channels      | Upstream API providers (base_url, api_key, prio, weight) |
-| api_keys      | Local client tokens                                |
-| model_maps    | Per-channel model rewriting (pattern → target)     |
-| route_rules   | Reserved (priority/type-based rules)               |
-| request_logs  | Audit trail: method, path, model, channel, status, duration |
-| settings      | KV for app config (listen_host, port, local_token) |
+16 tables, defined in `crates/oxygenrouter-core/src/db.rs`.
+
+| Group | Table | Purpose |
+|-------|-------|---------|
+| Relay | `channels` | Upstream API providers (base_url, api_key, priority, weight, provider) |
+| Relay | `api_keys` | Local client tokens |
+| Relay | `model_maps` | Per-channel model rewriting (pattern → target) |
+| Relay | `model_metadata` | Model registry (vendor, capabilities, pricing metadata) |
+| Relay | `route_rules` | Route rules (priority / type / keyword based) |
+| Relay | `request_logs` | Audit trail: method, path, model, channel, status, duration |
+| Config | `settings` | KV for app config (listen host/port, local token, theme, language) |
+| Config | `migrations` | Applied-migration ledger |
+| Identity | `users` | Accounts + roles |
+| Identity | `auth_sessions` | Session tokens |
+| Billing | `ledger_entries` | Balance movements |
+| Billing | `subscription_plans` | Plan catalog |
+| Billing | `subscriptions` | Active/past subscriptions |
+| Billing | `redemption_codes` | Redeemable codes |
+| Billing | `redemption_uses` | Redemption audit (single-use enforcement) |
+| Billing | `payment_orders` | Manual and gateway orders |
+
+`crates/oxygenrouter-core/src/db.rs` holds the authoritative DDL; add a migration row to
+`migrations` for every schema change.
 
 ## 5. Protocol surface
 
 Implemented OpenAI-compatible endpoints (under `127.0.0.1:<port>/`):
 
+Relay endpoints (13, registered in `crates/oxygenrouter-webui/src/proxy.rs`):
+
 | Method | Path                       | Notes                                     |
 |--------|----------------------------|-------------------------------------------|
-| POST   | /v1/chat/completions       | Streaming (SSE) + non-streaming           |
-| POST   | /v1/completions            | Legacy completions                        |
-| POST   | /v1/embeddings             | Pass-through                               |
-| POST   | /v1/images/generations     | Pass-through                               |
-| GET    | /v1/models                 | Static list of well-known model IDs       |
-| GET    | /api/channels              | CRUD: channels                            |
-| GET/POST/PUT/DELETE | /api/channels/:id    | Channel management                        |
-| POST   | /api/channels/:id/test     | Connectivity test                         |
-| GET/POST | /api/keys                | Local API keys                            |
-| GET/POST | /api/model-maps          | Model rewriting                           |
-| GET/POST | /api/rules               | Route rules (reserved)                    |
-| GET    | /api/logs                  | Request log with `?limit=N`               |
-| GET    | /api/status                | System status snapshot                    |
-| GET/PUT | /api/settings             | App config                                |
+| ANY    | /v1/chat/completions       | Streaming (SSE) + non-streaming           |
+| ANY    | /v1/completions            | Legacy completions                        |
+| ANY    | /v1/embeddings             | Pass-through                              |
+| ANY    | /v1/responses              | Responses API                             |
+| ANY    | /v1/messages               | Anthropic-format messages                 |
+| ANY    | /v1/rerank                 | Rerank                                    |
+| ANY    | /v1/audio/speech           | TTS                                       |
+| ANY    | /v1/audio/transcriptions   | STT                                       |
+| ANY    | /v1/audio/translations     | STT translation                           |
+| ANY    | /v1/models                 | Model list (currently static; see P1)     |
+| ANY    | /v1/images/generations     | Pass-through                              |
+| ANY    | /v1/images/edits           | Pass-through                              |
+| ANY    | /v1/images/variations      | Pass-through                              |
+
+Admin / user API (60 routes, registered in `crates/oxygenrouter-webui/src/api.rs`), grouped:
+
+| Group | Representative paths |
+|-------|----------------------|
+| Channels | `GET/POST /api/channels`, `GET/PUT/DELETE /api/channels/:id`, `POST .../test`, `POST .../models/fetch`, `GET/POST .../keys`, `PATCH/DELETE /api/channels/batch` |
+| Keys | `GET/POST /api/keys`, `DELETE /api/keys/:id`, `GET /api/keys/usage`, `GET /api/keys/query` |
+| Models | `GET/POST /api/models-metadata`, `PUT/DELETE /api/models-metadata/:id`, `GET .../missing`, `POST .../sync` |
+| Routing | `GET/POST /api/model-maps`, `DELETE /api/model-maps/:id`, `GET/POST /api/rules`, `DELETE /api/rules/:id` |
+| Logs | `GET /api/logs`, `GET /api/logs/stream`, `GET /api/log/stats` |
+| System | `GET /api/status`, `GET /api/system/info`, `GET /api/dashboard`, `GET /api/analytics/flow`, `GET/PUT /api/settings`, `GET /api/options`, `PUT /api/options`, `POST /api/backup/create` |
+| Auth | `POST /api/auth/{register,login,logout}`, `GET /api/auth/me` |
+| Billing | `GET /api/wallet`, `GET /api/subscriptions/me`, `POST /api/subscriptions/subscribe`, `GET /api/plans`, `POST /api/redemption/redeem`, `POST /api/orders/manual` |
+| Admin | `GET /api/admin/users`, `PUT /api/admin/users/:id`, `POST /api/admin/users/:id/balance-adjust`, `GET/PUT /api/admin/plans`, `GET/PUT /api/admin/redemption-codes`, `GET /api/admin/orders`, `POST /api/admin/orders/:id/complete`, `GET /api/admin/ledger` |
+
+> **Known gap (P1, in progress):** the `oxygenrouter-relay` crate holds 9 provider adapters with
+> 101 public items and passing tests, but `oxygenrouter-webui` does not yet depend on it — relay
+> traffic still uses the legacy pass-through client in `proxy.rs`. Wiring this crate into the
+> request path is the current top priority. See `docs/research/NEWAPI_SUPERSET_ANALYSIS.md`.
 
 ## 6. Channel selection algorithm
 

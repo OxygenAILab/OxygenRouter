@@ -77,10 +77,16 @@ The local API token is shown on the Settings page (and on first start in the con
 crates/
 ├── oxygenrouter-core/   # data models, SQLite, config
 ├── oxygenrouter-proxy/  # upstream client, channel scheduler, model router
-└── oxygenrouter-webui/  # axum REST API + embedded Vite/React static
-    └── web/             # React 18 + Vite + Tailwind + lucide (OxygenOrigin dark)
-src/bin/oxygenrouter/    # CLI entry — console subsystem on Windows
+├── oxygenrouter-relay/  # provider adapters, protocol converters, SSE state machines
+├── oxygenrouter-webui/  # axum REST API + embedded Vite/React static
+│   └── web/             # React 18 + Vite + Tailwind + lucide (OxygenOrigin dark)
+└── oxygenrouter-bin/    # CLI entry — console subsystem on Windows
 ```
+
+> **Current wiring status:** `oxygenrouter-relay` is built and tested (9 adapters, 101 public
+> items, 15 unit tests) but is **not yet a dependency of `oxygenrouter-webui`**, so relay traffic
+> still flows through the legacy pass-through client. Wiring it in is the top priority of the
+> superset program — see [`docs/research/NEWAPI_SUPERSET_ANALYSIS.md`](./docs/research/NEWAPI_SUPERSET_ANALYSIS.md).
 
 ### How channel rotation works
 
@@ -97,13 +103,36 @@ src/bin/oxygenrouter/    # CLI entry — console subsystem on Windows
 
 ### WebUI pages (English / 中文)
 
-- **Overview** — welcome panel, base address, 4-step setup checklist (channel → key → mapping → first test), and a tile grid of local services
-- **Model Analytics** — real charts: time-bucket request line + error overlay, per-model and per-channel horizontal bars, channel health cards
-- **Channels** — card grid with status dot, search, show-disabled toggle, per-card test / copy / edit / delete
-- **API Keys** — row cards with masked-by-default keys, reveal-once, copy, and enabled/disabled badge
-- **Routes** — Model Maps as cards (pattern → target) and Route Rules list, with create modals
-- **Request Logs** — filterable list (status / free text), 56 px row virtualization, expand-for-error rows, auto-refresh every 10 s
-- **Settings** — tabbed layout (General · Routing · Upstream · Retention · Danger), language picker, theme picker, rotating local token, danger zone for log reset
+18 routes are registered in `crates/oxygenrouter-webui/web/src/App.tsx`.
+
+**Operational (substantive):**
+
+- **Overview** (`/ui/overview`) — welcome panel, base address, 4-step setup checklist (channel → key → mapping → first test), and a tile grid of local services
+- **Model Analytics** (`/ui/analytics`) — real charts: time-bucket request line + error overlay, per-model and per-channel horizontal bars, channel health cards
+- **Channels** (`/ui/channels`) — card grid with status dot, search, show-disabled toggle, per-card test / copy / edit / delete, multi-key management
+- **API Keys** (`/ui/keys`) — row cards with masked-by-default keys, reveal-once, copy, and enabled/disabled badge
+- **Routes** (`/ui/routes`) — Model Maps as cards (pattern → target) and Route Rules list, with create modals
+- **Request Logs** (`/ui/logs`) — filterable list (status / free text), 56 px row virtualization, expand-for-error rows, auto-refresh every 10 s
+- **Models** (`/ui/models`) — model catalog view
+- **Model Registry** (`/ui/model-registry`) — model metadata CRUD + upstream sync + missing-model detection
+- **System Info** (`/ui/system`) — runtime and storage information
+- **System Settings** (`/ui/system-settings`) — tabbed layout (General · Routing · Upstream · Retention · Danger), language picker, theme picker, rotating local token, danger zone for log reset
+- **Playground** (`/ui/playground`) — in-browser chat against your own channels
+- **Settings** (`/ui/settings`)
+
+**SaaS surface — currently placeholder stubs:**
+
+> ⚠️ These routes exist but render minimal content (4–20 lines each). Completing them is tracked
+> under the NewAPI superset program; see `docs/research/NEWAPI_SUPERSET_ANALYSIS.md` §5.1.
+
+| Route | Status |
+| --- | --- |
+| `/ui/sign-in`, `/ui/sign-up` | stub (`AuthPage`, 12 lines) |
+| `/ui/wallet` | stub (`WalletPage`, 20 lines) |
+| `/ui/plans` | stub (`PlansPage`, 18 lines) |
+| `/ui/subscriptions` | stub (`SubscriptionsPage`, 4 lines) |
+| `/ui/admin/users` | stub (`AdminUsersPage`, 4 lines) |
+| `/ui/admin/billing` | stub (`AdminBillingPage`, 5 lines) |
 
 The sidebar is 256 px (collapsible to 72 px, persisted in `localStorage`). A sticky 56 px top bar holds breadcrumbs, language pill (EN / 中) and theme toggle. Dashboard data is read only from the local SQLite `request_logs` and `channels` tables. The API endpoint is `GET /api/dashboard?time_range=1h|24h|7d`.
 

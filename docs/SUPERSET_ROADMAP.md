@@ -8,6 +8,35 @@
 
 ---
 
+> ## ⚠️ CORRECTION NOTICE (2026-09-25)
+>
+> The baseline numbers below were measured against a **stale upstream**. They have been
+> superseded by a verified re-measurement. For the authoritative figures, read
+> **[`docs/research/NEWAPI_SUPERSET_ANALYSIS.md`](./research/NEWAPI_SUPERSET_ANALYSIS.md)**.
+>
+> | Claim in this document | Verified reality |
+> |---|---|
+> | Upstream `Calcium-Ion/new-api` | Repo has moved to **`QuantumNous/new-api`** (48,881 stars) |
+> | 208,258 LOC Go | **217,437** LOC Go **+ 253,686** LOC frontend = **~471,100** total |
+> | OxygenRouter 6,584 LOC | **~17,950** LOC (9,569 Rust + 8,381 TS/TSX) |
+> | 23 relay endpoints | **50** resolved relay routes across 11 route groups |
+> | "40 provider dirs" | Confirmed: **40** adapter directories |
+> | 13 relay endpoints implemented | Confirmed: **13** (`proxy.rs`, all `ANY`) |
+> | WebUI pages | NewAPI has **65** canonical client routes incl. a **40-section** admin settings workspace; OxygenRouter has **18** real pages (6 of them stubs) |
+>
+> Additionally: NewAPI is **AGPL-3.0** while OxygenRouter is **MIT**. NewAPI may be read as a
+> behavioral specification only; its code must not be copied or transliterated into this
+> repository. See §7.4 of the analysis document.
+>
+> The **phase ordering** (P1 adapters → P2 billing → P3 routing → P4 protocol) in this document
+> remains sound and is retained; only the sizing and one repository identity were wrong.
+>
+> One key status change since this document was written: the §2.6 note "remaining for full
+> wiring" is still accurate — `oxygenrouter-webui` **does not depend on** `oxygenrouter-relay`,
+> so the 9 adapters are dead code in production. That wiring is the current top priority.
+
+---
+
 ## 0. The Honest Gap
 
 | Dimension | NewAPI | OxygenRouter | Ratio |
