@@ -25,17 +25,18 @@ use reqwest::Client;
 use oxygenrouter_core::Channel;
 use oxygenrouter_relay::{
     channel_type_to_api_type, get_adaptor, provider_str_to_channel_type,
-    value::{RelayFormat, RelayInfo, Usage},
+    value::{RelayFormat, RelayInfo},
     UpstreamResponse,
 };
 
 use crate::upstream::{ProxyError, ProxyRequest, ProxyResult};
-/// Which adaptor drove a response. Reported back so the caller can log the
-/// effective provider rather than the channel's configured label.
+/// What the adaptor did with a request, beyond the response itself.
+///
+/// Usage deliberately lives on `ProxyResult` (it is the thing billing needs);
+/// this carries only the translation metadata, so there is one source of truth.
 #[derive(Debug, Clone)]
 pub struct RelayOutcome {
     pub result: ProxyResult,
-    pub usage: Usage,
     /// Adaptor name, e.g. `anthropic`.
     pub adaptor: &'static str,
     /// True when the request was translated into a non-OpenAI wire format.
@@ -238,8 +239,9 @@ impl RelayClient {
                 body: adapted.body,
                 model_used: info.upstream_model.clone(),
                 channel_id: channel.id.clone(),
+                usage: adapted.usage,
+                adaptor: adaptor.name().to_string(),
             },
-            usage: adapted.usage,
             adaptor: adaptor.name(),
             translated: !matches!(relay_format, RelayFormat::Raw | RelayFormat::OpenAiChat),
         })

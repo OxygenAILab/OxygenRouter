@@ -163,12 +163,23 @@ impl UpstreamClient {
             });
         }
 
+        // This client is the legacy OpenAI pass-through, kept for reference and
+        // for the channel tester. It reads usage the same way the adaptor layer
+        // does so billing sees consistent numbers regardless of the path.
+        let usage = if req.stream {
+            oxygenrouter_relay::sse::openai::extract_stream_usage(&body_bytes).1
+        } else {
+            oxygenrouter_relay::usage::extract_openai_usage(&body_bytes)
+        };
+
         Ok(ProxyResult {
             status,
             headers: resp_headers,
             body: body_bytes,
             model_used: model.to_string(),
             channel_id: channel.id.clone(),
+            usage,
+            adaptor: "openai".to_string(),
         })
     }
 }

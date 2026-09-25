@@ -5,6 +5,8 @@
 use bytes::Bytes;
 use thiserror::Error;
 
+pub use oxygenrouter_relay::Usage;
+
 #[derive(Debug, Clone)]
 pub struct ProxyRequest {
     pub method: String,
@@ -22,6 +24,13 @@ pub struct ProxyResult {
     pub body: Bytes,
     pub model_used: String,
     pub channel_id: String,
+    /// Token usage the upstream reported, for billing.
+    ///
+    /// Zero-valued when the upstream reported none; the caller decides whether
+    /// to fall back to an estimate.
+    pub usage: Usage,
+    /// The adaptor that served the request, e.g. `anthropic`.
+    pub adaptor: String,
 }
 
 #[derive(Debug, Error)]

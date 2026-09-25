@@ -1683,6 +1683,164 @@ impl Database {
         tx.commit()?;
         Ok(entry)
     }
+
+    // -----------------------------------------------------------------------
+    // Billing: atomic quota movement
+    //
+    // These are the storage primitives the billing engine drives. Each guard
+    // and the mutation it authorises happen in one statement so two concurrent
+    // requests cannot both pass a stale check and over-spend.
+    // -----------------------------------------------------------------------
+
+    /// Atomically move `amount` out of an API key's quota.
+    ///
+    /// Returns `Ok(true)` when the key had room. A key with no quota ceiling
+    /// (`quota_micros == 0`) is unlimited, matching NewAPI's semantics.
+    pub fn try_reserve_key_quota(
+        &self,
+        key_id: &str,
+        amount: i64,
+    ) -> SqliteResult<bool> {
+        if amount <= 0 {
+            return Ok(true);
+        }
+        let changed = self.conn.lock().execute(
+            "UPDATE api_keys SET used_micros = used_micros + ?2 \
+             WHERE id = ?1 AND (quota_micros = 0 OR used_micros + ?2 <= quota_micros)",
+            params![key_id, amount],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Unconditionally move `amount` out of an API key's used-quota counter.
+    ///
+    /// Used at settlement, where a key may legitimately exceed its ceiling
+    /// (the request is already served; the overage must be recorded).
+    pub fn debit_key_quota(&self, key_id: &str, amount: i64) -> SqliteResult<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.conn.lock().execute(
+            "UPDATE api_keys SET used_micros = used_micros + ?2 WHERE id = ?1",
+            params![key_id, amount],
+        )?;
+        Ok(())
+    }
+
+    /// Move `amount` back into an API key's counter, never below zero.
+    pub fn credit_key_quota(&self, key_id: &str, amount: i64) -> SqliteResult<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.conn.lock().execute(
+            "UPDATE api_keys SET used_micros = MAX(0, used_micros - ?2) WHERE id = ?1",
+            params![key_id, amount],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically move `amount` out of a user's wallet.
+    ///
+    /// Returns `Ok(false)` when the wallet cannot cover it.
+    pub fn try_reserve_wallet(
+        &self,
+        user_id: &str,
+        amount: i64,
+    ) -> SqliteResult<bool> {
+        if amount <= 0 {
+            return Ok(true);
+        }
+        let changed = self.conn.lock().execute(
+            "UPDATE users SET balance_micros = balance_micros - ?2, updated_at = ?3 \
+             WHERE id = ?1 AND balance_micros >= ?2",
+            params![user_id, amount, Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Move `amount` out of a wallet, allowing it to go negative (debt).
+    ///
+    /// Settlement may exceed the reservation; the wallet absorbs the difference
+    /// rather than the request becoming free.
+    pub fn debit_wallet(&self, user_id: &str, amount: i64) -> SqliteResult<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.conn.lock().execute(
+            "UPDATE users SET balance_micros = balance_micros - ?2, updated_at = ?3 WHERE id = ?1",
+            params![user_id, amount, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Move `amount` into a wallet.
+    pub fn credit_wallet(&self, user_id: &str, amount: i64) -> SqliteResult<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.conn.lock().execute(
+            "UPDATE users SET balance_micros = balance_micros + ?2, updated_at = ?3 WHERE id = ?1",
+            params![user_id, amount, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Append a ledger entry **without** moving the balance.
+    ///
+    /// Billing settlements move the balance through `debit_wallet`/`credit_wallet`
+    /// (which the billing session owns); this records the reason alongside the
+    /// current balance so the wallet history stays explainable. Doing both in
+    /// one call would double-charge.
+    pub fn append_ledger_entry(
+        &self,
+        user_id: &str,
+        amount_micros: i64,
+        kind: &str,
+        description: &str,
+        reference_id: Option<&str>,
+    ) -> SqliteResult<LedgerEntry> {
+        let conn = self.conn.lock();
+        let balance: i64 = conn.query_row(
+            "SELECT COALESCE(balance_micros, 0) FROM users WHERE id=?1",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        let now = Utc::now();
+        let entry = LedgerEntry {
+            id: Uuid::new_v4().to_string(),
+            user_id: user_id.to_string(),
+            amount_micros,
+            balance_after_micros: balance,
+            kind: kind.to_string(),
+            description: description.to_string(),
+            reference_id: reference_id.map(str::to_string),
+            created_at: now,
+        };
+        conn.execute("INSERT INTO ledger_entries (id,user_id,amount_micros,balance_after_micros,kind,description,reference_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![entry.id,entry.user_id,entry.amount_micros,entry.balance_after_micros,entry.kind,entry.description,entry.reference_id,entry.created_at.to_rfc3339()])?;
+        Ok(entry)
+    }
+
+    /// Total quota consumed by one API key, in micros.
+    pub fn key_used_micros(&self, key_id: &str) -> SqliteResult<i64> {
+        let conn = self.conn.lock();
+        let value: i64 = conn.query_row(
+            "SELECT COALESCE(used_micros, 0) FROM api_keys WHERE id = ?1",
+            params![key_id],
+            |r| r.get(0),
+        )?;
+        Ok(value)
+    }
+
+    /// A user's current wallet balance, in micros.
+    pub fn wallet_balance(&self, user_id: &str) -> SqliteResult<i64> {
+        let conn = self.conn.lock();
+        let value: i64 = conn.query_row(
+            "SELECT COALESCE(balance_micros, 0) FROM users WHERE id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )?;
+        Ok(value)
+    }
     pub fn list_ledger(&self, user_id: &str) -> SqliteResult<Vec<LedgerEntry>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id,user_id,amount_micros,balance_after_micros,kind,description,reference_id,created_at FROM ledger_entries WHERE user_id=?1 ORDER BY created_at DESC")?;

@@ -18,8 +18,10 @@ pub mod chat_quota;
 pub mod estimator;
 pub mod expr;
 pub mod price;
+pub mod pricing;
 pub mod quota_math;
 pub mod session;
+pub mod service;
 pub mod usage;
 
 pub use chat_quota::{compute_chat_quota, ChatQuotaRequest, ChatQuotaResult};
@@ -29,10 +31,17 @@ pub use expr::{
     ExprOutcome, TokenParams,
 };
 pub use price::{PriceData, QUOTA_PER_UNIT};
+pub use pricing::{
+    BillingMode, Pricing, PricingDocument, PricingLoadError, PricingMeta, PricingTables,
+    DEFAULT_GROUP_RATIO,
+};
 pub use quota_math::{
     quota_from_decimal, quota_from_decimal_checked, quota_from_decimal_strict, quota_from_f64,
     quota_round, quota_round_checked, wallet_quota_from_decimal, QuotaClamp, QuotaClampKind,
     MAX_QUOTA, MAX_WALLET_QUOTA, MIN_QUOTA,
 };
 pub use session::{BillingError, BillingSession, BillingState};
+pub use service::{
+    BillingPath, BillingPolicy, BillingService, BillingStore, Charge,
+};
 pub use usage::{BillingUsage, UsageDetails, UsageSemantic};
