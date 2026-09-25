@@ -333,19 +333,17 @@ async fn chat_completions(
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
 
-    let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid JSON body"),
-    };
-
-    let stream = is_stream_request(&headers, &parsed);
+    // Parse only to reject a malformed body early and with a clean message;
+    // `dispatch_openai` re-parses it and detects streaming itself.
+    if let Err(_) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid JSON body");
+    }
     dispatch_openai(
         state,
         "/v1/chat/completions",
         body_bytes,
         "gpt-3.5-turbo",
         headers,
-        stream,
     )
     .await
 }
@@ -355,10 +353,7 @@ async fn text_completions(
     request: Request,
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
-    let stream = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .map(|v| is_stream_request(&headers, &v))
-        .unwrap_or(false);
-    dispatch_openai(state, "/v1/completions", body_bytes, "gpt-3.5-turbo", headers, stream).await
+    dispatch_openai(state, "/v1/completions", body_bytes, "gpt-3.5-turbo", headers).await
 }
 
 async fn embeddings(State(state): State<std::sync::Arc<AppState>>, request: Request) -> Response {
@@ -369,7 +364,6 @@ async fn embeddings(State(state): State<std::sync::Arc<AppState>>, request: Requ
         body_bytes,
         "text-embedding-3-small",
         headers,
-        false,
     )
     .await
 }
@@ -379,7 +373,7 @@ async fn image_generations(
     request: Request,
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
-    dispatch_openai(state, "/v1/images/generations", body_bytes, "dall-e-3", headers, false).await
+    dispatch_openai(state, "/v1/images/generations", body_bytes, "dall-e-3", headers).await
 }
 
 fn add_response_headers(
@@ -514,11 +508,15 @@ async fn dispatch_openai(
     body_bytes: Vec<u8>,
     default_fallback_model: &str,
     headers: axum::http::HeaderMap,
-    stream: bool,
 ) -> Response {
     let start = Instant::now();
     let parsed: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+
+    // Streaming is detected here rather than passed in, because a caller that
+    // forgot to forward `stream: true` would send a non-streaming upstream
+    // request whose SSE body the response converter then fails to parse.
+    let stream = is_stream_request(&headers, &parsed);
 
     let router = ModelRouter::new();
     let decision = router.resolve_auto(&parsed, path);
@@ -1354,7 +1352,6 @@ async fn responses_endpoint(
         body_bytes,
         "gpt-4o-mini",
         headers,
-        false,
     )
     .await
 }
@@ -1370,7 +1367,6 @@ async fn messages_endpoint(
         body_bytes,
         "claude-3-haiku",
         headers,
-        false,
     )
     .await
 }
@@ -1386,7 +1382,6 @@ async fn rerank_endpoint(
         body_bytes,
         "rerank-english-v3.0",
         headers,
-        false,
     )
     .await
 }
@@ -1399,7 +1394,6 @@ async fn audio_speech(State(state): State<std::sync::Arc<AppState>>, request: Re
         body_bytes,
         "tts-1",
         headers,
-        false,
     )
     .await
 }
@@ -1415,7 +1409,6 @@ async fn audio_transcription(
         body_bytes,
         "whisper-1",
         headers,
-        false,
     )
     .await
 }
@@ -1431,7 +1424,6 @@ async fn audio_translation(
         body_bytes,
         "whisper-1",
         headers,
-        false,
     )
     .await
 }
@@ -1444,7 +1436,6 @@ async fn image_edits(State(state): State<std::sync::Arc<AppState>>, request: Req
         body_bytes,
         "dall-e-3",
         headers,
-        false,
     )
     .await
 }
@@ -1460,7 +1451,6 @@ async fn image_variations(
         body_bytes,
         "dall-e-3",
         headers,
-        false,
     )
     .await
 }

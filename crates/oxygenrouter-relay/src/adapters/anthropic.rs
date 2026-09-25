@@ -17,7 +17,7 @@ use crate::convert::openai_to_claude;
 use crate::error::RelayError;
 use crate::sse::claude::ClaudeToOpenAiStream;
 use crate::usage::extract_claude_usage;
-use crate::value::{RelayInfo, RelayValue, Usage};
+use crate::value::{RelayFormat, RelayInfo, RelayValue, Usage};
 
 /// Default Anthropic API version header.
 pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -88,7 +88,20 @@ impl Adaptor for AnthropicAdaptor {
         info: &RelayInfo,
         resp: &UpstreamResponse,
     ) -> Result<AdaptedResponse, RelayError> {
+        // Shape the response after what the *client* asked for, not what the
+        // provider speaks. A client posting to `/v1/messages` expects Anthropic
+        // shape, so the upstream body passes through unchanged; a client posting
+        // OpenAI shape gets the translation. Returning OpenAI shape to an
+        // Anthropic client is the bug this branch exists to prevent.
+        let client_speaks_claude = info.relay_format == RelayFormat::Claude;
+
         if info.is_stream && resp.is_stream {
+            if client_speaks_claude {
+                // Already Anthropic SSE: forward verbatim, but still read the
+                // usage out for billing.
+                let (body, usage) = crate::sse::claude::pass_through_stream(&resp.body);
+                return Ok(AdaptedResponse { body, usage });
+            }
             let mut conv = ClaudeToOpenAiStream::new(&info.origin_model);
             let (body, usage) = conv.run(&resp.body);
             return Ok(AdaptedResponse {
@@ -96,7 +109,14 @@ impl Adaptor for AnthropicAdaptor {
                 usage,
             });
         }
+
         let usage = extract_claude_usage(&resp.body);
+        if client_speaks_claude {
+            return Ok(AdaptedResponse {
+                body: resp.body.clone(),
+                usage,
+            });
+        }
         let body = crate::convert::claude_to_openai::convert_response(&resp.body, &info.origin_model)?;
         Ok(AdaptedResponse {
             body: body.into(),

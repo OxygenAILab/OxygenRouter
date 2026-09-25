@@ -25,16 +25,58 @@ This document records verified project facts. Update it whenever a fact changes.
 - **Icons**: lucide-react 0.294
 - **State management**: @tanstack/react-query 5
 
-### Implemented relay endpoints (13, `crates/oxygenrouter-webui/src/proxy.rs`)
+### Implemented relay endpoints (29, `crates/oxygenrouter-webui/src/proxy.rs`)
 - `/v1/chat/completions` — streaming (SSE) + non-streaming
 - `/v1/completions`
-- `/v1/embeddings`
+- `/v1/embeddings`, `/v1/engines/:model/embeddings`
 - `/v1/responses`
-- `/v1/messages` (Anthropic-format)
+- `/v1/messages` (Anthropic-format), `/v1/messages/count_tokens`
 - `/v1/rerank`
+- `/v1/moderations`, `/v1/edits`
+- `/v1beta/models/*path` — Gemini native inbound
+- `/v1/files`, `/v1/files/:id`, `/v1/files/:id/content`
+- `/v1/batches`, `/v1/batches/:id`, `/v1/batches/:id/cancel`
+- `/v1/fine_tuning/jobs` (+ `:id`, `:id/cancel`, `:id/events`)
 - `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`
 - `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations`
-- `/v1/models` (currently a static list; dynamic-from-DB is pending)
+- `/v1/models`, `/v1/models/:model` (both derived from the database)
+
+### Client dialect is honoured on an OpenAI channel (verified 2026-09-26)
+
+A client posting Anthropic shape to `/v1/messages` gets Anthropic shape back even
+when the selected channel speaks OpenAI, and — the part that was broken — gets its
+**content**. `OpenAiAdaptor::request_url` addresses such a request to
+`{base}/v1/chat/completions` and `convert_request` translates the body
+(`crates/oxygenrouter-relay/src/convert/claude_to_openai_request.rs`). The
+reference behaves the same way (`relay/channel/openai/adaptor.go:180-184`
+hard-codes the chat route for a Claude-format relay).
+
+Evidence, all four quadrants against the live NewAPI instance:
+
+| Client | Channel | Expected | Observed |
+|---|---|---|---|
+| OpenAI | OpenAI | `chat.completion` + text | `content='PING'`, usage `10/2/12` |
+| Claude | OpenAI | `type=message` + text | `content=[{"type":"text","text":"PING"}]`, usage `input=10 output=2` |
+| Claude | Anthropic | pass-through | `content=[{"type":"text","text":"PING"}]` |
+| OpenAI | Anthropic | translated to OpenAI | `content='PING'` |
+
+Streaming, Claude client through an OpenAI channel: `message_start`,
+`content_block_start`, 26 × `content_block_delta`, `content_block_stop`,
+`message_delta`, `message_stop` — with real text, and `tokens_used=2033` recorded
+on the log row (it was `0` while streaming was broken).
+
+**Why it survived review:** the earlier check asserted *shape* only
+(`type == "message"`, `content` is a list). An empty answer satisfies both. The
+regression guard therefore asserts on the URL and on the extracted text:
+`crates/oxygenrouter-relay/tests/openai_channel_serves_claude_clients.rs`.
+Removing the URL guard makes it fail (mutation-verified).
+
+### Streaming asks the upstream to report usage
+
+`claude_to_openai_request::convert` sets `stream_options.include_usage` on any
+streamed request. Without it an OpenAI upstream omits the terminal usage chunk and
+the request settles at zero — the same defect class as the hard-coded
+`stream: false` fixed earlier.
 
 ### Provider adapters — now wired (2026-09-25)
 
@@ -231,6 +273,21 @@ a concurrent 20-thread test proves reservation cannot overspend).
    accepted `area-N`, so `ap-southeast-2` failed and Bedrock fell back to
    `us-east-1`. Caught by adaptor contract tests.
 
+### Fixed defects (2026-09-26)
+
+3. **A Claude client on an OpenAI channel received an empty answer.** The OpenAI
+   adaptor appended the client's own path to the base URL, so `POST /v1/messages`
+   was forwarded as `/v1/messages` — a route an OpenAI upstream does not serve in
+   OpenAI shape — while carrying an *Anthropic* body. The reply was then handed to
+   the OpenAI→Claude converter, which found no `choices` and returned a valid but
+   empty content block. Fixed by routing such requests to
+   `{base}/v1/chat/completions` and translating the request body
+   (`convert/claude_to_openai_request.rs`). Two earlier checks missed it because
+   they asserted shape only; the new guard asserts the text.
+4. **`stream_options.include_usage` was never set.** Now added on every streamed
+   request, so the upstream's terminal usage frame exists and the request bills
+   its real token count instead of zero.
+
 ### Failure modes that trigger channel switch
 - HTTP 401, 403, 408, 425, 429
 - HTTP 500, 502, 503, 504
@@ -259,7 +316,17 @@ a concurrent 20-thread test proves reservation cannot overspend).
   read as a behavioral specification only — its code must never be copied.
 
 ## Open questions
-- _None recorded_
+- **Gemini-native inbound on a pure OpenAI channel.** `POST /v1beta/models/*path`
+  is forwarded verbatim (`proxy.rs:gemini_inbound`). That works when the upstream
+  itself understands Gemini (the live NewAPI instance does), because it answers in
+  the format it was asked in. It does *not* work against a plain OpenAI-compatible
+  server such as vLLM, which has no `/v1beta` route — there is no
+  `gemini_to_openai` *request* converter yet, only the response direction. The
+  reference handles it the same way it handles Claude inbound, by forcing
+  `{base}/v1/chat/completions` and translating
+  (`relay/channel/openai/adaptor.go:180-184`); we have not yet mirrored that for
+  Gemini. Tracked as part of the P4 remainder. Same shape of defect as the Claude
+  one fixed above, caught by reading the reference rather than by a failing test.
 
 ## Pending decisions
 - _None recorded_

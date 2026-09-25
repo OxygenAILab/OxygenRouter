@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (P4 — client dialect)
+- **A Claude client routed to an OpenAI channel received an empty answer.** The OpenAI
+  adaptor appended the client's path to the base URL, so `POST /v1/messages` was forwarded
+  to `/v1/messages` — a route an OpenAI upstream does not serve in OpenAI shape — while
+  carrying an Anthropic body. The Anthropic reply was then handed to the OpenAI→Claude
+  converter, which found no `choices` and returned a well-formed but **empty** content
+  block. Such a request is now aimed at `{base}/v1/chat/completions` and its body is
+  translated by the new `convert/claude_to_openai_request.rs` (system hoisting,
+  `stop_sequences`→`stop`, `tools[].input_schema`→`function.parameters`,
+  `tool_use`→`tool_calls`, `tool_result`→`tool` messages with images kept off the tool
+  message, `image`→`image_url` data URLs). The reference does the same: a Claude-format
+  relay hard-codes the chat route (`relay/channel/openai/adaptor.go:180-184`).
+  The two earlier checks missed this because they asserted *shape* — `type == "message"`
+  and `content` being a list — and an empty answer satisfies both.
+- **`stream_options.include_usage` was never set on streamed requests.** An OpenAI upstream
+  omits the terminal usage frame without it, so the request settled at zero. Same defect
+  class as the hard-coded `stream: false` fixed in P2.
+
+### Verified (P4)
+- All four client/channel quadrants end to end against the live NewAPI instance:
+  OpenAI→`chat.completion` `'PING'` (usage 10/2/12); Claude client on an OpenAI channel →
+  `content=[{"type":"text","text":"PING"}]` with Anthropic usage (input 10, output 2);
+  Claude client on an Anthropic channel → pass-through; OpenAI client on an Anthropic
+  channel → translated. Streaming through the OpenAI channel emits the full Anthropic
+  event sequence (`message_start`, `content_block_start`, deltas, `content_block_stop`,
+  `message_delta`, `message_stop`) with real text, and `tokens_used=2033` reaches the log
+  row where it used to be `0`.
+- Mutation check: removing the new URL guard makes
+  `openai_channel_serves_claude_clients` fail, so the guard is load-bearing.
+- `cargo test --workspace` → **264 passed / 0 failed**, zero warnings.
+
 ### Added
 - **Priority-tiered failover, auto-disable, rate limiting, and a global concurrency ceiling** (P3).
   - The attempt counter indexes priority tiers, so the first attempt takes the best priority and
@@ -42,13 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The four handlers that re-implemented dispatch (`chat_completions`, `text_completions`,
   `embeddings`, `image_generations`) now delegate to the shared `dispatch_openai`, removing ~240
   duplicated lines and routing every endpoint through one billing-aware path.
-- `dispatch_openai` takes an explicit `stream` flag; streaming requests are now billed from their
-  final SSE usage frame instead of being charged as empty non-streaming calls.
+- `dispatch_openai` detects streaming itself rather than taking a flag from each caller: a caller
+  that forgot to forward `stream: true` would send a non-streaming upstream request whose SSE body
+  the response converter then cannot parse. Streaming requests bill from their final SSE usage frame
+  instead of being charged as empty non-streaming calls.
 
 ### Fixed
 - **Streaming requests were charged zero and lost their content type.** `dispatch_openai` hard-coded
   `stream: false`, so an SSE request was sent non-streaming and its response was typed
-  `application/json`. Drove found by end-to-end verification, not unit tests.
+  `application/json`. Found by end-to-end verification, not unit tests.
 - The `Footer` option default leaked another project's watermark
   (`GitHub@NDBlockConnect | BlockConnect@StarsailsClover`); it now carries this repository's mark.
 

@@ -23,6 +23,95 @@ use crate::convert::claude_to_openai::map_stop_reason;
 use crate::value::Usage;
 
 /// Streaming converter holding per-stream state.
+/// Forward an Anthropic SSE stream to a client that already speaks Anthropic.
+///
+/// Nothing is rewritten: the client asked for Anthropic and the upstream speaks
+/// Anthropic, so any reshaping would be a bug. The stream is still parsed to
+/// accumulate the usage Anthropic splits across `message_start` (input,
+/// cache read, cache creation) and `message_delta` (output), because billing
+/// needs the numbers and cannot read them from a forwarded byte stream.
+pub fn pass_through_stream(body: &[u8]) -> (bytes::Bytes, Usage) {
+    let text = String::from_utf8_lossy(body);
+    let mut usage = Usage {
+        semantic: "anthropic".to_string(),
+        ..Default::default()
+    };
+
+    for frame in parse_sse_frames(&text) {
+        let Some(data) = frame.data else { continue };
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let etype = ev
+            .get("type")
+            .and_then(|v| v.as_str())
+            .or(frame.event.as_deref())
+            .unwrap_or("");
+
+        match etype {
+            "message_start" => {
+                if let Some(u) = ev.get("message").and_then(|m| m.get("usage")) {
+                    merge_anthropic_usage(&mut usage, u);
+                }
+            }
+            // The terminal delta carries the final output token count.
+            "message_delta" => {
+                if let Some(u) = ev.get("usage") {
+                    merge_anthropic_usage(&mut usage, u);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    normalize_anthropic_usage(&mut usage);
+    (body.to_vec().into(), usage)
+}
+
+/// Fold an Anthropic usage object into an accumulating `Usage`.
+///
+/// Each field is *overwritten*, not summed: Anthropic reports every counter once
+/// per stream, and a later `message_delta` carries the final value. Summing here
+/// would double-count the cache fields when both `message_start` and
+/// `message_delta` report them.
+///
+/// Raw fields are stored as Anthropic sent them. Normalizing to OpenAI semantics
+/// (where `prompt_tokens` is the full input total) happens once, in
+/// [`normalize_anthropic_usage`], so the result matches the non-streaming
+/// `extract_claude_usage` path exactly.
+fn merge_anthropic_usage(usage: &mut Usage, u: &Value) {
+    if let Some(v) = u.get("input_tokens").and_then(|v| v.as_i64()) {
+        usage.prompt_tokens = v;
+    }
+    if let Some(v) = u.get("output_tokens").and_then(|v| v.as_i64()) {
+        usage.completion_tokens = v;
+    }
+    if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
+        usage.cached_tokens = v;
+    }
+    if let Some(v) = u.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
+        usage.cache_creation_tokens = v;
+    }
+}
+
+/// Convert accumulated Anthropic counters to the OpenAI-normalized totals the
+/// billing engine expects: `prompt_tokens` covers the whole input, with the
+/// cache categories also reported separately.
+///
+/// Byte-for-byte the same rule as `usage::extract_claude_usage`, so a streamed
+/// request and a buffered one bill identically.
+fn normalize_anthropic_usage(usage: &mut Usage) {
+    let input = usage.prompt_tokens;
+    let cached = usage.cached_tokens;
+    let created = usage.cache_creation_tokens;
+    usage.prompt_tokens = input + cached + created;
+    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+}
+
 pub struct ClaudeToOpenAiStream<'a> {
     model: &'a str,
     id: String,
@@ -404,5 +493,58 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
         assert_eq!(usage.cache_creation_tokens, 3);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 10 + 5 + 3 + 7);
+    }
+
+    #[test]
+    fn pass_through_forwards_anthropic_bytes_unchanged() {
+        let payload = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":2}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (body, usage) = pass_through_stream(payload.as_bytes());
+        // Nothing may be rewritten: the client asked for Anthropic.
+        assert_eq!(String::from_utf8_lossy(&body), payload);
+        // Billing still needs what Anthropic splits across two events.
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.cached_tokens, 4);
+        assert_eq!(usage.cache_creation_tokens, 2);
+        assert_eq!(usage.prompt_tokens, 16);
+        assert_eq!(usage.total_tokens, 21);
+    }
+
+    #[test]
+    fn usage_reported_twice_is_not_double_counted() {
+        let payload = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":4}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":4,\"output_tokens\":7}}\n\n",
+        );
+        let (_, usage) = pass_through_stream(payload.as_bytes());
+        assert_eq!(usage.cached_tokens, 4, "cache reads must not be summed");
+        assert_eq!(usage.prompt_tokens, 14);
+        assert_eq!(usage.completion_tokens, 7);
+    }
+
+    #[test]
+    fn pass_through_tolerates_a_truncated_stream() {
+        let payload = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n";
+        let (body, usage) = pass_through_stream(payload.as_bytes());
+        assert_eq!(String::from_utf8_lossy(&body), payload);
+        assert_eq!(usage.prompt_tokens, 3);
+    }
+
+    #[test]
+    fn pass_through_of_non_sse_text_is_intact_with_zero_usage() {
+        let payload = "not an sse stream at all";
+        let (body, usage) = pass_through_stream(payload.as_bytes());
+        assert_eq!(String::from_utf8_lossy(&body), payload);
+        assert_eq!(usage.total_tokens, 0);
     }
 }
