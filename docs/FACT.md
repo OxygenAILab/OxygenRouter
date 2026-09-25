@@ -99,11 +99,42 @@ Subscriptions, Admin Users, Admin Billing.
 `subscriptions`, `redemption_codes`, `redemption_uses`, `payment_orders`.
 
 ### Test & build baseline (2026-09-25)
-- `cargo test --workspace` → **163 passed / 0 failed**, zero build warnings
+- `cargo test --workspace` → **193 passed / 0 failed**, zero build warnings
   (`billing` 102 unit + 3 oracle-differential, `relay` 15 unit + 20 adaptor-contract,
   `webui` 8 billing-store + 5 usage-mapping, `core` 5 unit + 5 config-compat)
 - `npm run build` (tsc + vite) → **passes** (2,032 modules)
 - `cargo check --workspace` → clean
+
+### Routing & reliability (P3) — verified end to end
+
+Selection and protection, in `crates/oxygenrouter-proxy/src/selection.rs` and
+`limits.rs`:
+
+| Capability | Behaviour |
+|---|---|
+| Priority-tiered failover | the attempt counter indexes the priority tiers; each retry steps down, and a tier whose members were all attempted falls through |
+| Smoothing-weighted pick | within a tier, matching NewAPI: an all-zero weight set gets equal weight; an average below 10 amplifies weights by 100 |
+| Auto-disable | N consecutive failures exclude a channel from selection; the counter resets on success |
+| Rate limiting | fixed-window counters scoped by client token (else IP) |
+| Concurrency ceiling | global in-flight limit with a drop-guard permit — **NewAPI does not enforce one** |
+
+**Verified** against a live upstream with a dead primary (priority 10) and a
+healthy backup (priority 1):
+
+| Check | Evidence |
+|---|---|
+| Failover works | **5/5** requests `200` served by `backup`; before the fix every one returned `502` |
+| Auto-disable engages | latency `10,129 ms` on the first request (tries the dead primary) then `~1,600 ms` once it is excluded |
+| Failover is auditable | log row shows winner `backup` with `failed over: <primary-id>` |
+| Concurrency ceiling | ceiling 2 with 6 concurrent requests → **exactly 2 × `200`, 4 × `429`** |
+| Quota rejection | insufficient balance → **`403`** with the real balance, matching NewAPI (`billing_session.go`); `429` is reserved for rate limiting |
+
+One correctness fix worth calling out: **failover did not work at all** before
+this change. Exhaustion was judged on the candidate set *after* removing
+already-tried channels, so a two-channel deployment gave up after one failure
+instead of using its backup. Every request with a dead primary returned `502`.
+Unit tests did not catch it because the selection tests exercised the tier walk
+without exclusions; the end-to-end run did.
 
 ### Billing is live on the request path (verified end to end)
 

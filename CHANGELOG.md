@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Priority-tiered failover, auto-disable, rate limiting, and a global concurrency ceiling** (P3).
+  - The attempt counter indexes priority tiers, so the first attempt takes the best priority and
+    each retry steps down; a tier whose members were all attempted falls through to the next.
+  - Within a tier, smoothing-weighted random pick matching NewAPI: an all-zero weight set gets equal
+    weight, and an average below 10 amplifies every weight by 100 so small weights still spread load.
+  - Auto-disable after N consecutive failures, reset on success.
+  - Fixed-window rate limiting scoped by client token, falling back to IP.
+  - A global in-flight ceiling with a drop-guard permit. **NewAPI does not enforce one.**
+  - Failed channels are recorded on the response and in the request log, so a failover is auditable
+    rather than invisible.
+
+### Fixed (P3)
+- **Failover did not work at all.** Exhaustion was judged on the candidate set *after* removing
+  already-tried channels, so a two-channel deployment gave up after one failure instead of using its
+  backup — every request with a dead primary returned `502`. Exhaustion is now judged on the full
+  candidate set, with exclusions applied inside each tier. Verified: 5/5 requests now succeed via the
+  backup, and auto-disable shows as latency dropping from 10.1 s to 1.6 s.
+- **Insufficient quota answered `429`.** NewAPI reserves `429` for rate limiting and answers
+  insufficient quota with `403 Forbidden` (`billing_session.go`); we now match.
+- The quota error printed a placeholder `available 0`; it reports the real balance, and says
+  "unknown" rather than a misleading zero when no layer could read it.
+- Model-map globbing anchoring was wrong (`4o*` matched `gpt-4o`, `*4o` matched `gpt-4o-mini`).
+
 - **Billing is wired into the request path.** Pre-consume → settle → refund now runs on every relay
   request that carries a wallet-backed key: the wallet is debited, the key's usage moves, and
   `request_logs.tokens_used` is populated with the upstream's real token count (it was always `NULL`).
