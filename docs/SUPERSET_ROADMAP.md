@@ -391,21 +391,38 @@ default `max_retries > 0` to actually get multi-channel resilience (an improveme
 
 ## 5. P4 — Protocol Superset
 
-Add missing endpoints on top of P1:
-- `POST /v1/moderations`
-- `POST /v1/batches` + `/v1/files` (upload/list/get/content/delete)
-- `GET /v1/responses` WebSocket (Responses streaming session)
-- `GET /v1/realtime` WebSocket (Realtime API)
-- `POST /v1/responses/compact`, `POST /v1/alpha/search`
-- `POST /v1/messages/count_tokens`
-- Native inbound `/v1/messages` (Anthropic-format request → adaptors)
-- Native inbound `/v1beta/models/*path` (Gemini-format request)
-- `/v1/engines/:model/embeddings`
-- Codex credential refresh + usage endpoints
-- vLLM / SGLang per-channel metrics
+Add missing endpoints on top of P1. Status as of `7f553df`:
 
-Also fix: `/v1/models` must be **dynamic** (from DB `model_list` + `model_metadata`),
-not the current static hard-coded list.
+**Landed**
+- ✅ `POST /v1/moderations`
+- ✅ `POST /v1/batches` + `/v1/files` (upload/list/get/content/delete)
+- ✅ `POST /v1/messages/count_tokens`
+- ✅ Native inbound `/v1/messages` — and it now *works*: see the dialect fix in
+  `docs/FACT.md`, where a Claude client on an OpenAI channel received an empty
+  answer because the request was aimed at the wrong route.
+- ✅ `/v1/engines/:model/embeddings`
+- ✅ `/v1/models` is dynamic (DB `model_list` + `model_metadata`), plus
+  `GET`/`DELETE /v1/models/:model`
+- ✅ `POST /v1/fine_tuning/jobs` (+ `:id`, `:id/cancel`, `:id/events`), `/v1/edits`
+
+**Remaining**
+- ❌ `GET /v1/responses` WebSocket (Responses streaming session)
+- ❌ `GET /v1/realtime` WebSocket (Realtime API)
+- ❌ `POST /v1/responses/compact`, `POST /v1/alpha/search`
+- ❌ **Gemini-native inbound on a plain OpenAI channel.** `/v1beta/models/*path` is
+  forwarded verbatim, which works only when the upstream itself speaks Gemini.
+  There is no `gemini_to_openai` *request* converter yet, so a vLLM/SGLang channel
+  cannot serve a Gemini client. The reference forces
+  `{base}/v1/chat/completions` and translates
+  (`relay/channel/openai/adaptor.go:180-184`); we have not mirrored that.
+- ❌ Codex credential refresh + usage endpoints
+- ❌ vLLM / SGLang per-channel metrics
+
+**Still open from the dialect work:** the OpenAI adaptor is the only one that
+reshapes a Claude client's request. Anthropic/Azure/Bedrock have their own
+correct routing, but `AdvancedCustom`, `Ollama` and the OpenAI-compatible shims
+still append `info.request_path` verbatim, so a Claude client on those channels
+has the same wrong-route hazard that was just fixed for `OpenAI`.
 
 ---
 
