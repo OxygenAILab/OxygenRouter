@@ -83,10 +83,11 @@ crates/
 └── oxygenrouter-bin/    # CLI entry — console subsystem on Windows
 ```
 
-> **Current wiring status:** `oxygenrouter-relay` is built and tested (9 adapters, 101 public
-> items, 15 unit tests) but is **not yet a dependency of `oxygenrouter-webui`**, so relay traffic
-> still flows through the legacy pass-through client. Wiring it in is the top priority of the
-> superset program — see [`docs/research/NEWAPI_SUPERSET_ANALYSIS.md`](./docs/research/NEWAPI_SUPERSET_ANALYSIS.md).
+> **Adapter layer:** `Channel.provider` is now real. `oxygenrouter-proxy/src/dispatch.rs` picks the
+> adaptor for a channel's provider, translates the request into that provider's wire format, and
+> translates the response (including SSE) back to the client — so a `provider=anthropic` channel
+> serves an OpenAI client transparently. Pass-through providers share the same code path.
+> See [`docs/FACT.md`](./docs/FACT.md) for verified end-to-end evidence.
 
 ### How channel rotation works
 

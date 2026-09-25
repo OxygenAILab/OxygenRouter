@@ -36,12 +36,50 @@ This document records verified project facts. Update it whenever a fact changes.
 - `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations`
 - `/v1/models` (currently a static list; dynamic-from-DB is pending)
 
-> **Not yet wired:** `crates/oxygenrouter-relay` provides 9 provider adapters
-> (OpenAI, Anthropic, Gemini, Bedrock+SigV4, Vertex, Ollama, Cohere, Azure,
-> AdvancedCustom) plus OpenAI↔Claude / OpenAI↔Gemini converters and SSE state
-> machines — 101 public items, 15 unit tests passing — but `oxygenrouter-webui`
-> does not yet depend on it, so production traffic still uses the legacy
-> pass-through client. This is the top priority of the superset program.
+### Provider adapters — now wired (2026-09-25)
+
+`oxygenrouter-relay` supplies 9 provider adapters (OpenAI, Anthropic, Gemini,
+Bedrock+SigV4, Vertex, Ollama, Cohere, Azure, AdvancedCustom) plus
+OpenAI↔Claude / OpenAI↔Gemini converters and SSE state machines.
+
+The wiring lives in `oxygenrouter-proxy/src/dispatch.rs`: for every attempt the
+scheduler resolves the channel's `ApiType`, builds the matching adaptor,
+translates the inbound body into that provider's wire format, and translates the
+response (including SSE) back — extracting billing usage on the way. Pass-through
+providers take the same path via `RelayFormat::Raw`, so there is one code path.
+
+Per-request adaptor work completed in this change:
+
+- `RelayInfo` now carries `api_key` / `credential_raw` / `request_path`, so
+  adaptors can emit provider auth (previously `setup_headers` discarded `_info`
+  and no adapter could ever send a credential).
+- Real auth per provider: `Authorization: Bearer` (OpenAI, Cohere, Ollama,
+  AdvancedCustom, Bedrock API-key mode), `x-api-key` (Anthropic),
+  `x-goog-api-key` (Gemini), `api-key` + `?api-version` (Azure),
+  `Authorization: Bearer` + project/location path (Vertex), SigV4 (Bedrock AKSK).
+- `Adaptor::sign_request` hook added so body-signing providers (SigV4) can run
+  after the body is serialized.
+- URL construction per provider: OpenAI base+path with `/v1` de-duplication,
+  Anthropic `/v1/messages`, Gemini/Vertex `:generateContent` & `:streamGenerateContent`,
+  Azure `/openai/deployments/{model}/...`, Bedrock `/model/{id}/invoke[-with-response-stream]`.
+- `GET /v1/models` is now built from the database (enabled channels' `model_list`
+  plus the model registry) instead of a hard-coded list.
+
+**Verified end-to-end** against the live NewAPI instance on `127.0.0.1:3000` used
+as an upstream channel:
+
+| Check | Result |
+|---|---|
+| Non-streaming chat via the OpenAI adaptor | `200`, real usage `prompt=18 completion=16` |
+| Streaming chat (SSE) | `200 text/event-stream`, 25 `data:` frames |
+| Channel configured as `provider=anthropic` (Claude path) | `200`, Claude→OpenAI response conversion, usage preserved |
+| `GET /v1/models` | DB-derived: the channel's model plus `auto` |
+| Request log | every attempt recorded with channel id, status, duration |
+
+**Still open:** the relay client buffers streaming bodies before adaptor
+translation, so time-to-first-token is not yet incremental; and inbound-format
+selection is wired but response shaping for native `/v1/messages` clients still
+returns OpenAI-shaped JSON. Both are tracked in the superset analysis (§5.2).
 
 ### Admin / user API
 60 routes in `crates/oxygenrouter-webui/src/api.rs`. Groups: channels, keys,
@@ -61,9 +99,24 @@ Subscriptions, Admin Users, Admin Billing.
 `subscriptions`, `redemption_codes`, `redemption_uses`, `payment_orders`.
 
 ### Test & build baseline (2026-09-25)
-- `cargo test --workspace` → **20 passed / 0 failed** (15 in `relay`, 5 in `core`)
+- `cargo test --workspace` → **45 passed / 0 failed**
+  (`relay` 15 unit + 20 adaptor-contract, `core` 5 unit + 5 config-compat)
 - `npm run build` (tsc + vite) → **passes** (2,032 modules)
 - `cargo check --workspace` → clean
+
+### Fixed defects (2026-09-25)
+
+1. **Config loss on partial `config.json`.** `AppSettings` had no per-field serde
+   defaults, so any hand-written config that omitted a field failed to
+   deserialize; startup then saved stock defaults over the operator's file,
+   silently discarding settings such as a custom listen port. Found while
+   bringing up an isolated end-to-end instance. Fixed by adding
+   `#[serde(default = "...")]` to every field (regression test:
+   `crates/oxygenrouter-core/tests/config_compat.rs`) and by making startup
+   refuse to write back a config it could not parse.
+2. **AWS region parsing rejected three-segment regions.** `is_aws_region` only
+   accepted `area-N`, so `ap-southeast-2` failed and Bedrock fell back to
+   `us-east-1`. Caught by adaptor contract tests.
 
 ### Failure modes that trigger channel switch
 - HTTP 401, 403, 408, 425, 429

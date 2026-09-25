@@ -37,8 +37,13 @@ impl Adaptor for GeminiAdaptor {
         }
     }
 
-    fn setup_headers(&self, headers: &mut HeaderMap, _info: &RelayInfo) -> Result<(), RelayError> {
+    fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+        if !info.api_key.is_empty() {
+            let value = HeaderValue::from_str(&info.api_key)
+                .map_err(|e| RelayError::Auth(format!("x-goog-api-key header: {}", e)))?;
+            headers.insert("x-goog-api-key", value);
+        }
         Ok(())
     }
 

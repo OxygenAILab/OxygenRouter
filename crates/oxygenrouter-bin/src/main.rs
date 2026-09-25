@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 #[allow(unused_imports)]
 use oxygenrouter_core::save_config;
 use oxygenrouter_core::{load_config, ChannelSelector, Database, APP_CONFIG};
-use oxygenrouter_proxy::{ChannelScheduler, UpstreamClient};
+use oxygenrouter_proxy::{ChannelScheduler, RelayClient};
 use oxygenrouter_webui::{api, proxy, AppState};
 
 #[tokio::main]
@@ -31,11 +31,22 @@ async fn main() {
     let db_path = data_dir.join("oxygenrouter.db");
     let config_path = data_dir.join("config.json");
 
-    if let Err(e) = load_config(&config_path) {
-        eprintln!("[OxygenRouter] config load error (using defaults): {}", e);
-    }
-    if let Err(e) = save_config(&config_path) {
-        eprintln!("[OxygenRouter] config save error: {}", e);
+    let config_loaded = match load_config(&config_path) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[OxygenRouter] config load error: {}", e);
+            eprintln!(
+                "[OxygenRouter] refusing to write config.json; running with defaults for this session"
+            );
+            false
+        }
+    };
+    // Only write back when we successfully read (or the file did not exist), so
+    // an unreadable file is never clobbered with defaults.
+    if config_loaded {
+        if let Err(e) = save_config(&config_path) {
+            eprintln!("[OxygenRouter] config save error: {}", e);
+        }
     }
 
     let db = match Database::new(&db_path) {
@@ -75,9 +86,28 @@ async fn main() {
     }
 
     let selector = ChannelSelector::new(db.clone());
-    let upstream = UpstreamClient::new();
-    let max_retries = APP_CONFIG.read().max_retries as u32;
-    let scheduler = ChannelScheduler::new(selector, upstream).with_max_retries(max_retries);
+    let (max_retries, user_agent, timeout_ms, backoff_base_ms, immediate_retry) = {
+        let cfg = APP_CONFIG.read();
+        (
+            cfg.max_retries.max(0) as u32,
+            if cfg.user_agent.trim().is_empty() {
+                format!("OxygenRouter/{}", env!("CARGO_PKG_VERSION"))
+            } else {
+                cfg.user_agent.clone()
+            },
+            cfg.upstream_timeout_ms,
+            cfg.retry_delay_ms.max(0) as u64,
+            // "none" reproduces NewAPI's immediate retry; anything else backs off.
+            cfg.retry_backoff.eq_ignore_ascii_case("none"),
+        )
+    };
+    let relay = RelayClient::new(user_agent, timeout_ms);
+    let scheduler = ChannelScheduler::new(selector, relay)
+        .with_max_retries(max_retries)
+        .with_backoff(
+            if immediate_retry { 0 } else { backoff_base_ms },
+            backoff_base_ms.saturating_mul(60).max(30_000),
+        );
 
     let local_token = APP_CONFIG.read().local_api_token.clone();
     let state: Arc<AppState> = Arc::new(AppState::new(

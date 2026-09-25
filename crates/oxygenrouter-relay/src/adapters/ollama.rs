@@ -23,11 +23,21 @@ impl Adaptor for OllamaAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
-        Ok(info.base_url.clone())
+        Ok(crate::adapters::openai::OpenAiAdaptor::join_url(
+            &info.base_url,
+            &info.request_path,
+        ))
     }
 
-    fn setup_headers(&self, headers: &mut HeaderMap, _info: &RelayInfo) -> Result<(), RelayError> {
+    fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+        // Ollama ignores auth locally, but a reverse-proxied Ollama may require
+        // it, so forward the credential when the operator supplied one.
+        if !info.api_key.is_empty() {
+            if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", info.api_key)) {
+                headers.insert("Authorization", value);
+            }
+        }
         Ok(())
     }
 

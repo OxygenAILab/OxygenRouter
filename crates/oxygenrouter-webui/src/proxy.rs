@@ -594,34 +594,75 @@ fn build_streaming_response(body: Vec<u8>, status: u16, headers: &[(String, Stri
     .unwrap_or_else(|_| error_500())
 }
 
-async fn list_models() -> Response {
-    let models = serde_json::json!({
-        "object": "list",
-        "data": [
-            {"id": "gpt-3.5-turbo", "object": "model", "created": 1677610602, "owned_by": "openai"},
-            {"id": "gpt-3.5-turbo-16k", "object": "model", "created": 1683758182, "owned_by": "openai"},
-            {"id": "gpt-4", "object": "model", "created": 1687882411, "owned_by": "openai"},
-            {"id": "gpt-4-32k", "object": "model", "created": 1687882411, "owned_by": "openai"},
-            {"id": "gpt-4o", "object": "model", "created": 1715721543, "owned_by": "openai"},
-            {"id": "gpt-4o-mini", "object": "model", "created": 1720201543, "owned_by": "openai"},
-            {"id": "o1-preview", "object": "model", "created": 1724710400, "owned_by": "openai"},
-            {"id": "o1-mini", "object": "model", "created": 1724710400, "owned_by": "openai"},
-            {"id": "dall-e-3", "object": "model", "created": 1698785189, "owned_by": "openai"},
-            {"id": "tts-1", "object": "model", "created": 1699094024, "owned_by": "openai"},
-            {"id": "tts-1-hd", "object": "model", "created": 1699094024, "owned_by": "openai"},
-            {"id": "whisper-1", "object": "model", "created": 1677532384, "owned_by": "openai"},
-            {"id": "text-embedding-3-small", "object": "model", "created": 1705949951, "owned_by": "openai"},
-            {"id": "text-embedding-3-large", "object": "model", "created": 1705949951, "owned_by": "openai"},
-            {"id": "claude-3-haiku", "object": "model", "created": 1708000000, "owned_by": "anthropic"},
-            {"id": "claude-3-sonnet", "object": "model", "created": 1708000000, "owned_by": "anthropic"},
-            {"id": "claude-3-opus", "object": "model", "created": 1708000000, "owned_by": "anthropic"},
-            {"id": "auto", "object": "model", "created": 1700000000, "owned_by": "system"}
-        ]
-    });
+/// `GET /v1/models` — built from the local database rather than a hard-coded
+/// list, so adding a channel immediately makes its models visible to clients.
+///
+/// Sources, in precedence order:
+/// 1. every model declared by an enabled channel (`channels.model_list`)
+/// 2. every model known to the registry (`model_metadata`)
+///
+/// `owned_by` is the channel's provider for source 1, and the registry vendor
+/// (falling back to the provider) for source 2. The synthetic `auto` entry is
+/// always present because the router accepts it.
+async fn list_models(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    use std::collections::BTreeMap;
+
+    let mut owned: BTreeMap<String, String> = BTreeMap::new();
+
+    if let Ok(channels) = state.db.get_enabled_channels() {
+        for channel in channels {
+            let provider = if channel.provider.trim().is_empty() {
+                "openai".to_string()
+            } else {
+                channel.provider.clone()
+            };
+            for model in channel.model_list {
+                let model = model.trim();
+                if model.is_empty() {
+                    continue;
+                }
+                owned.entry(model.to_string()).or_insert(provider.clone());
+            }
+        }
+    }
+
+    if let Ok(metadata) = state.db.list_model_metadata() {
+        for entry in metadata {
+            if entry.id.trim().is_empty() {
+                continue;
+            }
+            let vendor = if entry.vendor.trim().is_empty() {
+                "system".to_string()
+            } else {
+                entry.vendor.clone()
+            };
+            owned.entry(entry.id.clone()).or_insert(vendor);
+        }
+    }
+
+    let mut data: Vec<serde_json::Value> = owned
+        .into_iter()
+        .map(|(id, owner)| {
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": owner,
+            })
+        })
+        .collect();
+    data.push(serde_json::json!({
+        "id": "auto",
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "system",
+    }));
+
+    let payload = serde_json::json!({ "object": "list", "data": data });
     (
         StatusCode::OK,
         [("content-type", "application/json")],
-        serde_json::to_string(&models).unwrap_or_default(),
+        serde_json::to_string(&payload).unwrap_or_default(),
     )
         .into_response()
 }

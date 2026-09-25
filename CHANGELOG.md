@@ -5,6 +5,45 @@ All notable changes to OxygenRouter are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Provider adapter dispatch** — `Channel.provider` is now functional. New module
+  `oxygenrouter-proxy/src/dispatch.rs` resolves a channel's `ApiType`, builds the matching
+  adaptor from `oxygenrouter-relay`, translates the request into the provider's wire format, and
+  translates the response (including SSE) back to the client, extracting billing usage. Pass-through
+  providers use the same path via `RelayFormat::Raw`.
+- Per-provider authentication, previously impossible: `RelayInfo` now carries `api_key`,
+  `credential_raw`, and `request_path`. `Authorization: Bearer` (OpenAI, Cohere, Ollama, AdvancedCustom,
+  Bedrock API-key mode), `x-api-key` (Anthropic), `x-goog-api-key` (Gemini),
+  `api-key` + `?api-version` (Azure), Bearer + project/location path (Vertex), and SigV4 (Bedrock AKSK).
+- `Adaptor::sign_request` hook so body-signing providers (AWS SigV4) run after the body is serialized.
+- Real per-provider URL construction: Anthropic `/v1/messages`, Gemini/Vertex
+  `:generateContent` / `:streamGenerateContent`, Azure `/openai/deployments/{model}/...`,
+  Bedrock `/model/{id}/invoke[-with-response-stream]`.
+- Retry backoff with jitter (exponential, capped), configurable, with a `none` mode that reproduces
+  immediate retry.
+- Regression tests: 20 adaptor contract tests (auth header + URL shape + credential parsing) and
+  5 config-compatibility tests.
+- `docs/research/NEWAPI_SUPERSET_ANALYSIS.md` — verified superset gap study.
+
+### Changed
+- `GET /v1/models` is now derived from the database (enabled channels' model lists plus the model
+  registry) instead of a hard-coded list, so adding a channel immediately exposes its models.
+- Retry classification and backoff now come from `oxygenrouter-relay::retry`.
+
+### Fixed
+- **`config.json` settings were discarded when the file was partial.** `AppSettings` lacked per-field
+  serde defaults, so a hand-written config missing any field failed to deserialize and startup then
+  overwrote it with stock defaults — losing settings such as a custom listen port. Every field now has
+  a `#[serde(default = "...")]`, and startup refuses to write back a config it could not parse.
+- Bedrock region parsing rejected three-segment AWS regions such as `ap-southeast-2`, silently
+  falling back to `us-east-1`.
+
+### Removed
+- 220 MiB of redundant `ho/` + `ho.zip` tree copies (verified byte-identical to HEAD, zero unique
+  content; inventory retained at `.devlogs/p0_ho_inventory.txt`).
+
 ## [v0.1.0] — 2026-09-14
 
 ### Added

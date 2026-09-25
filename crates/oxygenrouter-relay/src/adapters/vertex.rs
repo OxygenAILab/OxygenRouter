@@ -45,6 +45,31 @@ pub fn parse_credential(raw: &str) -> VertexCredential {
     }
 }
 
+/// Resolve the API host for a Vertex channel.
+///
+/// An operator-supplied `base_url` wins. Otherwise we derive the regional
+/// endpoint from the credential's location.
+pub fn vertex_endpoint(base_url: &str, cred: &VertexCredential) -> String {
+    let base = base_url.trim_end_matches('/');
+    if !base.is_empty() {
+        // Accept both the full regional host and a bare `https://host`.
+        return base
+            .trim_end_matches("/v1")
+            .trim_end_matches("/v1beta")
+            .to_string();
+    }
+    let location = if cred.location.is_empty() {
+        "us-central1"
+    } else {
+        &cred.location
+    };
+    if location == "global" {
+        "https://aiplatform.googleapis.com".to_string()
+    } else {
+        format!("https://{}-aiplatform.googleapis.com", location)
+    }
+}
+
 pub struct VertexAdaptor;
 
 #[async_trait]
@@ -54,18 +79,43 @@ impl Adaptor for VertexAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
-        let base = info.base_url.trim_end_matches('/');
+        let cred = parse_credential(&info.credential_raw);
+        let base = vertex_endpoint(&info.base_url, &cred);
         let action = if info.is_stream {
             "streamGenerateContent?alt=sse"
         } else {
             "generateContent"
         };
-        Ok(format!("{}/{}", base, action))
+        if cred.project.is_empty() {
+            return Err(RelayError::Auth(
+                "vertex channel credential must be `project|location|access_token`".into(),
+            ));
+        }
+        Ok(format!(
+            "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:{}",
+            base, cred.project, cred.location, info.upstream_model, action
+        ))
     }
 
-    fn setup_headers(&self, headers: &mut HeaderMap, _info: &RelayInfo) -> Result<(), RelayError> {
+    fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+        let cred = parse_credential(&info.credential_raw);
+        if cred.access_token.is_empty() {
+            return Err(RelayError::Auth(
+                "vertex channel has no access token".into(),
+            ));
+        }
+        let value = HeaderValue::from_str(&format!("Bearer {}", cred.access_token))
+            .map_err(|e| RelayError::Auth(format!("authorization header: {}", e)))?;
+        headers.insert("Authorization", value);
         Ok(())
+    }
+
+    /// Vertex supports a static service-account JSON whose `private_key` and
+    /// `client_email` let us mint a self-signed JWT without a network round trip.
+    /// That path is not implemented yet, so a static access token is required.
+    fn model_list(&self) -> Vec<String> {
+        vec![]
     }
 
     fn convert_request(

@@ -41,11 +41,30 @@ pub trait Adaptor: Send + Sync {
     /// Stable name, e.g. "openai", "anthropic".
     fn name(&self) -> &'static str;
 
+    /// HTTP method to use. All current providers are POST-based.
+    fn method(&self) -> &'static str {
+        "POST"
+    }
+
     /// The URL to POST to for this request.
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError>;
 
     /// Apply auth + provider headers to an outgoing request.
     fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError>;
+
+    /// Last-chance mutation of the request once the body is serialized.
+    ///
+    /// Needed by request-signing providers (AWS SigV4 signs the body hash, so it
+    /// cannot run in `setup_headers`). The default is a no-op.
+    fn sign_request(
+        &self,
+        _info: &RelayInfo,
+        _url: &str,
+        _headers: &mut HeaderMap,
+        _body: &[u8],
+    ) -> Result<(), RelayError> {
+        Ok(())
+    }
 
     /// Translate the inbound request into this provider's wire format.
     ///

@@ -25,13 +25,20 @@ impl Adaptor for AdvancedCustomAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
+        let action = info.request_path.trim_start_matches('/').to_string();
         Ok(info
             .base_url
-            .replace("{model}", &info.upstream_model))
+            .replace("{model}", &info.upstream_model)
+            .replace("{action}", &action))
     }
 
-    fn setup_headers(&self, headers: &mut HeaderMap, _info: &RelayInfo) -> Result<(), RelayError> {
+    fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+        if !info.api_key.is_empty() {
+            let value = HeaderValue::from_str(&format!("Bearer {}", info.api_key))
+                .map_err(|e| RelayError::Auth(format!("authorization header: {}", e)))?;
+            headers.insert("Authorization", value);
+        }
         Ok(())
     }
 

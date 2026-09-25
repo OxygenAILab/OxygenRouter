@@ -63,6 +63,13 @@ impl RelayValue {
         }
     }
 
+    /// Consume the envelope and return the underlying JSON.
+    pub fn into_raw(self) -> serde_json::Value {
+        match self {
+            RelayValue::Raw(v) => v,
+        }
+    }
+
     pub fn as_object_mut(&mut self) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
         match self {
             RelayValue::Raw(serde_json::Value::Object(m)) => Some(m),
@@ -130,6 +137,19 @@ pub struct RelayInfo {
     pub channel_type: ChannelType,
     pub api_type: ApiType,
     pub base_url: String,
+    /// Credential selected for this attempt (one line of a multi-key channel).
+    ///
+    /// Populated by the caller before `setup_headers` runs; adaptors use it to
+    /// emit their provider-specific auth. Never logged.
+    pub api_key: String,
+    /// Raw channel credential, for providers whose auth is not a single bearer
+    /// token (`ak|sk|region` for Bedrock, `project|location|token` for Vertex).
+    /// Equal to `api_key` when the channel has no compound credential.
+    pub credential_raw: String,
+    /// The client-facing path, e.g. `/v1/chat/completions`. Adaptors that own
+    /// the whole URL (Gemini, Cohere) ignore it; adaptors that forward the path
+    /// (OpenAI, Azure) append it to `base_url`.
+    pub request_path: String,
     /// The model the client asked for (before mapping).
     pub origin_model: String,
     /// The model to send upstream (after mapping).
@@ -148,6 +168,9 @@ impl Default for RelayInfo {
             channel_type: ChannelType::OpenAI,
             api_type: ApiType::OpenAi,
             base_url: String::new(),
+            api_key: String::new(),
+            credential_raw: String::new(),
+            request_path: String::new(),
             origin_model: String::new(),
             upstream_model: String::new(),
             relay_format: RelayFormat::OpenAiChat,

@@ -15,7 +15,16 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     if path.exists() {
         let raw = std::fs::read_to_string(path)?;
-        let cfg: AppSettings = serde_json::from_str(&raw)?;
+        // Fail loudly instead of falling back to defaults: `main` saves the
+        // in-memory config at startup, so a silent parse failure would overwrite
+        // the operator's file with stock values and lose their settings.
+        let cfg: AppSettings = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "{} is not valid config JSON ({}). Leaving it untouched.",
+                path.display(),
+                e
+            )
+        })?;
         *APP_CONFIG.write() = cfg;
     }
     Ok(())

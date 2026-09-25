@@ -3,12 +3,14 @@
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
 mod client;
+mod dispatch;
 mod router;
 mod scheduler;
 mod tester;
 mod upstream;
 
 pub use client::UpstreamClient;
+pub use dispatch::{relay_format_for_path, RelayClient, RelayOutcome};
 pub use router::{ModelRouter, RouteDecision};
 pub use scheduler::ChannelScheduler;
 pub use tester::test_channel;

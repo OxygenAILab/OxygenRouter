@@ -1,32 +1,46 @@
-//! Channel scheduler: weighted pick, retry on retryable errors, switch on context exceeded
+//! Channel scheduler: weighted pick, retry on retryable errors, switch on
+//! context exceeded, adaptor-driven dispatch for non-OpenAI providers.
 //!
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
 use std::time::Duration;
 
-use crate::client::UpstreamClient;
+use crate::dispatch::{relay_format_for_path, RelayClient};
 use crate::upstream::{ProxyError, ProxyRequest, ProxyResult};
 use oxygenrouter_core::{Channel, ChannelSelector};
+use oxygenrouter_relay::retry::backoff_ms;
 
 pub struct ChannelScheduler {
     selector: ChannelSelector,
-    upstream: UpstreamClient,
+    relay: RelayClient,
     model_maps: Vec<(String, String, String)>,
     max_retries: u32,
+    backoff_base_ms: u64,
+    backoff_cap_ms: u64,
 }
 
 impl ChannelScheduler {
-    pub fn new(selector: ChannelSelector, upstream: UpstreamClient) -> Self {
+    pub fn new(selector: ChannelSelector, relay: RelayClient) -> Self {
         Self {
             selector,
-            upstream,
+            relay,
             model_maps: Vec::new(),
             max_retries: 3,
+            backoff_base_ms: 300,
+            backoff_cap_ms: 30_000,
         }
     }
 
     pub fn with_max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
+        self
+    }
+
+    /// Configure retry backoff. `base_ms == 0` disables sleeping (immediate
+    /// retry, matching NewAPI's behaviour).
+    pub fn with_backoff(mut self, base_ms: u64, cap_ms: u64) -> Self {
+        self.backoff_base_ms = base_ms;
+        self.backoff_cap_ms = cap_ms.max(base_ms);
         self
     }
 
@@ -85,8 +99,13 @@ impl ChannelScheduler {
             tried.push(channel.id.clone());
 
             let actual_model = self.apply_model_map(&channel, &current_model);
-            match self.upstream.send(&channel, &actual_model, req).await {
-                Ok(r) => return Ok(r),
+            let format = relay_format_for_path(&req.path);
+            match self
+                .relay
+                .send(&channel, &actual_model, req, format)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome.result),
                 Err(e) => {
                     let retryable = e.is_retryable();
                     let ctx_exceeded = e.is_context_exceeded();
@@ -98,7 +117,14 @@ impl ChannelScheduler {
                     }
                     if retryable && attempt < self.max_retries {
                         last_err = Some(e);
-                        tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+                        if self.backoff_base_ms > 0 {
+                            let delay = backoff_ms(
+                                attempt,
+                                self.backoff_base_ms,
+                                self.backoff_cap_ms,
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
                         continue;
                     }
                     return Err(e);

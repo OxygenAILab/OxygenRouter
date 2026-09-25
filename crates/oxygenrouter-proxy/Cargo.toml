@@ -14,3 +14,4 @@ bytes       = "1"
 url         = "2"
 
 oxygenrouter-core = { path = "../oxygenrouter-core" }
+oxygenrouter-relay = { path = "../oxygenrouter-relay" }

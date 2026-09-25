@@ -112,10 +112,11 @@ Admin / user API (60 routes, registered in `crates/oxygenrouter-webui/src/api.rs
 | Billing | `GET /api/wallet`, `GET /api/subscriptions/me`, `POST /api/subscriptions/subscribe`, `GET /api/plans`, `POST /api/redemption/redeem`, `POST /api/orders/manual` |
 | Admin | `GET /api/admin/users`, `PUT /api/admin/users/:id`, `POST /api/admin/users/:id/balance-adjust`, `GET/PUT /api/admin/plans`, `GET/PUT /api/admin/redemption-codes`, `GET /api/admin/orders`, `POST /api/admin/orders/:id/complete`, `GET /api/admin/ledger` |
 
-> **Known gap (P1, in progress):** the `oxygenrouter-relay` crate holds 9 provider adapters with
-> 101 public items and passing tests, but `oxygenrouter-webui` does not yet depend on it — relay
-> traffic still uses the legacy pass-through client in `proxy.rs`. Wiring this crate into the
-> request path is the current top priority. See `docs/research/NEWAPI_SUPERSET_ANALYSIS.md`.
+> **Adapter layer is wired (P1 complete for dispatch).** `oxygenrouter-proxy/src/dispatch.rs`
+> resolves the channel's `ApiType`, builds the matching adaptor from `oxygenrouter-relay`,
+> translates the request and response (including SSE), and extracts billing usage. See
+> `docs/FACT.md` for the verified end-to-end evidence and the two items still open
+> (incremental streaming, inbound-format response shaping).
 
 ## 6. Channel selection algorithm
 

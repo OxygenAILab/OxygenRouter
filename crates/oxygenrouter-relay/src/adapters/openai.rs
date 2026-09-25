@@ -38,13 +38,17 @@ impl Adaptor for OpenAiAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
-        // The concrete path is carried on the request itself; the adapter only
-        // owns the auth/URL convention, which for OpenAI is base + path.
-        Ok(info.base_url.clone())
+        // OpenAI convention is `{base}/{path}`, collapsing a duplicated `/v1`.
+        Ok(Self::join_url(&info.base_url, &info.request_path))
     }
 
-    fn setup_headers(&self, headers: &mut HeaderMap, _info: &RelayInfo) -> Result<(), RelayError> {
+    fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+        if !info.api_key.is_empty() {
+            let value = HeaderValue::from_str(&format!("Bearer {}", info.api_key))
+                .map_err(|e| RelayError::Auth(format!("authorization header: {}", e)))?;
+            headers.insert("Authorization", value);
+        }
         Ok(())
     }
 

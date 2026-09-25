@@ -286,43 +286,105 @@ pub struct RequestLog {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    #[serde(default = "default_listen_host")]
     pub listen_host: String,
+    #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    #[serde(default = "default_local_api_token")]
     pub local_api_token: String,
+    #[serde(default = "default_true")]
     pub open_browser_on_start: bool,
+    #[serde(default = "default_db_path")]
     pub db_path: String,
+    #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default = "default_max_retries")]
     pub max_retries: i32,
+    #[serde(default = "default_retry_delay_ms")]
     pub retry_delay_ms: i64,
+    #[serde(default = "default_retry_backoff")]
     pub retry_backoff: String,
+    #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
+    #[serde(default = "default_user_agent")]
     pub user_agent: String,
+    #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: i32,
+    #[serde(default = "default_request_log_retention_days")]
     pub request_log_retention_days: i32,
+    #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default = "default_language")]
     pub language: String,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            listen_host: "127.0.0.1".to_string(),
-            listen_port: 3001,
-            local_api_token: Uuid::new_v4().to_string(),
-            open_browser_on_start: true,
-            db_path: "oxygenrouter.db".to_string(),
-            log_level: "info".to_string(),
-            max_retries: 3,
-            retry_delay_ms: 500,
-            retry_backoff: "exponential".to_string(),
-            upstream_timeout_ms: 120_000,
-            user_agent: "OxygenRouter/0.1.0".to_string(),
-            max_concurrent_requests: 64,
-            request_log_retention_days: 30,
-            theme: "dark".to_string(),
-            language: "auto".to_string(),
+            listen_host: default_listen_host(),
+            listen_port: default_listen_port(),
+            local_api_token: default_local_api_token(),
+            open_browser_on_start: default_true(),
+            db_path: default_db_path(),
+            log_level: default_log_level(),
+            max_retries: default_max_retries(),
+            retry_delay_ms: default_retry_delay_ms(),
+            retry_backoff: default_retry_backoff(),
+            upstream_timeout_ms: default_upstream_timeout_ms(),
+            user_agent: default_user_agent(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            request_log_retention_days: default_request_log_retention_days(),
+            theme: default_theme(),
+            language: default_language(),
         }
     }
+}
+
+// Per-field defaults, shared by `Default` and the serde `#[serde(default = ...)]`
+// hooks. Without these, a hand-written `config.json` that omits a field fails to
+// deserialize, and `main` then silently overwrites the operator's file with
+// stock defaults — losing settings such as a custom listen port.
+fn default_listen_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_listen_port() -> u16 {
+    3001
+}
+fn default_local_api_token() -> String {
+    Uuid::new_v4().to_string()
+}
+fn default_db_path() -> String {
+    "oxygenrouter.db".to_string()
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_max_retries() -> i32 {
+    3
+}
+fn default_retry_delay_ms() -> i64 {
+    500
+}
+fn default_retry_backoff() -> String {
+    "exponential".to_string()
+}
+fn default_upstream_timeout_ms() -> u64 {
+    120_000
+}
+fn default_user_agent() -> String {
+    "OxygenRouter/0.1.0".to_string()
+}
+fn default_max_concurrent_requests() -> i32 {
+    64
+}
+fn default_request_log_retention_days() -> i32 {
+    30
+}
+fn default_theme() -> String {
+    "dark".to_string()
+}
+fn default_language() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

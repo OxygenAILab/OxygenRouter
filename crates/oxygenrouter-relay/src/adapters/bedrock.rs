@@ -31,6 +31,58 @@ pub enum BedrockCredential {
     Missing,
 }
 
+pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
+
+/// Resolve the region for a Bedrock channel.
+///
+/// Preference order: an explicit `|region` on the credential, a region embedded
+/// in the region-endpoint host name, then the default.
+pub fn bedrock_region(info: &RelayInfo) -> String {
+    if let Some(region) = info
+        .credential_raw
+        .split('|')
+        .map(str::trim)
+        .find(|part| is_aws_region(part))
+    {
+        return region.to_string();
+    }
+    if let Some(region) = region_from_endpoint(&info.base_url) {
+        return region;
+    }
+    DEFAULT_BEDROCK_REGION.to_string()
+}
+
+/// AWS regions are `area-name-N` (`ap-southeast-2`, `eu-west-1`) or, for
+/// early regions, `area-N` (`us-east-1`). Every segment but the last is
+/// lowercase letters; the last is digits.
+fn is_aws_region(part: &str) -> bool {
+    let segs: Vec<&str> = part.split('-').collect();
+    if segs.len() < 2 || segs.len() > 3 {
+        return false;
+    }
+    let (last, rest) = segs.split_last().expect("len >= 2");
+    if last.is_empty() || !last.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if rest.iter().any(|s| s.len() < 2) {
+        return false;
+    }
+    rest.iter()
+        .all(|s| s.chars().all(|c| c.is_ascii_lowercase()))
+}
+
+/// Extract `us-east-1` from `https://bedrock-runtime.us-east-1.amazonaws.com`.
+fn region_from_endpoint(base_url: &str) -> Option<String> {
+    let rest = base_url.split("bedrock-runtime.").nth(1)?;
+    let host = rest.split('/').next()?;
+    let candidate = host.strip_suffix(".amazonaws.com").unwrap_or(host);
+    let candidate = candidate.split(".amazonaws.com.cn").next().unwrap_or(candidate);
+    let candidate = candidate
+        .strip_prefix("fips.")
+        .unwrap_or(candidate);
+    is_aws_region(candidate).then(|| candidate.to_string())
+}
+
 /// Parse a Bedrock channel's `api_key` field.
 /// * 2 parts `key|region` -> API-key mode.
 /// * 3 parts `ak|sk|region` -> AKSK mode.
@@ -96,14 +148,50 @@ impl Adaptor for BedrockAdaptor {
     }
 
     fn request_url(&self, info: &RelayInfo) -> Result<String, RelayError> {
-        // `info.base_url` carries the endpoint; the concrete path is injected by
-        // the caller (Bedrock paths are model-specific).
-        Ok(info.base_url.clone())
+        // Bedrock paths are model-specific:
+        //   `{base}/model/{model-id}/invoke`               (non-streaming)
+        //   `{base}/model/{model-id}/invoke-with-response-stream`
+        // `base_url` normally carries the region endpoint, e.g.
+        // `https://bedrock-runtime.us-east-1.amazonaws.com`.
+        let base = info.base_url.trim_end_matches('/');
+        let region = bedrock_region(info);
+        let model_id = to_bedrock_model_id(&info.upstream_model, &region);
+        let verb = if info.is_stream {
+            "invoke-with-response-stream"
+        } else {
+            "invoke"
+        };
+        Ok(format!("{}/model/{}/{}", base, model_id, verb))
     }
 
-    fn setup_headers(&self, headers: &mut HeaderMap, _info: &RelayInfo) -> Result<(), RelayError> {
+    fn setup_headers(&self, headers: &mut HeaderMap, info: &RelayInfo) -> Result<(), RelayError> {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+        match parse_credential(&info.credential_raw, &bedrock_region(info)) {
+            BedrockCredential::ApiKey { token, .. } => {
+                let value = HeaderValue::from_str(&format!("Bearer {}", token))
+                    .map_err(|e| RelayError::Auth(format!("authorization header: {}", e)))?;
+                headers.insert("Authorization", value);
+            }
+            // SigV4 needs the body hash, so it runs in `sign_request`.
+            BedrockCredential::AkSk(_) => {}
+            BedrockCredential::Missing => {
+                return Err(RelayError::Auth("bedrock channel has no credential".into()));
+            }
+        }
         Ok(())
+    }
+
+    fn sign_request(
+        &self,
+        info: &RelayInfo,
+        url: &str,
+        headers: &mut HeaderMap,
+        body: &[u8],
+    ) -> Result<(), RelayError> {
+        match parse_credential(&info.credential_raw, &bedrock_region(info)) {
+            BedrockCredential::AkSk(creds) => sign_bedrock_request(&creds, "POST", url, headers, body),
+            _ => Ok(()),
+        }
     }
 
     fn convert_request(
