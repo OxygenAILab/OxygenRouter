@@ -819,7 +819,27 @@ async fn fetch_channel_models(
     };
     let base = ch.base_url.trim_end_matches('/');
     let url = if base.ends_with("/v1") { format!("{}/models", base) } else { format!("{}/v1/models", base) };
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build() {
+    // This is a server-side fetch of a stored URL, so it is SSRF-checked. The
+    // relay path deliberately is not: NewAPI exempts provider base URLs because
+    // they are operator-managed deployment targets that may legitimately be
+    // private (a LAN vLLM or Ollama host), whereas this endpoint tells the
+    // server to dereference a URL on demand.
+    if let Err(error) = s.fetch_policy.validate_url(&url) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<Channel>::err(format!(
+                "ssrf protection refused this target: {error}"
+            ))),
+        )
+            .into_response();
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        // Redirects are not followed: a permitted host could otherwise bounce
+        // the request to an internal one and defeat the check above.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };

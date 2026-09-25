@@ -8,6 +8,7 @@ pub mod limits;
 mod router;
 mod scheduler;
 pub mod selection;
+pub mod ssrf;
 mod tester;
 mod upstream;
 

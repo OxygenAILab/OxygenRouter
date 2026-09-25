@@ -11,6 +11,7 @@ use tokio::sync::{broadcast, RwLock};
 use oxygenrouter_billing::{BillingPolicy, BillingService, Pricing};
 use oxygenrouter_core::{Database, RequestLog};
 use oxygenrouter_proxy::limits::{ConcurrencyGuard, RateLimiter, RateLimit};
+use oxygenrouter_proxy::ssrf::SsrfPolicy;
 use oxygenrouter_proxy::ChannelScheduler;
 
 use crate::billing_store::SqliteBillingStore;
@@ -37,6 +38,12 @@ pub struct AppState {
     pub concurrency: Arc<ConcurrencyGuard>,
     /// Rate limit applied to relay endpoints per client IP. `0` disables it.
     pub relay_rate_limit: RateLimit,
+    /// Policy for server-side fetches of a stored URL (channel model sync).
+    ///
+    /// The relay path is deliberately not gated by this: provider base URLs are
+    /// operator-managed deployment targets, matching NewAPI's decision to keep
+    /// its SSRF-protected client off the provider path.
+    pub fetch_policy: SsrfPolicy,
 }
 
 impl AppState {
@@ -70,7 +77,52 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::new()),
             concurrency: Arc::new(ConcurrencyGuard::new(0)),
             relay_rate_limit: RateLimit::disabled(),
+            fetch_policy: SsrfPolicy::default(),
         }
+    }
+
+    /// Build the fetch policy from the `FetchSetting.*` options.
+    ///
+    /// Called at startup and after an admin edits them, so a change takes effect
+    /// without a restart. Parsing failures keep the previous policy rather than
+    /// silently widening it.
+    pub fn reload_fetch_policy(&mut self) {
+        use oxygenrouter_proxy::ssrf::FilterMode;
+
+        let read_bool = |key: &str, fallback: bool| -> bool {
+            self.db
+                .get_setting(key)
+                .ok()
+                .flatten()
+                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(fallback)
+        };
+
+        let mut policy = SsrfPolicy::default();
+        let enabled = read_bool("FetchSetting.EnableSSRFProtection", true);
+        if !enabled {
+            // Protection off means the operator has accepted the risk; keep the
+            // scheme check but drop the address and port rules.
+            self.fetch_policy = SsrfPolicy::scheme_only();
+            return;
+        }
+        policy.allow_private_ip = read_bool("FetchSetting.AllowPrivateIp", false);
+        // An empty or unparsable port list falls back to the shipped default
+        // rather than becoming 'any port', which would be a silent widening.
+        if let Ok(Some(raw)) = self.db.get_setting("FetchSetting.AllowedPorts") {
+            match parse_port_list(&raw) {
+                Some(ports) => policy.allowed_ports = ports,
+                None => eprintln!("[OxygenRouter] FetchSetting.AllowedPorts ignored; using the default"),
+            }
+        }
+        // Both filters stay in denylist mode with empty lists, as upstream ships.
+        policy.domain_mode = FilterMode::Denylist;
+        policy.ip_mode = FilterMode::Denylist;
+        self.fetch_policy = policy;
     }
 
     /// Configure the global in-flight ceiling and the per-IP relay rate limit.
@@ -130,5 +182,57 @@ impl AppState {
                 Err(e) => eprintln!("[OxygenRouter] GroupRatio override ignored: {e}"),
             }
         }
+    }
+}
+/// Parse `80,443,8000-9000` into a port list.
+///
+/// Returns `None` when nothing usable was found, so the caller can fall back to
+/// the default instead of treating the list as empty (= every port allowed).
+fn parse_port_list(raw: &str) -> Option<Vec<u16>> {
+    let mut ports = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.split_once('-') {
+            Some((lo, hi)) => match (lo.trim().parse::<u16>(), hi.trim().parse::<u16>()) {
+                (Ok(lo), Ok(hi)) if lo <= hi => ports.extend(lo..=hi),
+                _ => return None,
+            },
+            None => match entry.parse::<u16>() {
+                Ok(port) if port > 0 => ports.push(port),
+                _ => return None,
+            },
+        }
+    }
+    if ports.is_empty() {
+        None
+    } else {
+        Some(ports)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_port_list;
+
+    #[test]
+    fn port_lists_parse_including_ranges() {
+        assert_eq!(parse_port_list("80,443"), Some(vec![80, 443]));
+        assert_eq!(parse_port_list("80, 443 , 8080"), Some(vec![80, 443, 8080]));
+        assert_eq!(parse_port_list("80-83"), Some(vec![80, 81, 82, 83]));
+        assert_eq!(parse_port_list("80-82,443"), Some(vec![80, 81, 82, 443]));
+    }
+
+    #[test]
+    fn an_empty_or_invalid_list_is_reported_so_the_default_survives() {
+        // Returning Some(vec![]) would mean 'any port', a silent widening.
+        assert_eq!(parse_port_list(""), None);
+        assert_eq!(parse_port_list("   ,  "), None);
+        assert_eq!(parse_port_list("not-a-port"), None);
+        assert_eq!(parse_port_list("90-80"), None);
+        assert_eq!(parse_port_list("0"), None);
+        assert_eq!(parse_port_list("70000"), None);
     }
 }

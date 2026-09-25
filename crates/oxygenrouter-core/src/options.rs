@@ -89,6 +89,14 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("FreeModelPreConsumeEnabled", Billing, Bool, "false", "Reserve quota even for zero-price models"),
     schema!("Currency", Billing, String, "USD", "Display currency for wallet amounts"),
     // Operations
+    // --- SSRF protection (NewAPI `fetch_setting`) -------------------------
+    // Applies to server-side fetches of a stored URL (channel model sync).
+    // Provider base URLs used for relay are deliberately exempt, matching
+    // NewAPI: they are operator-managed deployment targets that may legitimately
+    // point at private networks.
+    schema!("FetchSetting.EnableSSRFProtection", Security, Bool, "true", "Validate URLs before fetching them server-side"),
+    schema!("FetchSetting.AllowPrivateIp", Security, Bool, "false", "Permit fetching private/loopback/link-local addresses (needed for a LAN upstream)"),
+    schema!("FetchSetting.AllowedPorts", Security, String, "80,443,8080,8443", "Comma-separated ports, or ranges like 8000-9000; empty allows any"),
     schema!("ListenHost", Operations, String, "127.0.0.1", "Bind address for the HTTP server"),
     schema!("ListenPort", Operations, Int, "3001", "HTTP port for WebUI and proxy"),
     schema!("UpstreamTimeoutMs", Operations, Int, "120000", "Maximum duration of one upstream call"),

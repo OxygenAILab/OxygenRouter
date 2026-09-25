@@ -120,6 +120,7 @@ async fn main() {
         config_path.clone(),
     );
     state_inner.configure_limits(max_concurrent, 0);
+    state_inner.reload_fetch_policy();
     let state: Arc<AppState> = Arc::new(state_inner);
 
     state.reload_scheduler_maps().await;
