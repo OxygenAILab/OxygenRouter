@@ -6,17 +6,24 @@
 use std::time::Duration;
 
 use crate::dispatch::{relay_format_for_path, RelayClient};
+use crate::selection::{
+    apply_model_map, select_tiered_excluding, tiers_exhausted_excluding, Selection,
+};
 use crate::upstream::{ProxyError, ProxyRequest, ProxyResult};
-use oxygenrouter_core::{Channel, ChannelSelector};
+use oxygenrouter_core::{Channel, ChannelSelector, ModelMap};
 use oxygenrouter_relay::retry::backoff_ms;
 
 pub struct ChannelScheduler {
     selector: ChannelSelector,
     relay: RelayClient,
-    model_maps: Vec<(String, String, String)>,
+    model_maps: Vec<ModelMap>,
     max_retries: u32,
     backoff_base_ms: u64,
     backoff_cap_ms: u64,
+    /// Consecutive failures per channel, for auto-disable.
+    failures: parking_lot::Mutex<std::collections::HashMap<String, u32>>,
+    /// Consecutive failures before a channel is disabled. `0` disables the rule.
+    disable_threshold: u32,
 }
 
 impl ChannelScheduler {
@@ -28,7 +35,16 @@ impl ChannelScheduler {
             max_retries: 3,
             backoff_base_ms: 300,
             backoff_cap_ms: 30_000,
+            failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            disable_threshold: 5,
         }
+    }
+
+    /// Configure auto-disable. `threshold == 0` turns the rule off; NewAPI's
+    /// default behaviour is to never auto-disable unless configured.
+    pub fn with_disable_threshold(mut self, threshold: u32) -> Self {
+        self.disable_threshold = threshold;
+        self
     }
 
     pub fn with_max_retries(mut self, n: u32) -> Self {
@@ -44,26 +60,40 @@ impl ChannelScheduler {
         self
     }
 
-    pub fn set_model_maps(&mut self, maps: Vec<oxygenrouter_core::ModelMap>) {
-        self.model_maps = maps
-            .into_iter()
-            .filter(|m| m.enabled)
-            .map(|m| (m.channel_id, m.pattern, m.target_model))
-            .collect();
+    pub fn set_model_maps(&mut self, maps: Vec<ModelMap>) {
+        self.model_maps = maps;
     }
 
-    /// Apply channel-specific model map rewriting
-    fn apply_model_map(&self, channel: &Channel, model: &str) -> String {
-        for (ch_id, pattern, target) in &self.model_maps {
-            if ch_id == &channel.id {
-                if let Ok(re) = regex_lite_match(pattern, model) {
-                    if re {
-                        return target.clone();
-                    }
-                }
-            }
+    /// Apply channel-specific model map rewriting.
+    fn rewrite_model(&self, channel: &Channel, model: &str) -> String {
+        apply_model_map(&self.model_maps, &channel.id, model)
+    }
+
+    /// Record a successful attempt: the channel's failure streak resets.
+    fn note_success(&self, channel_id: &str) {
+        self.failures.lock().remove(channel_id);
+    }
+
+    /// Record a failed attempt and report whether the channel has now crossed
+    /// the auto-disable threshold.
+    ///
+    /// This is an improvement over NewAPI in one respect and deliberately
+    /// identical in another: identical in that only *consecutive* failures
+    /// count, and an improvement in that the threshold is enforced in-process
+    /// so a dead channel stops being selected immediately.
+    fn note_failure(&self, channel_id: &str) -> bool {
+        if self.disable_threshold == 0 {
+            return false;
         }
-        model.to_string()
+        let mut failures = self.failures.lock();
+        let count = failures.entry(channel_id.to_string()).or_insert(0);
+        *count += 1;
+        *count >= self.disable_threshold
+    }
+
+    /// Number of consecutive failures recorded for a channel.
+    pub fn failure_count(&self, channel_id: &str) -> u32 {
+        self.failures.lock().get(channel_id).copied().unwrap_or(0)
     }
 
     pub async fn dispatch(
@@ -84,30 +114,47 @@ impl ChannelScheduler {
         let mut tried: Vec<String> = Vec::new();
         let mut last_err: Option<ProxyError> = None;
         let mut current_model = model.to_string();
+        let limit = self.max_retries.max(1);
 
-        for attempt in 0..=self.max_retries {
-            let channel = self.pick_channel(&tried, group_name, cross_group_retry && attempt > 0);
-            let channel = match channel {
-                Some(c) => c,
-                None => {
-                    if let Some(e) = last_err {
-                        return Err(e);
-                    }
-                    return Err(ProxyError::NoChannel);
+        for attempt in 0..=limit {
+            let candidates = self.candidates(&tried, group_name, cross_group_retry && attempt > 0);
+            if candidates.is_empty() {
+                return Err(last_err.unwrap_or(ProxyError::NoChannel));
+            }
+            // Walk priority tiers with the attempt counter so the first attempt
+            // takes the best tier and each retry steps down. `tried` is passed in
+            // so a tier whose members have all been attempted falls through to
+            // the next one -- that fall-through is what lets a dead primary hand
+            // off to its backup instead of failing the request.
+            if tiers_exhausted_excluding(&candidates, &tried, attempt) {
+                return Err(last_err.unwrap_or(ProxyError::NoChannel));
+            }
+
+            let channel = match select_tiered_excluding(&candidates, &tried, attempt, rand_i64()) {
+                Selection::Picked(channel) => channel,
+                Selection::NoCandidate => {
+                    return Err(last_err.unwrap_or(ProxyError::NoChannel));
+                }
+                Selection::TiersExhausted => {
+                    return Err(last_err.unwrap_or(ProxyError::NoChannel));
                 }
             };
             tried.push(channel.id.clone());
 
-            let actual_model = self.apply_model_map(&channel, &current_model);
+            let actual_model = self.rewrite_model(&channel, &current_model);
             let format = relay_format_for_path(&req.path);
-            match self
-                .relay
-                .send(&channel, &actual_model, req, format)
-                .await
-            {
-                Ok(outcome) => return Ok(outcome.result),
+            match self.relay.send(&channel, &actual_model, req, format).await {
+                Ok(outcome) => {
+                    self.note_success(&channel.id);
+                    let mut result = outcome.result;
+                    // `tried` ends with the winner; everything before it is the
+                    // failover trail, recorded so a retried request is auditable.
+                    if tried.len() > 1 {
+                        result.failed_channels = tried[..tried.len() - 1].to_vec();
+                    }
+                    return Ok(result);
+                }
                 Err(e) => {
-                    let retryable = e.is_retryable();
                     let ctx_exceeded = e.is_context_exceeded();
                     if ctx_exceeded {
                         if let Some(fb) = self.selector.db_fallback(&channel, &current_model) {
@@ -115,14 +162,21 @@ impl ChannelScheduler {
                             continue;
                         }
                     }
-                    if retryable && attempt < self.max_retries {
+                    let retryable = e.is_retryable();
+                    if retryable {
+                        let crossed = self.note_failure(&channel.id);
+                        if crossed {
+                            eprintln!(
+                                "[OxygenRouter] channel {} hit {} consecutive failures; excluding it from selection",
+                                channel.id, self.disable_threshold
+                            );
+                        }
+                    }
+                    if retryable && attempt < limit {
                         last_err = Some(e);
                         if self.backoff_base_ms > 0 {
-                            let delay = backoff_ms(
-                                attempt,
-                                self.backoff_base_ms,
-                                self.backoff_cap_ms,
-                            );
+                            let delay =
+                                backoff_ms(attempt, self.backoff_base_ms, self.backoff_cap_ms);
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
                         continue;
@@ -135,20 +189,32 @@ impl ChannelScheduler {
         Err(last_err.unwrap_or(ProxyError::NoChannel))
     }
 
-    fn pick_channel(
+    /// Eligible channels for this attempt.
+    ///
+    /// Excludes channels already tried in this request and any channel that has
+    /// crossed the auto-disable threshold.
+    fn candidates(
         &self,
         exclude: &[String],
         group_name: Option<&str>,
         allow_cross_group: bool,
-    ) -> Option<Channel> {
+    ) -> Vec<Channel> {
         let channels = match self.selector.list_enabled() {
             Ok(c) => c,
-            Err(_) => return None,
+            Err(_) => return Vec::new(),
         };
+        let threshold = self.disable_threshold;
+        let failures = self.failures.lock();
         let mut candidates: Vec<Channel> = channels
             .into_iter()
             .filter(|c| !exclude.contains(&c.id))
+            .filter(|c| {
+                // A channel past the threshold is skipped until it succeeds again.
+                threshold == 0 || failures.get(&c.id).copied().unwrap_or(0) < threshold
+            })
             .collect();
+        drop(failures);
+
         if let Some(group_name) = group_name.filter(|group| !group.is_empty()) {
             let grouped: Vec<Channel> = candidates
                 .iter()
@@ -159,48 +225,24 @@ impl ChannelScheduler {
                 candidates = grouped;
             }
         }
-        if candidates.is_empty() {
-            return None;
-        }
-        let total_weight: i32 = candidates.iter().map(|c| c.weight.max(1)).sum();
-        let target = (rand_u32() as i32) % total_weight.max(1);
-        let mut acc = 0;
-        for c in &candidates {
-            acc += c.weight.max(1);
-            if acc > target {
-                return Some(c.clone());
-            }
-        }
-        candidates.into_iter().next()
+        candidates
     }
+
 }
 
-fn regex_lite_match(pattern: &str, input: &str) -> Result<bool, ()> {
-    let pat = pattern.trim();
-    if pat.is_empty() {
-        return Ok(false);
-    }
-    if pat == "*" {
-        return Ok(true);
-    }
-    if pat.starts_with('*') && pat.ends_with('*') {
-        let mid = &pat[1..pat.len() - 1];
-        return Ok(input.contains(mid));
-    }
-    if let Some(rest) = pat.strip_prefix('*') {
-        return Ok(input.ends_with(rest));
-    }
-    if let Some(rest) = pat.strip_suffix('*') {
-        return Ok(input.starts_with(rest));
-    }
-    Ok(pat == input)
-}
-
-fn rand_u32() -> u32 {
-    use std::collections::hash_map::DefaultHasher;
+/// A random value used as the weighted-draw roll.
+///
+/// Seeded from the clock and the thread id so concurrent requests do not draw
+/// the same value; the distribution matters, not cryptographic quality.
+fn rand_i64() -> i64 {
     use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-    let mut h = DefaultHasher::new();
-    SystemTime::now().hash(&mut h);
-    h.finish() as u32
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    (hasher.finish() >> 1) as i64
 }

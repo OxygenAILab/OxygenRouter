@@ -110,13 +110,17 @@ async fn main() {
         );
 
     let local_token = APP_CONFIG.read().local_api_token.clone();
-    let state: Arc<AppState> = Arc::new(AppState::new(
+    // The concurrency ceiling is enforced globally; NewAPI does not enforce one.
+    let max_concurrent = APP_CONFIG.read().max_concurrent_requests;
+    let mut state_inner = AppState::new(
         db.clone(),
         db_path.clone(),
         scheduler,
         local_token.clone(),
         config_path.clone(),
-    ));
+    );
+    state_inner.configure_limits(max_concurrent, 0);
+    let state: Arc<AppState> = Arc::new(state_inner);
 
     state.reload_scheduler_maps().await;
     // Apply this instance's own pricing overrides on top of the shipped pack.

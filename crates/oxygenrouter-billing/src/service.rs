@@ -326,7 +326,22 @@ impl BillingService {
             store,
             key_id: key_id.to_string(),
         };
-        let reserved = session.pre_consume(&dual, reservation)?;
+        let reserved = session.pre_consume(&dual, reservation).map_err(|error| {
+            // Turn the unset placeholder into the real balance so the client
+            // message is actionable instead of "available unknown".
+            match error {
+                BillingError::InsufficientBalance { needed, available }
+                    if available < 0 =>
+                {
+                    let actual = store.wallet_balance(user_id).unwrap_or(0);
+                    BillingError::InsufficientBalance {
+                        needed,
+                        available: actual,
+                    }
+                }
+                other => other,
+            }
+        })?;
         Ok((session, reserved))
     }
 

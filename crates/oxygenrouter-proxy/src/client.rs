@@ -180,6 +180,7 @@ impl UpstreamClient {
             channel_id: channel.id.clone(),
             usage,
             adaptor: "openai".to_string(),
+            failed_channels: Vec::new(),
         })
     }
 }

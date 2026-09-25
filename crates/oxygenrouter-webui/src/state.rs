@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use oxygenrouter_billing::{BillingPolicy, BillingService, Pricing};
 use oxygenrouter_core::{Database, RequestLog};
+use oxygenrouter_proxy::limits::{ConcurrencyGuard, RateLimiter, RateLimit};
 use oxygenrouter_proxy::ChannelScheduler;
 
 use crate::billing_store::SqliteBillingStore;
@@ -30,6 +31,12 @@ pub struct AppState {
     /// Billing's view of storage. Held as a concrete adapter so the trait object
     /// is constructed once rather than per request.
     pub billing_store: Arc<SqliteBillingStore>,
+    /// Per-scope fixed-window rate limits (client IP, token, model).
+    pub rate_limiter: Arc<RateLimiter>,
+    /// Global in-flight ceiling. NewAPI does not enforce one.
+    pub concurrency: Arc<ConcurrencyGuard>,
+    /// Rate limit applied to relay endpoints per client IP. `0` disables it.
+    pub relay_rate_limit: RateLimit,
 }
 
 impl AppState {
@@ -60,7 +67,22 @@ impl AppState {
             log_broadcast,
             billing: Arc::new(BillingService::new(pricing, BillingPolicy::default())),
             billing_store: Arc::new(SqliteBillingStore::new(db)),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            concurrency: Arc::new(ConcurrencyGuard::new(0)),
+            relay_rate_limit: RateLimit::disabled(),
         }
+    }
+
+    /// Configure the global in-flight ceiling and the per-IP relay rate limit.
+    ///
+    /// Called at startup from the option store so both are operator-controlled.
+    pub fn configure_limits(&mut self, max_concurrent: i32, requests_per_minute: u32) {
+        self.concurrency = Arc::new(ConcurrencyGuard::new(max_concurrent.max(0) as usize));
+        self.relay_rate_limit = if requests_per_minute == 0 {
+            RateLimit::disabled()
+        } else {
+            RateLimit::new(requests_per_minute, 60)
+        };
     }
 
     pub async fn reload_scheduler_maps(&self) {

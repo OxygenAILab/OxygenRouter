@@ -21,7 +21,11 @@ use crate::quota_math::QuotaClamp;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BillingError {
-    #[error("insufficient balance: need {needed}, available {available}")]
+    /// The account cannot cover the charge.
+    ///
+    /// `available` is `-1` when the refusing layer could not read the balance;
+    /// callers should substitute the real figure rather than printing it.
+    #[error("insufficient balance: need {needed}, available {}", if *.available < 0 { "unknown".to_string() } else { available.to_string() })]
     InsufficientBalance { needed: i64, available: i64 },
     #[error("quota must not be negative: {0}")]
     NegativeQuota(i64),
@@ -157,9 +161,12 @@ impl BillingSession {
         // 1) token account (hard floor)
         if !self.is_playground {
             if !store.try_reserve(&self.token_account, effective)? {
+                // The balance is not visible at this layer (`try_reserve` is a
+                // boolean), so `available` is left unset (-1) and the caller
+                // fills in the real figure from the store.
                 return Err(BillingError::InsufficientBalance {
                     needed: effective,
-                    available: 0,
+                    available: -1,
                 });
             }
             self.token_consumed.store(effective, Ordering::SeqCst);
@@ -174,7 +181,7 @@ impl BillingSession {
             }
             return Err(BillingError::InsufficientBalance {
                 needed: effective,
-                available: 0,
+                available: -1,
             });
         }
 

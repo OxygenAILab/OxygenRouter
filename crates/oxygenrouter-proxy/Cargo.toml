@@ -15,3 +15,7 @@ url         = "2"
 
 oxygenrouter-core = { path = "../oxygenrouter-core" }
 oxygenrouter-relay = { path = "../oxygenrouter-relay" }
+parking_lot = "0.12.5"
+
+[dev-dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }

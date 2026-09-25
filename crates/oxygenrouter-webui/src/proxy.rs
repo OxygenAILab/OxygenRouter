@@ -515,6 +515,46 @@ async fn dispatch(
 ) -> Response {
     let stream = proxy_req.stream;
 
+    // --- rate limit and concurrency gate ----------------------------------
+    //
+    // Both are checked before any upstream work, so a rejected request costs
+    // nothing. The permit is held for the whole dispatch and released on drop,
+    // including on every error path below.
+    if state.relay_rate_limit.is_enabled() {
+        let scope = format!("relay:{}", client_scope(&_headers));
+        if let Err(error) = state.rate_limiter.check(&scope, state.relay_rate_limit) {
+            log_request(
+                &state,
+                "POST",
+                path,
+                Some(model.clone()),
+                None,
+                api_key.as_ref().map(|k| k.id.clone()),
+                Some(error.status_code()),
+                Some("rate limited".to_string()),
+                start.elapsed().as_millis() as i64,
+            );
+            return limit_error_response(error);
+        }
+    }
+    let _permit = match state.concurrency.try_acquire() {
+        Ok(permit) => permit,
+        Err(error) => {
+            log_request(
+                &state,
+                "POST",
+                path,
+                Some(model.clone()),
+                None,
+                api_key.as_ref().map(|k| k.id.clone()),
+                Some(error.status_code()),
+                Some("concurrency ceiling reached".to_string()),
+                start.elapsed().as_millis() as i64,
+            );
+            return limit_error_response(error);
+        }
+    };
+
     // --- reserve before spending an upstream call -------------------------
     //
     // The reservation is deliberately keyed on the *client-supplied* body, not
@@ -544,9 +584,11 @@ async fn dispatch(
             ) {
                 Ok((session, reserved)) => Some((session, reserved, key_id, user_id, group.to_string())),
                 Err(error) => {
-                    // A refused reservation is a client-visible condition
-                    // (insufficient balance or key quota), not a server fault.
-                    let duration_ms = start.elapsed().as_millis() as i64;
+                    // A refused reservation is the client's condition, not a
+                    // server fault. NewAPI answers insufficient quota with
+                    // 403 Forbidden (billing_session.go), not 429 -- 429 is
+                    // reserved for rate limiting.
+                    let status = StatusCode::FORBIDDEN;
                     log_request(
                         &state,
                         "POST",
@@ -554,15 +596,11 @@ async fn dispatch(
                         Some(model.clone()),
                         None,
                         Some(key_id),
-                        Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                        Some(status.as_u16()),
                         Some(error.to_string()),
-                        duration_ms,
+                        start.elapsed().as_millis() as i64,
                     );
-                    return json_policy_error(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "insufficient_quota",
-                        &error.to_string(),
-                    );
+                    return json_policy_error(status, "insufficient_quota", &error.to_string());
                 }
             }
         }
@@ -628,6 +666,17 @@ async fn dispatch(
                 }
             }
 
+            // A failover is recorded on the log row so a retried request is
+            // auditable; the column holds the winning channel and this holds
+            // the trail that preceded it.
+            let failover_note = if r.failed_channels.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "failed over: {}",
+                    r.failed_channels.join(" -> ")
+                ))
+            };
             log_request_with_usage(
                 &state,
                 "POST",
@@ -636,7 +685,7 @@ async fn dispatch(
                 Some(r.channel_id.clone()),
                 api_key.as_ref().map(|k| k.id.clone()),
                 Some(r.status),
-                None,
+                failover_note,
                 duration_ms,
                 tokens_used,
             );
@@ -677,6 +726,55 @@ async fn dispatch(
     }
 }
 
+/// Identify the caller for rate-limit scoping.
+///
+/// Prefers the bearer token so one client cannot exhaust another's budget behind
+/// a shared NAT, and falls back to the forwarded address.
+fn client_scope(headers: &axum::http::HeaderMap) -> String {
+    if let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+    {
+        // Truncated: the scope must distinguish callers without storing the
+        // credential itself.
+        return format!("token:{}", &token[..token.len().min(16)]);
+    }
+    let ip = remote_ip(headers);
+    if ip.is_empty() {
+        "anonymous".to_string()
+    } else {
+        format!("ip:{ip}")
+    }
+}
+
+/// Render a limit rejection in the OpenAI error shape.
+fn limit_error_response(error: oxygenrouter_proxy::limits::LimitError) -> Response {
+    let message = match error {
+        oxygenrouter_proxy::limits::LimitError::RateLimited { retry_after_secs } => {
+            format!("rate limit exceeded; retry after {retry_after_secs}s")
+        }
+        oxygenrouter_proxy::limits::LimitError::ConcurrencyExceeded => {
+            "server is at its concurrent request ceiling; retry shortly".to_string()
+        }
+    };
+    let mut response = json_policy_error(
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::TOO_MANY_REQUESTS),
+        "rate_limit_exceeded",
+        &message,
+    );
+    if let Some(retry) = error.retry_after_secs() {
+        response.headers_mut().insert(
+            "retry-after",
+            axum::http::HeaderValue::from_str(&retry.to_string())
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
+        );
+    }
+    response
+}
 /// Which accounts pay for a request, if any.
 ///
 /// Returns `None` when there is no key, or the key has no owning user, so

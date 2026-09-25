@@ -4,8 +4,10 @@
 
 mod client;
 mod dispatch;
+pub mod limits;
 mod router;
 mod scheduler;
+pub mod selection;
 mod tester;
 mod upstream;
 

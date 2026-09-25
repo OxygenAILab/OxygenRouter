@@ -241,6 +241,7 @@ impl RelayClient {
                 channel_id: channel.id.clone(),
                 usage: adapted.usage,
                 adaptor: adaptor.name().to_string(),
+                failed_channels: Vec::new(),
             },
             adaptor: adaptor.name(),
             translated: !matches!(relay_format, RelayFormat::Raw | RelayFormat::OpenAiChat),

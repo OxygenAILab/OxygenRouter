@@ -31,6 +31,12 @@ pub struct ProxyResult {
     pub usage: Usage,
     /// The adaptor that served the request, e.g. `anthropic`.
     pub adaptor: String,
+    /// Every channel attempted before the one that succeeded, in order.
+    ///
+    /// Mirrors NewAPI's `use_channel` trail so a failover is auditable rather
+    /// than invisible: a request that silently retried three times looks
+    /// identical to one that worked first time without this.
+    pub failed_channels: Vec<String>,
 }
 
 #[derive(Debug, Error)]
