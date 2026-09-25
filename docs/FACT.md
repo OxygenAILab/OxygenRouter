@@ -43,33 +43,49 @@ This document records verified project facts. Update it whenever a fact changes.
 
 ### Client dialect is honoured on an OpenAI channel (verified 2026-09-26)
 
-A client posting Anthropic shape to `/v1/messages` gets Anthropic shape back even
-when the selected channel speaks OpenAI, and — the part that was broken — gets its
-**content**. `OpenAiAdaptor::request_url` addresses such a request to
-`{base}/v1/chat/completions` and `convert_request` translates the body
-(`crates/oxygenrouter-relay/src/convert/claude_to_openai_request.rs`). The
-reference behaves the same way (`relay/channel/openai/adaptor.go:180-184`
-hard-codes the chat route for a Claude-format relay).
+A client that speaks Anthropic (`/v1/messages`) or Gemini
+(`/v1beta/models/<m>:generateContent`) gets its own dialect back — and, the part
+that was broken, gets its **content** — even when the selected channel speaks
+OpenAI. `OpenAiAdaptor::request_url` addresses such a request to
+`{base}/v1/chat/completions` and `convert_request` translates the body into OpenAI
+chat shape. The reference behaves the same way
+(`relay/channel/openai/adaptor.go:180-184` hard-codes the chat route for a
+Claude- or Gemini-format relay).
 
-Evidence, all four quadrants against the live NewAPI instance:
+New converters, each with its own tests:
 
-| Client | Channel | Expected | Observed |
-|---|---|---|---|
-| OpenAI | OpenAI | `chat.completion` + text | `content='PING'`, usage `10/2/12` |
-| Claude | OpenAI | `type=message` + text | `content=[{"type":"text","text":"PING"}]`, usage `input=10 output=2` |
-| Claude | Anthropic | pass-through | `content=[{"type":"text","text":"PING"}]` |
-| OpenAI | Anthropic | translated to OpenAI | `content='PING'` |
+| Direction | File |
+|---|---|
+| Anthropic request → OpenAI request | `convert/claude_to_openai_request.rs` |
+| OpenAI response → Anthropic response | `convert/openai_to_claude_response.rs` |
+| OpenAI SSE → Anthropic SSE | `sse/openai.rs::to_claude_events` |
+| Gemini request → OpenAI request | `convert/gemini_to_openai_request.rs` |
+| OpenAI response → Gemini response | `same file` |
+| OpenAI SSE → Gemini SSE | `same file` |
 
-Streaming, Claude client through an OpenAI channel: `message_start`,
-`content_block_start`, 26 × `content_block_delta`, `content_block_stop`,
-`message_delta`, `message_stop` — with real text, and `tokens_used=2033` recorded
-on the log row (it was `0` while streaming was broken).
+Evidence, every client/channel quadrant, live against the reference instance:
 
-**Why it survived review:** the earlier check asserted *shape* only
+| Client | Channel | Observed |
+|---|---|---|
+| OpenAI | OpenAI | `chat.completion`, `content='PING'`, usage `10/2/12` |
+| Claude | OpenAI | `content=[{"type":"text","text":"PING"}]`, usage `input=10 output=2` |
+| Claude | Anthropic | pass-through, `content 'PING'` |
+| OpenAI | Anthropic | translated, `content 'PING'` |
+| Gemini | OpenAI | `parts:[{text:"PING"}]`, `finishReason STOP`, usage `prompt 10 / cand 2 / total 12` |
+
+Streaming through an OpenAI channel. Claude client: `message_start`,
+`content_block_start`, deltas, `content_block_stop`, `message_delta`,
+`message_stop`, with real text and `tokens_used=2033` on the log row (it was `0`
+while streaming was broken). Gemini client: Gemini-shaped `data:` frames, the
+role-only opening delta correctly dropped, terminal frame carrying
+`finishReason: STOP` and `usageMetadata` (`totalTokenCount 2025`).
+
+**Why the Claude bug survived review:** the earlier check asserted *shape* only
 (`type == "message"`, `content` is a list). An empty answer satisfies both. The
-regression guard therefore asserts on the URL and on the extracted text:
-`crates/oxygenrouter-relay/tests/openai_channel_serves_claude_clients.rs`.
-Removing the URL guard makes it fail (mutation-verified).
+regression guards therefore assert on the request URL and on the extracted text:
+`tests/openai_channel_serves_claude_clients.rs` and
+`tests/openai_channel_serves_gemini_clients.rs`. Removing either the URL guard or
+the request translation makes them fail (mutation-verified, both directions).
 
 ### Streaming asks the upstream to report usage
 
@@ -77,6 +93,29 @@ Removing the URL guard makes it fail (mutation-verified).
 streamed request. Without it an OpenAI upstream omits the terminal usage chunk and
 the request settles at zero — the same defect class as the hard-coded
 `stream: false` fixed earlier.
+
+### The passthrough path honours streaming (fixed 2026-09-26)
+
+`relay_passthrough` hard-coded `stream: false`, so every pass-through endpoint
+asked its upstream for a buffered reply and then returned it as
+`application/json`. The visible symptom was a Gemini client posting to
+`/v1beta/models/<m>:streamGenerateContent` receiving one JSON object instead of
+SSE, which the Gemini client libraries cannot parse at all — they wait for a
+stream that never arrives.
+
+Detection is now three-valued (`passthrough_wants_stream`): a `stream: true`
+body, an `Accept: text/event-stream` header, or a `:streamGenerateContent` method
+name. The third exists because Gemini selects streaming through the URL alone and
+says nothing in either the body or the headers.
+
+`is_stream_request` also now treats an explicit `stream: false` as terminal
+rather than falling through to `Accept`. An SDK that always sends
+`Accept: text/event-stream` while asking for a buffered reply would otherwise be
+marked streaming and its JSON body handed to the SSE parser.
+
+Verified live: a Gemini client streaming through an OpenAI channel receives 18
+Gemini-shaped frames ending in `finishReason: STOP` with `usageMetadata`
+(`totalTokenCount 2025`), where before it received a single JSON object.
 
 ### Provider adapters — now wired (2026-09-25)
 
@@ -316,17 +355,13 @@ a concurrent 20-thread test proves reservation cannot overspend).
   read as a behavioral specification only — its code must never be copied.
 
 ## Open questions
-- **Gemini-native inbound on a pure OpenAI channel.** `POST /v1beta/models/*path`
-  is forwarded verbatim (`proxy.rs:gemini_inbound`). That works when the upstream
-  itself understands Gemini (the live NewAPI instance does), because it answers in
-  the format it was asked in. It does *not* work against a plain OpenAI-compatible
-  server such as vLLM, which has no `/v1beta` route — there is no
-  `gemini_to_openai` *request* converter yet, only the response direction. The
-  reference handles it the same way it handles Claude inbound, by forcing
-  `{base}/v1/chat/completions` and translating
-  (`relay/channel/openai/adaptor.go:180-184`); we have not yet mirrored that for
-  Gemini. Tracked as part of the P4 remainder. Same shape of defect as the Claude
-  one fixed above, caught by reading the reference rather than by a failing test.
+- **The remaining OpenAI-compatible shims still append the client path verbatim.**
+  `AdvancedCustom`, `Ollama` and the other `ApiType::OpenAi` fallbacks do not
+  reshape a Claude or Gemini client's request the way `OpenAiAdaptor` now does, so
+  a native-dialect client on one of those channels hits the wrong route. Both
+  converters exist and are reusable, so each fix is a routing branch plus the
+  translation call; not yet done, and no live channel of those types was available
+  to verify against. Found by reading the reference, not by a failing test.
 
 ## Pending decisions
 - _None recorded_

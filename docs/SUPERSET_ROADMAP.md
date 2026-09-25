@@ -409,20 +409,19 @@ Add missing endpoints on top of P1. Status as of `7f553df`:
 - ❌ `GET /v1/responses` WebSocket (Responses streaming session)
 - ❌ `GET /v1/realtime` WebSocket (Realtime API)
 - ❌ `POST /v1/responses/compact`, `POST /v1/alpha/search`
-- ❌ **Gemini-native inbound on a plain OpenAI channel.** `/v1beta/models/*path` is
-  forwarded verbatim, which works only when the upstream itself speaks Gemini.
-  There is no `gemini_to_openai` *request* converter yet, so a vLLM/SGLang channel
-  cannot serve a Gemini client. The reference forces
-  `{base}/v1/chat/completions` and translates
-  (`relay/channel/openai/adaptor.go:180-184`); we have not mirrored that.
+- ✅ Native inbound `/v1beta/models/*path` now works against a plain OpenAI
+  channel too: `convert/gemini_to_openai_request.rs` translates the request and
+  the adaptor aims it at `{base}/v1/chat/completions`, both directions, streaming
+  included. Verified live. (Was listed here as a gap; now closed.)
 - ❌ Codex credential refresh + usage endpoints
 - ❌ vLLM / SGLang per-channel metrics
 
 **Still open from the dialect work:** the OpenAI adaptor is the only one that
-reshapes a Claude client's request. Anthropic/Azure/Bedrock have their own
-correct routing, but `AdvancedCustom`, `Ollama` and the OpenAI-compatible shims
-still append `info.request_path` verbatim, so a Claude client on those channels
-has the same wrong-route hazard that was just fixed for `OpenAI`.
+reshapes a Claude or Gemini client's request. Anthropic/Azure/Bedrock have their
+own correct routing, but `AdvancedCustom`, `Ollama` and the OpenAI-compatible
+shims still append `info.request_path` verbatim, so a Claude or Gemini client on
+those channels has the same wrong-route hazard that was just fixed for `OpenAI`.
+Both now have a converter to reuse, so the fix is a routing branch each.
 
 ---
 

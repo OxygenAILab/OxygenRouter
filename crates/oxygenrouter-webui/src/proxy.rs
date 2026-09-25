@@ -135,17 +135,46 @@ pub async fn fallback_handler(request: Request) -> Response {
 }
 
 fn is_stream_request(headers: &axum::http::HeaderMap, body: &serde_json::Value) -> bool {
-    if headers
+    // An explicit `stream: false` is the most specific signal a client can give,
+    // so it wins over a broad `Accept` header. Without this an SDK that always
+    // sends `Accept: text/event-stream` but asked for a buffered reply would be
+    // marked streaming, and its JSON body would then be fed to the SSE parser.
+    match body.get("stream").and_then(|v| v.as_bool()) {
+        Some(false) => return false,
+        Some(true) => return true,
+        None => {}
+    }
+    headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.contains("text/event-stream"))
         .unwrap_or(false)
-    {
-        return true;
+}
+
+/// Whether a pass-through request asked for a streamed reply.
+///
+/// Three signals, because the endpoints differ: an OpenAI-family body says
+/// `stream: true`, an `Accept: text/event-stream` header covers clients that do
+/// not put it in the body, and Gemini selects streaming purely through the
+/// `:streamGenerateContent` method name, which appears in neither.
+fn passthrough_wants_stream(
+    headers: &axum::http::HeaderMap,
+    body: &serde_json::Value,
+    upstream_path: &str,
+) -> bool {
+    // Gemini names the streaming method in the URL -- `:streamGenerateContent`
+    // versus `:generateContent` -- and says nothing in the body or the headers.
+    // That verb is authoritative, so it decides on its own: falling through to
+    // the `Accept` header here would turn a client's ordinary
+    // `Accept: text/event-stream` into a streamed request for a method that has
+    // no streaming form. The verb is matched by name rather than by position so
+    // an unrelated colon elsewhere in the path cannot be mistaken for one.
+    if let Some((_, verb)) = upstream_path.rsplit('/').next().and_then(|leaf| leaf.split_once(':')) {
+        if verb.starts_with("streamGenerateContent") || verb.starts_with("generateContent") {
+            return verb.starts_with("streamGenerateContent");
+        }
     }
-    body.get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    is_stream_request(headers, body)
 }
 
 fn json_error(status: StatusCode, msg: &str) -> Response {
@@ -934,13 +963,19 @@ async fn relay_passthrough(
         Err(response) => return response,
     };
 
+    // A streamed pass-through needs the upstream to actually stream. This was
+    // hard-coded `false`, so a client asking for SSE got a buffered JSON body and
+    // the Gemini client gave up; the same defect class as the hard-coded
+    // `stream: false` on the chat completions path.
+    let stream = passthrough_wants_stream(&headers, &parsed, upstream_path);
+
     let proxy_req = ProxyRequest {
         method: method.to_string(),
         path: upstream_path.to_string(),
         headers: forwarded_headers(&headers),
         body: Some(body_bytes),
         model: model.clone(),
-        stream: false,
+        stream,
     };
 
     let scheduler = state.scheduler.read().await;
@@ -973,7 +1008,11 @@ async fn relay_passthrough(
                     None
                 },
             );
-            build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
+            if stream {
+                build_streaming_response(r.body.to_vec(), r.status, &r.headers)
+            } else {
+                build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
+            }
         }
         Err(e) => {
             let status = e.status();
@@ -1584,5 +1623,65 @@ mod tests {
     fn an_empty_header_map_forwards_nothing() {
         let headers = axum::http::HeaderMap::new();
         assert!(forwarded_headers(&headers).is_empty());
+    }
+
+    fn headers_with_accept(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn an_explicit_stream_false_beats_a_broad_accept_header() {
+        // An SDK that always sends the SSE accept header but asked for a buffered
+        // reply must not be marked streaming, or its JSON body reaches the SSE
+        // parser.
+        let headers = headers_with_accept("text/event-stream");
+        assert!(!is_stream_request(&headers, &serde_json::json!({"stream": false})));
+        assert!(is_stream_request(&headers, &serde_json::json!({"stream": true})));
+    }
+
+    #[test]
+    fn the_accept_header_still_selects_streaming_without_a_body_flag() {
+        let headers = headers_with_accept("text/event-stream");
+        assert!(is_stream_request(&headers, &serde_json::json!({})));
+        assert!(!is_stream_request(&axum::http::HeaderMap::new(), &serde_json::json!({})));
+    }
+
+    #[test]
+    fn the_gemini_verb_decides_passthrough_streaming() {
+        let json = axum::http::HeaderMap::new();
+        let body = serde_json::json!({});
+        assert!(passthrough_wants_stream(
+            &json,
+            &body,
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent"
+        ));
+        // The buffered verb must not stream even when the client sends the SSE
+        // accept header, because `:generateContent` has no streaming form.
+        assert!(!passthrough_wants_stream(
+            &headers_with_accept("text/event-stream"),
+            &body,
+            "/v1beta/models/gemini-2.5-flash:generateContent"
+        ));
+    }
+
+    #[test]
+    fn a_non_gemini_passthrough_falls_back_to_the_body_flag() {
+        let body = serde_json::json!({"stream": true});
+        assert!(passthrough_wants_stream(
+            &axum::http::HeaderMap::new(),
+            &body,
+            "/v1/files"
+        ));
+        let buffered = serde_json::json!({"stream": false});
+        assert!(!passthrough_wants_stream(
+            &headers_with_accept("text/event-stream"),
+            &buffered,
+            "/v1/files"
+        ));
     }
 }

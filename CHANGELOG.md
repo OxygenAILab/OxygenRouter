@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P4 — Gemini dialect)
+- **A Gemini client can now use an OpenAI channel.** `convert/gemini_to_openai_request.rs`
+  translates `generateContent` shape both ways — request (`contents[].role` `model`→
+  `assistant`, `systemInstruction`→a leading `system` message, `thought: true` parts→
+  `reasoning_content`, `inlineData`/`fileData`→`image_url`,
+  `functionCall`/`functionResponse`→`tool_calls`/`tool` messages with the call id
+  resolved by function name, `generationConfig`→sampling fields) and response
+  (`reasoning_content`→a `thought` part, `tool_calls`→`functionCall` parts,
+  `usage`→`usageMetadata` with reasoning taken out of the candidate count). The
+  OpenAI adaptor aims such a request at `{base}/v1/chat/completions`. Previously
+  there was no request converter at all, so a Gemini client on an OpenAI-compatible
+  channel (vLLM, SGLang, DeepSeek) could not work.
+
+### Fixed (P4 — passthrough streaming)
+- **`relay_passthrough` hard-coded `stream: false`**, so every pass-through endpoint
+  asked its upstream for a buffered reply and returned `application/json`. A Gemini
+  client posting to `:streamGenerateContent` received one JSON object instead of SSE
+  and could not parse it at all. Detection is now three-valued — a `stream: true`
+  body, an `Accept: text/event-stream` header, or the `:streamGenerateContent`
+  method name (Gemini selects streaming only through the URL).
+- **`is_stream_request` let a broad `Accept` header override an explicit
+  `stream: false`.** An SDK that always sends `Accept: text/event-stream` while
+  asking for a buffered reply would be marked streaming, and its JSON body handed to
+  the SSE parser. An explicit in-body flag now wins.
+
+### Verified (P4 — Gemini)
+- Live against the reference: a Gemini client on an OpenAI channel receives
+  `parts:[{text:"PING"}]` / `finishReason STOP` / `usageMetadata` `10/2/12`
+  non-streaming, and 18 Gemini-shaped SSE frames ending in `STOP` with
+  `totalTokenCount 2025` streaming (it was one JSON object before the fix).
+  Claude and Gemini clients both work on the same channel.
+- Mutation check: removing either the URL guard or the request translation makes
+  `openai_channel_serves_gemini_clients` fail, so both are load-bearing.
+- `cargo test --workspace` → **281 passed / 0 failed**, zero warnings.
+
 ### Fixed (P4 — client dialect)
 - **A Claude client routed to an OpenAI channel received an empty answer.** The OpenAI
   adaptor appended the client's path to the base URL, so `POST /v1/messages` was forwarded
