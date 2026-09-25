@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Billing & quota engine** — new crate `oxygenrouter-billing`.
+  - Tiered billing expressions (`expr.rs`), the modern NewAPI pricing path: token variables with
+    auto-exclusion, `tier`/`fixed`/`param`/`header`/`u`/`has`, math helpers, fixed-offset timezone
+    functions, ternaries and the full operator set. `quota = round(expr_USD / 1e6 * QuotaPerUnit * group_ratio)`.
+  - Classic ratio pricing (`chat_quota.rs`) with the ±1 minimum-charge rule.
+  - `quota_math.rs`: int32 saturation, half-away-from-zero rounding, and the wider 2^53-1 wallet domain.
+  - `estimator.rs`: per-vendor token estimation (CJK/math/URL/emoji aware) used for pre-consume, plus
+    cl100k BPE counting when the `tiktoken` feature is enabled.
+  - `session.rs`: reserve → settle → refund with an idempotent refund, trust bypass, playground mode,
+    and the invariant that a settled session can never refund.
+- **Differential parity harness** — `tests/fixtures/live_newapi_quota_oracle.json` is a verbatim
+  export of every `tiered_expr` request in the live instance. `tests/live_oracle_diff.rs` replays
+  all **15,728 requests across 33 distinct expressions**: **zero mismatches**, including tier
+  (branch) selection. This is the evidence for the G6 parity gate.
+
+### Added (P1 — adapter dispatch)
 - **Provider adapter dispatch** — `Channel.provider` is now functional. New module
   `oxygenrouter-proxy/src/dispatch.rs` resolves a channel's `ApiType`, builds the matching
   adaptor from `oxygenrouter-relay`, translates the request into the provider's wire format, and
@@ -37,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serde defaults, so a hand-written config missing any field failed to deserialize and startup then
   overwrote it with stock defaults — losing settings such as a custom listen port. Every field now has
   a `#[serde(default = "...")]`, and startup refuses to write back a config it could not parse.
+- AWS region parsing rejected three-segment AWS regions such as `ap-southeast-2`, silently falling
+  back to `us-east-1`. Caught by the new adaptor contract tests.
 - Bedrock region parsing rejected three-segment AWS regions such as `ap-southeast-2`, silently
   falling back to `us-east-1`.
 

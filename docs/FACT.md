@@ -99,10 +99,56 @@ Subscriptions, Admin Users, Admin Billing.
 `subscriptions`, `redemption_codes`, `redemption_uses`, `payment_orders`.
 
 ### Test & build baseline (2026-09-25)
-- `cargo test --workspace` → **45 passed / 0 failed**
-  (`relay` 15 unit + 20 adaptor-contract, `core` 5 unit + 5 config-compat)
+- `cargo test --workspace` → **126 passed / 0 failed**
+  (`billing` 78 unit + 3 oracle-differential, `relay` 15 unit + 20 adaptor-contract,
+  `core` 5 unit + 5 config-compat, `proxy`/`webui` component tests)
 - `npm run build` (tsc + vite) → **passes** (2,032 modules)
 - `cargo check --workspace` → clean
+
+### Billing engine (P2) — verified against live production traffic
+
+`oxygenrouter-billing` implements the quota engine. Two pricing paths exist in
+NewAPI and both are now supported:
+
+1. **Tiered expressions** (the modern default, and what the live instance
+   actually uses — `billing_mode: "tiered_expr"`). An operator writes a small
+   expression in USD per million tokens:
+
+   ```text
+   tier("base", p * 3 + c * 12 + cr * 0.06)
+   quota = round(expr_USD / 1_000_000 * QuotaPerUnit * group_ratio)
+   ```
+
+   `crates/oxygenrouter-billing/src/expr.rs` implements the language: token
+   variables with **auto-exclusion**, `tier`, `fixed`, `param`, `header`, `u`,
+   `has`, `min`/`max`/`abs`/`ceil`/`floor`, `hour`/`minute`/`weekday`/`month`/
+   `day` with fixed-offset timezones, ternaries, and the full operator set.
+
+2. **Classic ratios** (`chat_quota.rs`) — model/completion/cache/image ratios
+   with the ±1 minimum-charge rule, for operators still on the legacy tables.
+
+**Differential parity result.** `crates/oxygenrouter-billing/tests/fixtures/live_newapi_quota_oracle.json`
+is a verbatim export of every `tiered_expr` request in the running instance:
+**15,728 requests spanning 33 distinct expressions**. `live_oracle_diff.rs`
+replays all of them through our engine.
+
+| Check | Result |
+|---|---|
+| Requests priced identically to NewAPI | **15,728 / 15,728 (0 mismatches)** |
+| Branch (`tier`) selection agreement | **all** |
+| Distinct live expressions evaluated | **33 / 33** |
+| Expressions covering the traffic | 2 expressions account for 13,590 requests |
+
+This is the strongest available evidence for gate **G6**: not hand-picked
+examples, but real production traffic including `cc1h` split cache tiers,
+time-gated peak/off-peak rates, `len`-conditioned long-context tiers, and a
+request-body-gated branch.
+
+Also implemented: `quota_math` (int32 saturation, half-away-from-zero rounding,
+the wider 2^53-1 wallet domain), `estimator` (per-vendor heuristic plus
+optional cl100k BPE), and `session` (reserve → settle → refund, with an
+idempotent refund and the invariant that **a settled session can never refund**;
+a concurrent 20-thread test proves reservation cannot overspend).
 
 ### Fixed defects (2026-09-25)
 
