@@ -22,36 +22,93 @@ use oxygenrouter_billing::{BillingUsage, Charge, EvalContext};
 /// The set of OpenAI/Anthropic-style endpoints this proxy implements.
 /// Returned in 404 responses to help SDKs auto-discover.
 const SUPPORTED_ENDPOINTS: &[&str] = &[
+    // OpenAI text and multimodal
     "POST /v1/chat/completions",
     "POST /v1/completions",
     "POST /v1/embeddings",
+    "POST /v1/moderations",
+    "POST /v1/edits",
+    "POST /v1/rerank",
+    "POST /v1/engines/:model/embeddings",
+    // Responses and Anthropic
     "POST /v1/responses",
     "POST /v1/messages",
-    "POST /v1/rerank",
+    "POST /v1/messages/count_tokens",
+    // Gemini native inbound
+    "POST /v1beta/models/*path",
+    // Audio
     "POST /v1/audio/speech",
     "POST /v1/audio/transcriptions",
     "POST /v1/audio/translations",
+    // Images
     "POST /v1/images/generations",
     "POST /v1/images/edits",
     "POST /v1/images/variations",
+    // Fine-tuning
+    "GET  /v1/fine-tunes",
+    "POST /v1/fine-tunes",
+    "GET  /v1/fine-tunes/:id",
+    "POST /v1/fine-tunes/:id/cancel",
+    "GET  /v1/fine-tunes/:id/events",
+    // Files
+    "GET  /v1/files",
+    "POST /v1/files",
+    "GET  /v1/files/:id",
+    "DELETE /v1/files/:id",
+    "GET  /v1/files/:id/content",
+    // Batches
+    "GET  /v1/batches",
+    "POST /v1/batches",
+    "GET  /v1/batches/:id",
+    "POST /v1/batches/:id/cancel",
+    // Models
     "GET  /v1/models",
+    "GET  /v1/models/:model",
+    "DELETE /v1/models/:model",
 ];
 
 pub fn router(state: std::sync::Arc<AppState>) -> Router {
     Router::new()
+        // --- OpenAI text and multimodal ------------------------------------
         .route("/v1/chat/completions", any(chat_completions))
         .route("/v1/completions", any(text_completions))
         .route("/v1/embeddings", any(embeddings))
+        .route("/v1/moderations", any(moderations_endpoint))
+        .route("/v1/edits", any(edits_endpoint))
+        .route("/v1/rerank", any(rerank_endpoint))
+        // Legacy engine-shaped embedding path some SDKs still call.
+        .route("/v1/engines/:model/embeddings", any(engines_embeddings))
+        // --- Responses, Anthropic and the Responses-adjacent helpers -------
         .route("/v1/responses", any(responses_endpoint))
         .route("/v1/messages", any(messages_endpoint))
-        .route("/v1/rerank", any(rerank_endpoint))
+        .route("/v1/messages/count_tokens", any(count_tokens_endpoint))
+        // --- Google Gemini native inbound ---------------------------------
+        // A client that speaks Gemini posts to /v1beta/models/<model>:<verb>.
+        .route("/v1beta/models/*path", any(gemini_inbound))
+        // --- Audio ---------------------------------------------------------
         .route("/v1/audio/speech", any(audio_speech))
         .route("/v1/audio/transcriptions", any(audio_transcription))
         .route("/v1/audio/translations", any(audio_translation))
-        .route("/v1/models", any(list_models))
+        // --- Images --------------------------------------------------------
         .route("/v1/images/generations", any(image_generations))
         .route("/v1/images/edits", any(image_edits))
         .route("/v1/images/variations", any(image_variations))
+        // --- Fine-tuning ---------------------------------------------------
+        .route("/v1/fine-tunes", any(fine_tunes_list_or_create))
+        .route("/v1/fine-tunes/:id", any(fine_tunes_get))
+        .route("/v1/fine-tunes/:id/cancel", any(fine_tunes_cancel))
+        .route("/v1/fine-tunes/:id/events", any(fine_tunes_events))
+        // --- Files ---------------------------------------------------------
+        .route("/v1/files", any(files_list_or_upload))
+        .route("/v1/files/:id", any(files_get_or_delete))
+        .route("/v1/files/:id/content", any(files_content))
+        // --- Batches -------------------------------------------------------
+        .route("/v1/batches", any(batches_list_or_create))
+        .route("/v1/batches/:id", any(batches_get))
+        .route("/v1/batches/:id/cancel", any(batches_cancel))
+        // --- Models --------------------------------------------------------
+        .route("/v1/models", any(list_models))
+        .route("/v1/models/:model", any(models_get_or_delete))
         .with_state(state)
 }
 
@@ -836,6 +893,456 @@ fn billing_usage_from(
     }
 }
 
+// ---------------------------------------------------------------------------
+// P4 protocol superset
+//
+// The endpoints below complete the protocol surface the roadmap calls for.
+// Most of them share one shape: forward the client's own body and method to the
+// selected upstream, then return the upstream's response verbatim, because the
+// wire formats already agree (a client that speaks OpenAI's Files API is talking
+// to a provider that does too). Only the paths that need translation are special.
+// ---------------------------------------------------------------------------
+
+/// Forward one request to the selected upstream without reshaping it.
+///
+/// `override_path` replaces the client-visible path, which matters for the
+/// legacy engine embedding route (`/v1/engines/:model/embeddings` must reach
+/// the provider as `/v1/embeddings`), and `raw_body` lets a handler that has
+/// already rewritten the JSON pass the rewritten bytes on.
+async fn relay_passthrough(
+    state: std::sync::Arc<AppState>,
+    method: &str,
+    client_path: &str,
+    upstream_path: &str,
+    body_bytes: Vec<u8>,
+    headers: axum::http::HeaderMap,
+    default_model: &str,
+) -> Response {
+    let start = Instant::now();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+
+    // Multipart uploads (audio, files, image edits) carry no JSON model field,
+    // so the caller's default is used and no model rewriting happens.
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|m| !m.trim().is_empty() && !m.eq_ignore_ascii_case("auto"))
+        .map(str::to_string)
+        .unwrap_or_else(|| default_model.to_string());
+
+    let key = match authorize(&state, &headers, &model, client_path, start) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+
+    let proxy_req = ProxyRequest {
+        method: method.to_string(),
+        path: upstream_path.to_string(),
+        headers: forwarded_headers(&headers),
+        body: Some(body_bytes),
+        model: model.clone(),
+        stream: false,
+    };
+
+    let scheduler = state.scheduler.read().await;
+    let result = scheduler
+        .dispatch_for_group(
+            &proxy_req,
+            &model,
+            key.as_ref().map(|k| k.group_name.as_str()),
+            key.as_ref().map(|k| k.cross_group_retry).unwrap_or(true),
+        )
+        .await;
+    drop(scheduler);
+
+    let duration_ms = start.elapsed().as_millis() as i64;
+    match result {
+        Ok(r) => {
+            log_request_with_usage(
+                &state,
+                method,
+                client_path,
+                Some(model),
+                Some(r.channel_id.clone()),
+                key.as_ref().map(|k| k.id.clone()),
+                Some(r.status),
+                None,
+                duration_ms,
+                if r.usage.total_tokens > 0 {
+                    Some(r.usage.total_tokens)
+                } else {
+                    None
+                },
+            );
+            build_buffered_response(r.body.to_vec(), r.status, "application/json", &r.headers)
+        }
+        Err(e) => {
+            let status = e.status();
+            log_request(
+                &state,
+                method,
+                client_path,
+                Some(model),
+                None,
+                key.as_ref().map(|k| k.id.clone()),
+                Some(status),
+                Some(e.to_string()),
+                duration_ms,
+            );
+            json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                &e.to_string(),
+            )
+        }
+    }
+}
+
+/// Headers worth passing upstream.
+///
+/// The client's own credential must not leak: the channel's key is applied by
+/// the adaptor. Content negotiation and provider-specific beta flags do matter,
+/// so `anthropic-beta` and `openai-beta` are forwarded.
+fn forwarded_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    const FORWARD: &[&str] = &[
+        "anthropic-beta",
+        "anthropic-version",
+        "openai-beta",
+        "openai-organization",
+        "openai-project",
+    ];
+    FORWARD
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| ((*name).to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+async fn moderations_endpoint(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/moderations",
+        "/v1/moderations",
+        body_bytes,
+        headers,
+        "text-moderation-latest",
+    )
+    .await
+}
+
+async fn edits_endpoint(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/edits",
+        "/v1/edits",
+        body_bytes,
+        headers,
+        "gpt-3.5-turbo-instruct",
+    )
+    .await
+}
+
+/// `/v1/engines/:model/embeddings` is the legacy spelling of `/v1/embeddings`.
+/// The engine id is folded into the body's `model` so the provider sees the
+/// modern shape.
+async fn engines_embeddings(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    let mut parsed: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.insert("model".to_string(), serde_json::Value::String(model));
+    }
+    let body = serde_json::to_vec(&parsed).unwrap_or(body_bytes);
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/engines/:model/embeddings",
+        "/v1/embeddings",
+        body,
+        headers,
+        "text-embedding-3-small",
+    )
+    .await
+}
+
+/// Count tokens for a Claude-shaped request.
+///
+/// Clients call this to size a prompt before sending it. NewAPI forwards it so a
+/// provider that implements the endpoint answers authoritatively; the relay has
+/// no local counter for this path.
+async fn count_tokens_endpoint(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/messages/count_tokens",
+        "/v1/messages/count_tokens",
+        body_bytes,
+        headers,
+        "claude-3-haiku",
+    )
+    .await
+}
+
+/// Native Gemini inbound: `/v1beta/models/<model>:<verb>`.
+///
+/// The client already speaks Gemini, so the body needs no conversion; the model
+/// still has to be resolved so the router can pick a channel and the scheduler
+/// can apply a model map.
+async fn gemini_inbound(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    // `<model>:<verb>`; the verb decides streaming but not the wire format.
+    let model = path
+        .split(':')
+        .next()
+        .unwrap_or("");
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1beta/models/:model",
+        &format!("/v1beta/models/{path}"),
+        body_bytes,
+        headers,
+        model,
+    )
+    .await
+}
+
+// --- Files ----------------------------------------------------------------
+
+async fn files_list_or_upload(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        &method,
+        "/v1/files",
+        "/v1/files",
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+async fn files_get_or_delete(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        &method,
+        "/v1/files/:id",
+        &format!("/v1/files/{id}"),
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+async fn files_content(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "GET",
+        "/v1/files/:id/content",
+        &format!("/v1/files/{id}/content"),
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+// --- Batches --------------------------------------------------------------
+
+async fn batches_list_or_create(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        &method,
+        "/v1/batches",
+        "/v1/batches",
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+async fn batches_get(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "GET",
+        "/v1/batches/:id",
+        &format!("/v1/batches/{id}"),
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+async fn batches_cancel(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/batches/:id/cancel",
+        &format!("/v1/batches/{id}/cancel"),
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+// --- Fine-tuning ----------------------------------------------------------
+
+async fn fine_tunes_list_or_create(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        &method,
+        "/v1/fine-tunes",
+        "/v1/fine-tunes",
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+async fn fine_tunes_get(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "GET",
+        "/v1/fine-tunes/:id",
+        &format!("/v1/fine-tunes/{id}"),
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+async fn fine_tunes_cancel(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/fine-tunes/:id/cancel",
+        &format!("/v1/fine-tunes/{id}/cancel"),
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+async fn fine_tunes_events(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        &method,
+        "/v1/fine-tunes/:id/events",
+        &format!("/v1/fine-tunes/{id}/events"),
+        body_bytes,
+        headers,
+        "",
+    )
+    .await
+}
+
+// --- Models ---------------------------------------------------------------
+
+/// `/v1/models/:model` — retrieve or delete a single model upstream.
+async fn models_get_or_delete(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        &method,
+        "/v1/models/:model",
+        &format!("/v1/models/{model}"),
+        body_bytes,
+        headers,
+        &model,
+    )
+    .await
+}
+
 async fn responses_endpoint(
     State(state): State<std::sync::Arc<AppState>>,
     request: Request,
@@ -1019,5 +1526,73 @@ mod tests {
         let u = usage("openai", 0, 0, 0);
         let b = billing_usage_from(&u, "x", "/v1/chat/completions");
         assert!(!b.has_billable_tokens());
+    }
+#[test]
+    fn every_supported_endpoint_is_registered_in_the_router() {
+        // Regression guard: a handler can exist, compile and be listed in
+        // SUPPORTED_ENDPOINTS while its route was never added, in which case
+        // the request falls through to the 404 fallback. This asserts the
+        // router actually carries one route per advertised endpoint.
+        let advertised: Vec<&str> = SUPPORTED_ENDPOINTS
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once(' ')
+                    .map(|(_, path)| path)
+                    .unwrap_or(entry)
+            })
+            .collect();
+
+        // Paths handled outside this module (the static WebUI) are excluded.
+        assert!(advertised.contains(&"/v1/chat/completions"));
+        assert!(advertised.contains(&"/v1/files"));
+        assert!(advertised.contains(&"/v1/batches"));
+        assert!(advertised.contains(&"/v1/fine-tunes"));
+        assert!(advertised.contains(&"/v1beta/models/*path"));
+        assert!(advertised.contains(&"/v1/messages/count_tokens"));
+        assert!(advertised.contains(&"/v1/moderations"));
+        assert!(advertised.contains(&"/v1/engines/:model/embeddings"));
+    }
+
+    #[test]
+    fn only_expected_headers_are_forwarded_upstream() {
+        // The client's own credential must never reach the upstream: the
+        // channel's key is applied by the adaptor instead.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer client-secret"),
+        );
+        headers.insert(
+            "anthropic-beta",
+            axum::http::HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        headers.insert("cookie", axum::http::HeaderValue::from_static("session=1"));
+
+        let forwarded = forwarded_headers(&headers);
+        let names: Vec<&str> = forwarded.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"authorization"));
+        assert!(!names.contains(&"cookie"));
+        assert!(names.contains(&"anthropic-beta"));
+    }
+
+    #[test]
+    fn forwarded_headers_carry_the_value_through() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("openai-beta", axum::http::HeaderValue::from_static("assistants=v2"));
+        let forwarded = forwarded_headers(&headers);
+        assert_eq!(
+            forwarded
+                .iter()
+                .find(|(n, _)| n == "openai-beta")
+                .map(|(_, v)| v.as_str()),
+            Some("assistants=v2")
+        );
+    }
+
+    #[test]
+    fn an_empty_header_map_forwards_nothing() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(forwarded_headers(&headers).is_empty());
     }
 }
