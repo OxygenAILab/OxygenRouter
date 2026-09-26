@@ -115,7 +115,10 @@ export default function LogsPage() {
 
   // Live stream overlay
   useEffect(() => {
-    if (!live) {
+    // The stream carries the instance-wide firehose, which is admin-only. Rather
+    // than let a non-admin toggle it and watch an EventSource fail silently, the
+    // control is disabled for them (see the toggle below).
+    if (!live || !isAdmin) {
       setLiveStatus("disconnected");
       return;
     }
@@ -228,7 +231,15 @@ export default function LogsPage() {
         description={t.logs.description}
         action={
           <div className="flex items-center gap-2 flex-wrap">
-            <button className={`btn-outlined btn-sm ${live ? "is-active" : ""}`} onClick={() => setLive((v) => !v)}>
+            <button
+              className={`btn-outlined btn-sm ${live ? "is-active" : ""}`}
+              onClick={() => setLive((v) => !v)}
+              // The stream is the instance-wide firehose, so it is admin-only on
+              // the server; disabling it here keeps the control honest instead of
+              // letting it silently fail to connect.
+              disabled={!isAdmin}
+              title={isAdmin ? undefined : t.logs.allChannels}
+            >
               <span className={`live-indicator ${liveStatus}`} />
               {live ? <Wifi size={13} /> : <WifiOff size={13} />}
               {t.logs.live}
