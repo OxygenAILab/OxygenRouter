@@ -723,6 +723,25 @@ pub struct Subscription {
     pub started_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// The quota pool this subscription grants, snapshotted from the plan when it
+    /// was created. `0` means unlimited, matching the reference's `TotalAmount`
+    /// semantics.
+    #[serde(default)]
+    pub amount_total: i64,
+    /// How much of the pool has been consumed.
+    #[serde(default)]
+    pub amount_used: i64,
+}
+
+impl Subscription {
+    /// Quota still available. `None` means unlimited.
+    pub fn remaining(&self) -> Option<i64> {
+        if self.amount_total <= 0 {
+            None
+        } else {
+            Some((self.amount_total - self.amount_used).max(0))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

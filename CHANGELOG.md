@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P6 — subscription quota pool)
+- **A subscription's quota is now a real, spendable pool.** `subscriptions` gains
+  `amount_total` (snapshotted from the plan's `quota_micros` at creation) and
+  `amount_used`, plus `subscription_funding_source`, `consume_subscription_quota`
+  and `refund_subscription_quota`.
+- Selection follows the reference (`model/subscription.go:1334-1358`): among
+  active, unexpired subscriptions ordered by soonest expiry then id, the first
+  whose pool can still cover the amount. Draining the nearest-to-lapsing
+  entitlement first is what stops a user losing paid-for quota when one expires.
+
+### Verified (P6 — subscription quota pool)
+- **The pool lives on the subscription, not the wallet**, matching the reference
+  (`AmountTotal`/`AmountUsed`). This is the mechanism I had earlier recorded
+  incorrectly in the roadmap as "the reference credits the user"; it does not, and
+  the roadmap is corrected. The distinction is load-bearing: crediting the wallet
+  would make subscription quota spendable *after* expiry and would blend it with
+  money the user can top up. A test asserts an expired subscription with quota
+  left funds nothing.
+- Editing a plan does not change an existing subscription's pool, because the
+  total is a snapshot — asserted, since a later reprice must not retroactively
+  alter what was bought.
+- Spending is guarded in the `WHERE` clause, so a concurrent request cannot drive
+  usage past the total — the same atomic-reserve pattern as the wallet. An
+  exhausted pool refuses further spend; a refund is clamped at zero so a double
+  refund cannot manufacture quota.
+- **A bug the tests caught:** the first `consume` implementation required
+  `amount_total > 0`, so an *unlimited* pool (`0`) rejected every spend. The
+  reference accepts those and records no usage. Fixed with a single statement that
+  expresses both cases, so there is one definition of "may this spend proceed".
+- `cargo test --workspace` → **405 passed / 0 failed**, zero warnings.
+
 ### Added (P6 — subscription admin lifecycle)
 - Seven routes under `/api/subscription/admin/*`, matching the reference's
   `subscriptionAdminRoute` group: `bind`, a user's subscriptions, a plan's

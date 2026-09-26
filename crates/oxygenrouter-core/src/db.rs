@@ -367,6 +367,13 @@ impl Database {
             "ALTER TABLE users ADD COLUMN two_fa_secret TEXT",
             "ALTER TABLE users ADD COLUMN two_fa_enabled INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN two_fa_backup_codes TEXT NOT NULL DEFAULT '[]'",
+            // Subscription-scoped quota pool. The reference keeps this on the
+            // subscription, NOT in the wallet: `AmountTotal` is snapshotted from
+            // the plan's `TotalAmount` at creation and `AmountUsed` climbs as
+            // requests bill (model/subscription.go:258-259). Crediting the wallet
+            // instead would let subscription quota be spent after expiry.
+            "ALTER TABLE subscriptions ADD COLUMN amount_total INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE subscriptions ADD COLUMN amount_used INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(sql, []);
         }
@@ -2380,6 +2387,10 @@ impl Database {
             started_at: now,
             expires_at: now + Duration::days(plan.duration_days),
             created_at: now,
+            // Snapshotted from the plan, as the reference does: a later plan edit
+            // must not change what an existing subscription already granted.
+            amount_total: plan.quota_micros,
+            amount_used: 0,
         };
         if plan.price_micros > 0 {
             Self::credit_tx(
@@ -2391,7 +2402,7 @@ impl Database {
                 Some(&subscription.id),
             )?;
         }
-        tx.execute("INSERT INTO subscriptions (id,user_id,plan_id,status,started_at,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![subscription.id,subscription.user_id,subscription.plan_id,subscription.status,subscription.started_at.to_rfc3339(),subscription.expires_at.to_rfc3339(),subscription.created_at.to_rfc3339()])?;
+        tx.execute("INSERT INTO subscriptions (id,user_id,plan_id,status,started_at,expires_at,created_at,amount_total,amount_used) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![subscription.id,subscription.user_id,subscription.plan_id,subscription.status,subscription.started_at.to_rfc3339(),subscription.expires_at.to_rfc3339(),subscription.created_at.to_rfc3339(),subscription.amount_total,subscription.amount_used])?;
         tx.commit()?;
         Ok(subscription)
     }
@@ -2439,8 +2450,12 @@ impl Database {
             started_at: now,
             expires_at: now + Duration::days(plan.duration_days),
             created_at: now,
+            // A grant snapshots the same pool as a purchase, so an admin gift is
+            // worth exactly what the plan advertises.
+            amount_total: plan.quota_micros,
+            amount_used: 0,
         };
-        tx.execute("INSERT INTO subscriptions (id,user_id,plan_id,status,started_at,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![subscription.id,subscription.user_id,subscription.plan_id,subscription.status,subscription.started_at.to_rfc3339(),subscription.expires_at.to_rfc3339(),subscription.created_at.to_rfc3339()])?;
+        tx.execute("INSERT INTO subscriptions (id,user_id,plan_id,status,started_at,expires_at,created_at,amount_total,amount_used) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![subscription.id,subscription.user_id,subscription.plan_id,subscription.status,subscription.started_at.to_rfc3339(),subscription.expires_at.to_rfc3339(),subscription.created_at.to_rfc3339(),subscription.amount_total,subscription.amount_used])?;
         tx.commit()?;
         Ok(subscription)
     }
@@ -2491,7 +2506,7 @@ impl Database {
     pub fn list_subscriptions_for_plan(&self, plan_id: &str) -> SqliteResult<Vec<Subscription>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id,user_id,plan_id,status,started_at,expires_at,created_at FROM subscriptions
+                "SELECT id,user_id,plan_id,status,started_at,expires_at,created_at,amount_total,amount_used FROM subscriptions
              WHERE plan_id=?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![plan_id], |row| {
@@ -2503,6 +2518,8 @@ impl Database {
                 started_at: Self::parse_time(row.get(4)?)?,
                 expires_at: Self::parse_time(row.get(5)?)?,
                 created_at: Self::parse_time(row.get(6)?)?,
+                amount_total: row.get(7)?,
+                amount_used: row.get(8)?,
             })
         })?;
         rows.collect()
@@ -2516,9 +2533,94 @@ impl Database {
         self.list_subscriptions(user_id)
     }
 
+    /// The subscription a request should bill against, if any.
+    ///
+    /// Selection follows the reference exactly (`model/subscription.go:1334-1358`):
+    /// among *active, unexpired* subscriptions, ordered by soonest expiry then
+    /// id, take the first whose pool can still cover `amount`. That ordering
+    /// drains the entitlement closest to lapsing first, so a user does not lose
+    /// paid-for quota when a subscription expires mid-way.
+    ///
+    /// `Ok(None)` means "no subscription can pay"; the caller falls back to the
+    /// wallet. A lapsed subscription is excluded rather than offered, which is
+    /// what stops expired quota from being spent.
+    pub fn subscription_funding_source(
+        &self,
+        user_id: &str,
+        amount: i64,
+    ) -> SqliteResult<Option<Subscription>> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT id,user_id,plan_id,status,started_at,expires_at,created_at,amount_total,amount_used
+             FROM subscriptions
+             WHERE user_id=?1 AND status='active' AND expires_at>?2
+             ORDER BY expires_at ASC, id ASC",
+        )?;
+        let candidates: Vec<Subscription> = stmt
+            .query_map(params![user_id, now], |row| {
+                Ok(Subscription {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    plan_id: row.get(2)?,
+                    status: row.get(3)?,
+                    started_at: Self::parse_time(row.get(4)?)?,
+                    expires_at: Self::parse_time(row.get(5)?)?,
+                    created_at: Self::parse_time(row.get(6)?)?,
+                    amount_total: row.get(7)?,
+                    amount_used: row.get(8)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(candidates.into_iter().find(|sub| match sub.remaining() {
+            // Unlimited pools always qualify.
+            None => true,
+            Some(remaining) => remaining >= amount,
+        }))
+    }
+
+    /// Consume `amount` from a subscription's pool.
+    ///
+    /// The guard is in the `WHERE` clause, so a concurrent request cannot drive
+    /// `amount_used` past `amount_total`: the same atomic-reserve pattern as the
+    /// wallet. Returns whether the consumption happened.
+    ///
+    /// An unlimited pool (`amount_total = 0`) succeeds but records nothing,
+    /// matching the reference, which only accumulates `AmountUsed` when a total is
+    /// set. Both cases are expressed in one statement so there is a single
+    /// definition of "may this spend proceed": with an unlimited pool the guard
+    /// passes and the counter is left alone, so `amount_used` stays at 0 rather
+    /// than climbing against a total that does not exist.
+    pub fn consume_subscription_quota(&self, id: &str, amount: i64) -> SqliteResult<bool> {
+        if amount <= 0 {
+            return Ok(true);
+        }
+        Ok(self.conn.lock().execute(
+            "UPDATE subscriptions
+                SET amount_used = CASE WHEN amount_total > 0 THEN amount_used + ?2 ELSE amount_used END
+              WHERE id = ?1 AND (amount_total = 0 OR amount_used + ?2 <= amount_total)",
+            params![id, amount],
+        )? > 0)
+    }
+
+    /// Return quota to a subscription's pool after a failed request.
+    ///
+    /// Clamped at zero so a double refund cannot manufacture quota.
+    pub fn refund_subscription_quota(&self, id: &str, amount: i64) -> SqliteResult<()> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        self.conn.lock().execute(
+            "UPDATE subscriptions SET amount_used = MAX(amount_used - ?2, 0) WHERE id = ?1",
+            params![id, amount],
+        )?;
+        Ok(())
+    }
+
     pub fn list_subscriptions(&self, user_id: &str) -> SqliteResult<Vec<Subscription>> {
         let conn = self.conn.lock();
-        let mut stmt=conn.prepare("SELECT id,user_id,plan_id,status,started_at,expires_at,created_at FROM subscriptions WHERE user_id=?1 ORDER BY created_at DESC")?;
+        let mut stmt=conn.prepare("SELECT id,user_id,plan_id,status,started_at,expires_at,created_at,amount_total,amount_used FROM subscriptions WHERE user_id=?1 ORDER BY created_at DESC")?;
         let subscriptions = stmt
             .query_map(params![user_id], |row| {
                 Ok(Subscription {
@@ -2529,6 +2631,8 @@ impl Database {
                     started_at: Self::parse_time(row.get(4)?)?,
                     expires_at: Self::parse_time(row.get(5)?)?,
                     created_at: Self::parse_time(row.get(6)?)?,
+                    amount_total: row.get(7)?,
+                    amount_used: row.get(8)?,
                 })
             })?
             .collect();

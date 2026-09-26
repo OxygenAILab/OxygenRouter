@@ -335,6 +335,46 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription admin lifecycle (2026-09-26)
 
+### Subscription quota pool (2026-09-26)
+
+A subscription now carries a real spendable pool: `subscriptions.amount_total`
+(snapshotted from the plan's `quota_micros` at creation) and `amount_used`, with
+`subscription_funding_source` / `consume_subscription_quota` /
+`refund_subscription_quota` in `crates/oxygenrouter-core/src/db.rs`.
+
+**This corrects an error I had recorded here.** The roadmap previously said the
+reference "credits the user" and treated the missing credit as a transfer problem.
+It does not credit anything: it keeps a pool on the subscription — `AmountTotal`
+snapshotted from the plan's `TotalAmount`, `AmountUsed` climbing as requests bill
+(`model/subscription.go:258-259`) — and routes funding through a `FundingSource`
+abstraction (`service/funding_source.go`) that draws from the subscription or the
+wallet by billing preference. The mechanism was verified in the reference before
+implementing it, and the roadmap note is corrected.
+
+The distinction is load-bearing, not cosmetic: crediting the wallet would make
+subscription quota spendable **after** the subscription expired, and would blend it
+with money the user can top up. A test asserts an expired subscription with quota
+left funds nothing.
+
+Semantics, each pinned by a test:
+
+- **Selection** mirrors `model/subscription.go:1334-1358`: among active unexpired
+  subscriptions ordered by soonest expiry then id, the first whose pool can cover
+  the amount. Soonest-expiry-first drains the entitlement closest to lapsing, so a
+  user does not lose paid-for quota when one expires mid-way.
+- **`amount_total = 0` means unlimited** and is always selectable, with no usage
+  recorded — the reference only accumulates `AmountUsed` when a total exists.
+- **Spending is guarded in the `WHERE` clause**, so a concurrent request cannot
+  drive usage past the total (the same atomic-reserve pattern as the wallet), and
+  refunds are clamped at zero so a double refund cannot manufacture quota.
+- **The total is a snapshot**: editing a plan does not retroactively change what an
+  existing subscription granted.
+
+**A bug the tests caught:** the first `consume` implementation required
+`amount_total > 0`, so an unlimited pool rejected every spend. Unlimited pools must
+accept. Both cases are now expressed in one statement, so there is a single
+definition of "may this spend proceed".
+
 Seven routes under `/api/subscription/admin/*`, matching the reference's
 `subscriptionAdminRoute` group: bind a plan, list a user's subscriptions, list a
 plan's subscribers, reset a user's or a plan's subscriptions, invalidate one, and
