@@ -1764,6 +1764,90 @@ impl Database {
         conn.query_row("SELECT u.id,u.username,u.email,u.role,u.status,u.balance_micros,u.created_at,u.updated_at,u.last_login_at,s.expires_at FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?1 AND s.expires_at>?2 AND u.status='active'", params![token, Utc::now().to_rfc3339()], |row| Ok((Self::user_from_row(row)?, Self::parse_time(row.get(9)?)?))).optional()
     }
 
+    /// A user's live sessions, newest first.
+    ///
+    /// Expired rows are excluded rather than deleted: a purge would race with a
+    /// concurrent request that is still holding the token, and the caller only
+    /// ever wants the sessions that are actually usable.
+    pub fn sessions_for_user(&self, user_id: &str) -> SqliteResult<Vec<AuthSession>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,user_id,token,expires_at,created_at FROM auth_sessions
+             WHERE user_id=?1 AND expires_at>?2
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![user_id, Utc::now().to_rfc3339()], |row| {
+            Ok(AuthSession {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                token: row.get(2)?,
+                expires_at: Self::parse_time(row.get(3)?)?,
+                created_at: Self::parse_time(row.get(4)?)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The session row behind a token, if it is still live.
+    ///
+    /// Used to identify *which* session is making a call, so the API can mark it
+    /// as the current one and refuse to revoke it out from under the caller.
+    pub fn session_by_token(&self, token: &str) -> SqliteResult<Option<AuthSession>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id,user_id,token,expires_at,created_at FROM auth_sessions
+             WHERE token=?1 AND expires_at>?2",
+            params![token, Utc::now().to_rfc3339()],
+            |row| {
+                Ok(AuthSession {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    token: row.get(2)?,
+                    expires_at: Self::parse_time(row.get(3)?)?,
+                    created_at: Self::parse_time(row.get(4)?)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// Revoke one of `user_id`'s sessions, identified by its session id.
+    ///
+    /// Scoped by `user_id` rather than leaving it to the caller: a delete keyed on
+    /// the id alone would let any authenticated user revoke any other user's
+    /// session by guessing an id.
+    pub fn revoke_session_by_id(&self, user_id: &str, session_id: &str) -> SqliteResult<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM auth_sessions WHERE id=?1 AND user_id=?2",
+                params![session_id, user_id],
+            )?
+            > 0)
+    }
+
+    /// Revoke every session of `user_id` except `keep_session_id`.
+    ///
+    /// Returns how many rows were removed. A `None` keep-id revokes them all,
+    /// which is the "sign out everywhere" case.
+    pub fn revoke_other_sessions(
+        &self,
+        user_id: &str,
+        keep_session_id: Option<&str>,
+    ) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        match keep_session_id {
+            Some(keep) => Ok(conn.execute(
+                "DELETE FROM auth_sessions WHERE user_id=?1 AND id<>?2",
+                params![user_id, keep],
+            )?),
+            None => Ok(
+                conn.execute("DELETE FROM auth_sessions WHERE user_id=?1", params![user_id])?
+            ),
+        }
+    }
+
     fn credit_tx(
         tx: &rusqlite::Transaction<'_>,
         user_id: &str,

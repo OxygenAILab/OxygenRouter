@@ -76,6 +76,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        // Session management, matching the reference's `/api/user/sessions`
+        // (router/api-router.go:94-96).
+        .route("/api/user/sessions", get(list_sessions))
+        .route("/api/user/sessions/:sid", delete(delete_session))
+        .route(
+            "/api/user/sessions/revoke-others",
+            post(revoke_other_sessions),
+        )
         .route("/api/wallet", get(wallet))
         .route("/api/subscriptions/me", get(my_subscriptions))
         .route("/api/subscriptions/subscribe", post(subscribe))
@@ -230,6 +238,84 @@ async fn me(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match auth_user(&s, &headers) {
         Ok(user) => Json(ApiResponse::ok(user)).into_response(),
         Err(response) => response,
+    }
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────
+
+/// A session as the console sees it.
+///
+/// The raw token is deliberately absent: the console only needs to point at a
+/// session, and echoing tokens back would put a live credential in an HTTP
+/// response body and in any log that captures one.
+#[derive(serde::Serialize)]
+struct SessionView {
+    id: String,
+    created_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+    /// True for the session making this request.
+    current: bool,
+}
+
+/// `GET /api/user/sessions`
+async fn list_sessions(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let current_id = session_token(&headers)
+        .and_then(|token| s.db.session_by_token(token).ok().flatten())
+        .map(|session| session.id);
+
+    match s.db.sessions_for_user(&user.id) {
+        Ok(sessions) => {
+            let views: Vec<SessionView> = sessions
+                .into_iter()
+                .map(|session| SessionView {
+                    current: current_id.as_deref() == Some(session.id.as_str()),
+                    id: session.id,
+                    created_at: session.created_at,
+                    expires_at: session.expires_at,
+                })
+                .collect();
+            Json(ApiResponse::ok(views)).into_response()
+        }
+        Err(error) => Json(ApiResponse::<Vec<SessionView>>::err(error.to_string())).into_response(),
+    }
+}
+
+/// `DELETE /api/user/sessions/:sid`
+async fn delete_session(
+    State(s): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match s.db.revoke_session_by_id(&user.id, &session_id) {
+        Ok(true) => Json(ApiResponse::ok("revoked")).into_response(),
+        Ok(false) => Json(ApiResponse::<&str>::err("session not found")).into_response(),
+        Err(error) => Json(ApiResponse::<&str>::err(error.to_string())).into_response(),
+    }
+}
+
+/// `POST /api/user/sessions/revoke-others`
+///
+/// Keeps the calling session, so the user is not signed out by the action they
+/// just took; the reference does the same.
+async fn revoke_other_sessions(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let keep = session_token(&headers)
+        .and_then(|token| s.db.session_by_token(token).ok().flatten())
+        .map(|session| session.id);
+    match s.db.revoke_other_sessions(&user.id, keep.as_deref()) {
+        Ok(count) => Json(ApiResponse::ok(count)).into_response(),
+        Err(error) => Json(ApiResponse::<usize>::err(error.to_string())).into_response(),
     }
 }
 async fn wallet(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {

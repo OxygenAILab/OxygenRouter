@@ -328,7 +328,7 @@ Legend: **M** = missing entirely · **P** = partial · **S** = stub · **✓** =
 | Auto-disable / multi-key rotation | full | partial | P |
 | Rate limiting | 6 scopes | none | **M** |
 | SSRF protection | ✓ | none | **M** |
-| Auth: sessions/access tokens/passkey/2FA/email/RBAC | full | password only | **M** |
+| Auth: sessions/access tokens/passkey/2FA/email/RBAC | full | password + session management (list/revoke/revoke-others) | **P** |
 | OAuth providers | GitHub/Discord/OIDC/LinuxDO/Telegram/WeChat/custom | none | **M** |
 | Payments | 5 providers + webhooks | manual order only | **M** |
 | Subscriptions | full (plans/orders/pre-consume) | tables only | **M** |
@@ -340,7 +340,7 @@ Legend: **M** = missing entirely · **P** = partial · **S** = stub · **✓** =
 | Realtime / Responses WS | ✓ | none | **M** |
 | Batches / Files / Fine-tunes | ✓ | none | **M** |
 | Moderations / Rerank / Edits | ✓ | rerank only (pass-through) | P |
-| Vendors + Model metadata sync | ✓ (upstream sync) | metadata CRUD, no sync | P |
+| Vendors + Model metadata sync | ✓ (upstream sync) | vendors CRUD + metadata CRUD, no upstream sync | P |
 | Model deployments (GPU rental) | ✓ | none | **M** |
 | Perf metrics + rankings | ✓ | none | **M** |
 | Check-in rewards | ✓ | none | **M** |

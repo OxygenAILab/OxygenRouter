@@ -236,6 +236,33 @@ Verified live: create three, refuse a duplicate name with a readable message,
 list in name order with counts, attach two models and watch OpenAI's count become
 2, substring search, rename, delete. Nine storage tests plus the live run.
 
+### Session management (2026-09-26)
+
+`GET /api/user/sessions`, `DELETE /api/user/sessions/:sid` and
+`POST /api/user/sessions/revoke-others`, matching the reference
+(`router/api-router.go:94-96`). There was previously no way to see or end a
+session short of signing out.
+
+Two properties are deliberate rather than incidental:
+
+- **Revocation is scoped by `(user_id, session_id)`.** `revoke_session_by_id` takes
+  the owner as an argument instead of trusting a caller-supplied id, so one user
+  cannot sign another out by naming their session. Keying on the id alone is the
+  obvious implementation; removing the scope makes the test fail
+  (mutation-verified).
+- **The raw token is never echoed.** The list renders a `SessionView` with
+  `id`/`created_at`/`expires_at`/`current` and no token field, so a live credential
+  does not reach a response body or any log that captures one. The live check
+  asserts the field is absent.
+
+`revoke-others` keeps the calling session so the action does not sign the user out
+mid-request; the current session is identified by the caller's own token.
+
+Verified live: register, sign in twice, list both sessions with exactly one marked
+current, revoke the other (its token then answers `401` on `/api/auth/me`), refuse
+a foreign session id, and run `revoke-others` (count 1, caller still signed in, the
+third token `401`). Nine storage tests cover the same ground.
+
 ### Test & build baseline (2026-09-25)
 - `cargo test --workspace` → **193 passed / 0 failed**, zero build warnings
   (`billing` 102 unit + 3 oracle-differential, `relay` 15 unit + 20 adaptor-contract,

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P5 — sessions)
+- **Session management** — `GET /api/user/sessions`,
+  `DELETE /api/user/sessions/:sid`, `POST /api/user/sessions/revoke-others`,
+  matching the reference (`router/api-router.go:94-96`). Previously there was no
+  way to see or end a session short of signing out.
+
+### Verified (P5 — sessions)
+- Revocation is scoped by `(user_id, session_id)`: `revoke_session_by_id` takes the
+  owner as an argument rather than trusting a caller-supplied id, so one user
+  cannot sign another out by naming their session. Keying on the id alone is the
+  obvious implementation and makes the test fail (mutation-verified).
+- The raw token is never echoed. The list renders `id`/`created_at`/`expires_at`/
+  `current` and no token field, so a live credential cannot reach a response body
+  or a log that captures one; the live check asserts the field is absent.
+- Live end to end: register, sign in twice, list both with exactly one marked
+  current, revoke the other (its token then answers `401` on `/api/auth/me`),
+  refuse a foreign session id, and run `revoke-others` (one removed, caller still
+  signed in, the third token `401`). Nine storage tests cover the same ground.
+- `cargo test --workspace` → **322 passed / 0 failed**, zero warnings.
+
 ### Added (P8 — vendors)
 - **Vendor registry** — `vendors` table plus the `/api/vendors` group (list,
   search, get, create, update, delete), matching the reference's paths
