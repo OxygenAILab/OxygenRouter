@@ -321,6 +321,11 @@ impl Database {
             "ALTER TABLE channels ADD COLUMN balance_micros INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE channels ADD COLUMN last_test_at TEXT",
             "ALTER TABLE channels ADD COLUMN info TEXT NOT NULL DEFAULT '{}'",
+            // A long-lived dashboard credential, distinct from a login session:
+            // the reference stores it on the user row (`users.access_token`) and
+            // hands it to the client once, on generation.
+            "ALTER TABLE users ADD COLUMN access_token TEXT",
+            "ALTER TABLE users ADD COLUMN access_token_created_at TEXT",
         ] {
             let _ = conn.execute(sql, []);
         }
@@ -1831,6 +1836,9 @@ impl Database {
     ///
     /// Returns how many rows were removed. A `None` keep-id revokes them all,
     /// which is the "sign out everywhere" case.
+    ///
+    /// Returns how many rows were removed. A `None` keep-id revokes them all,
+    /// which is the "sign out everywhere" case.
     pub fn revoke_other_sessions(
         &self,
         user_id: &str,
@@ -1846,6 +1854,81 @@ impl Database {
                 conn.execute("DELETE FROM auth_sessions WHERE user_id=?1", params![user_id])?
             ),
         }
+    }
+
+    /// Whether `user_id` currently holds an access token, and since when.
+    ///
+    /// Returns only the timestamp, never the token: this is what the console
+    /// shows, and the reference likewise reports status rather than the value
+    /// (`model.GetUserAccessTokenStatus`).
+    pub fn access_token_status(&self, user_id: &str) -> SqliteResult<Option<DateTime<Utc>>> {
+        let conn = self.conn.lock();
+        let row: Option<Option<String>> = conn
+            .query_row(
+                "SELECT access_token_created_at FROM users WHERE id=?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match row {
+            // A user row whose token was never generated.
+            Some(None) => Ok(None),
+            Some(Some(created)) => Ok(Some(Self::parse_time(created)?)),
+            // No such user.
+            None => Ok(None),
+        }
+    }
+
+    /// Store a freshly generated access token, replacing any previous one.
+    ///
+    /// Replacing rather than keeping a set is the reference's behaviour: a user
+    /// has at most one access token, and generating again rotates it.
+    pub fn set_access_token(&self, user_id: &str, token: &str) -> SqliteResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.lock().execute(
+            "UPDATE users SET access_token=?1, access_token_created_at=?2, updated_at=?2 WHERE id=?3",
+            params![token, now, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the access token. Returns whether one had been set.
+    pub fn revoke_access_token(&self, user_id: &str) -> SqliteResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        Ok(self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE users SET access_token=NULL, access_token_created_at=NULL, updated_at=?1
+                 WHERE id=?2 AND access_token IS NOT NULL",
+                params![now, user_id],
+            )?
+            > 0)
+    }
+
+    /// The user behind an access token, if it is set and the account is active.
+    pub fn user_by_access_token(&self, token: &str) -> SqliteResult<Option<User>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id,username,email,role,status,balance_micros,created_at,updated_at,last_login_at
+             FROM users WHERE access_token=?1 AND status='active'",
+            params![token],
+            Self::user_from_row,
+        )
+        .optional()
+    }
+
+    /// Whether any user already holds `token`.
+    ///
+    /// A generated token is checked rather than assumed unique: a collision would
+    /// silently hand one user another's credential.
+    pub fn access_token_exists(&self, token: &str) -> SqliteResult<bool> {
+        let count: i64 = self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM users WHERE access_token=?1",
+            params![token],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     fn credit_tx(

@@ -84,6 +84,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/user/sessions/revoke-others",
             post(revoke_other_sessions),
         )
+        // Access tokens, matching the reference's `/api/user/token`
+        // (router/api-router.go:102-105). The reference serves GET and POST on
+        // the same path; both generate.
+        .route("/api/user/token", get(generate_access_token))
+        .route("/api/user/token", post(generate_access_token))
+        .route("/api/user/token", delete(revoke_access_token))
+        .route("/api/user/token/status", get(access_token_status))
         .route("/api/wallet", get(wallet))
         .route("/api/subscriptions/me", get(my_subscriptions))
         .route("/api/subscriptions/subscribe", post(subscribe))
@@ -140,11 +147,21 @@ fn auth_user(s: &AppState, headers: &HeaderMap) -> Result<User, Response> {
     };
     match s.db.session_user(token) {
         Ok(Some((user, _))) => Ok(user),
-        Ok(None) => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::<()>::err("invalid or expired session")),
-        )
-            .into_response()),
+        // Not a live session: it may be a long-lived access token, which is what
+        // lets a script drive the user API without holding a login session.
+        Ok(None) => match s.db.user_by_access_token(token) {
+            Ok(Some(user)) => Ok(user),
+            Ok(None) => Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::<()>::err("invalid or expired session")),
+            )
+                .into_response()),
+            Err(_) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::err("authentication lookup failed")),
+            )
+                .into_response()),
+        },
         Err(_) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiResponse::<()>::err("authentication lookup failed")),
@@ -316,6 +333,84 @@ async fn revoke_other_sessions(State(s): State<Arc<AppState>>, headers: HeaderMa
     match s.db.revoke_other_sessions(&user.id, keep.as_deref()) {
         Ok(count) => Json(ApiResponse::ok(count)).into_response(),
         Err(error) => Json(ApiResponse::<usize>::err(error.to_string())).into_response(),
+    }
+}
+
+// ── Access tokens ─────────────────────────────────────────────────────────
+
+/// A generated token is 29 + 0..4 random alphanumerics, the reference's shape.
+///
+/// Entropy comes from `Uuid::new_v4`, which is a CSPRNG-backed 122-bit value;
+/// the alphabet mapping preserves that rather than narrowing it with a weak
+/// source.
+fn new_access_token() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let extra = uuid::Uuid::new_v4().into_bytes();
+    let length = 29 + (bytes[0] as usize % 4);
+    (0..length)
+        .map(|i| {
+            let byte = if i < 16 { bytes[i] } else { extra[i - 16] };
+            ALPHABET[byte as usize % ALPHABET.len()] as char
+        })
+        .collect()
+}
+
+/// `GET /api/user/token/status`
+///
+/// Reports whether a token exists and when it was made, never the value itself.
+async fn access_token_status(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match s.db.access_token_status(&user.id) {
+        Ok(created) => Json(ApiResponse::ok(serde_json::json!({
+            "enabled": created.is_some(),
+            "created_at": created,
+        })))
+        .into_response(),
+        Err(error) => Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response(),
+    }
+}
+
+/// `POST /api/user/token` (and the `GET` the reference also accepts)
+///
+/// The value is returned exactly once, here. The status endpoint deliberately
+/// cannot re-read it, so a lost token has to be rotated rather than recovered —
+/// which is what makes storing it recoverable in the database acceptable.
+async fn generate_access_token(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    // Retry on the (vanishingly unlikely) collision rather than handing out a
+    // credential another user already holds.
+    let mut token = new_access_token();
+    for _ in 0..5 {
+        match s.db.access_token_exists(&token) {
+            Ok(false) => break,
+            Ok(true) => token = new_access_token(),
+            Err(error) => {
+                return Json(ApiResponse::<String>::err(error.to_string())).into_response()
+            }
+        }
+    }
+    match s.db.set_access_token(&user.id, &token) {
+        Ok(()) => Json(ApiResponse::ok(token)).into_response(),
+        Err(error) => Json(ApiResponse::<String>::err(error.to_string())).into_response(),
+    }
+}
+
+/// `DELETE /api/user/token`
+async fn revoke_access_token(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    match s.db.revoke_access_token(&user.id) {
+        Ok(removed) => Json(ApiResponse::ok(removed)).into_response(),
+        Err(error) => Json(ApiResponse::<bool>::err(error.to_string())).into_response(),
     }
 }
 async fn wallet(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {

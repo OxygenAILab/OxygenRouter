@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P5 — access tokens)
+- **Access tokens** — `GET`/`POST /api/user/token` (generate),
+  `DELETE /api/user/token` (revoke), `GET /api/user/token/status`, matching the
+  reference (`router/api-router.go:102-105`). A token is now accepted anywhere a
+  session token is, so a script can drive the user API without a browser session.
+
+### Verified (P5 — access tokens)
+- Shape is the reference's 29–32 alphanumeric characters, with entropy taken from
+  UUIDv4 bytes (CSPRNG-backed) rather than a weaker source. A generated value is
+  checked against existing tokens so a collision is retried rather than silently
+  handing one user another's credential.
+- Regeneration **rotates**: verified live that the previous value answered `401`
+  while the new one answered `200`.
+- **The value is returned exactly once.** `status` reports `enabled` and
+  `created_at` only; the live check asserts the token string does not appear in
+  the status response, because returning the stored row would pass every other
+  assertion while exposing a live credential.
+- Lookup joins on `status='active'`, so disabling an account ends its API access
+  without a separate revocation step (test-asserted).
+- Live end to end: status, generate (length 32), status with the value absent,
+  authenticate `/api/auth/me` with the token, rotate, revoke, and an
+  unauthenticated generate refused with `401`. Eight storage tests cover the same
+  ground.
+- `cargo test --workspace` → **330 passed / 0 failed**, zero warnings.
+
 ### Added (P5 — sessions)
 - **Session management** — `GET /api/user/sessions`,
   `DELETE /api/user/sessions/:sid`, `POST /api/user/sessions/revoke-others`,

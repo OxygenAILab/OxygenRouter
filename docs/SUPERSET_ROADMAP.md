@@ -433,7 +433,9 @@ with all three client dialects.
 - ✅ **Sessions**: multi-session list/revoke/revoke-others landed
   (`/api/user/sessions`). An auth-version fence (invalidate all sessions on a
   credential change) is **not** implemented.
-- **Access tokens**: generate/status/revoke (for dashboard API use).
+- ✅ **Access tokens**: generate/status/revoke landed
+  (`/api/user/token`, `/api/user/token/status`), and a token authenticates the
+  user API. Security-proof gating on generate/revoke is **not** implemented.
 - **OAuth providers**: GitHub, Discord, LinuxDO, OIDC, Telegram, WeChat, + custom
   generic providers (DB-driven, access-policy engine).
 - **Passkey / WebAuthn**: register/verify/delete, discoverable login, step-up verify.

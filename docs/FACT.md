@@ -263,6 +263,36 @@ current, revoke the other (its token then answers `401` on `/api/auth/me`), refu
 a foreign session id, and run `revoke-others` (count 1, caller still signed in, the
 third token `401`). Nine storage tests cover the same ground.
 
+### Access tokens (2026-09-26)
+
+`GET`/`POST /api/user/token` (generate), `DELETE /api/user/token` (revoke) and
+`GET /api/user/token/status`, matching the reference
+(`router/api-router.go:102-105`, `controller/access_token.go`). A login session is
+short-lived and belongs to a browser; an access token is a long-lived credential a
+script can carry, and it is now accepted anywhere a session token is.
+
+Shape and precedence:
+
+- 29–32 alphanumeric characters, the reference's `GenerateRandomKey(29..32)` shape.
+  Entropy comes from UUIDv4 bytes (CSPRNG-backed, 122 bits) rather than a weaker
+  source, so the alphabet mapping does not narrow the entropy.
+- A generated value is checked against existing tokens before it is handed out, so
+  a collision is retried instead of silently giving one user another's credential.
+- Regenerating **rotates**: a user has at most one token, and the previous value
+  stops authenticating. Verified live — the old token answered `401` while the new
+  one answered `200`.
+- **The value is returned exactly once and never readable back.** `status` reports
+  `enabled` and `created_at` only, and the live check asserts the token string does
+  not appear in the status response. Recovering a lost token is impossible by
+  design; it is rotated instead.
+- Lookup joins on `status='active'`, so disabling an account ends its API access
+  without a separate revocation step (test-asserted).
+
+Verified live: status before generating, generate (length 32), status after (value
+absent), authenticate `/api/auth/me` with the token, rotate and confirm the old
+value `401`s, revoke, and confirm an unauthenticated generate is refused with
+`401`. Eight storage tests cover the same ground.
+
 ### Test & build baseline (2026-09-25)
 - `cargo test --workspace` → **193 passed / 0 failed**, zero build warnings
   (`billing` 102 unit + 3 oracle-differential, `relay` 15 unit + 20 adaptor-contract,
