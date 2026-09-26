@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod models;
 mod options;
+pub mod totp;
 
 pub use config::{APP_CONFIG, load_config, save_config};
 pub use db::{ApiKeyResolutionError, ChannelSelector, Database};

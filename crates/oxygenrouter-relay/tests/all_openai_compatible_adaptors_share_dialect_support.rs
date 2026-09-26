@@ -12,7 +12,7 @@
 //!
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
-use oxygenrouter_relay::adaptor::{Adaptor, UpstreamResponse};
+use oxygenrouter_relay::adaptor::UpstreamResponse;
 use oxygenrouter_relay::channel_type::ApiType;
 use oxygenrouter_relay::get_adaptor;
 use oxygenrouter_relay::value::{RelayFormat, RelayInfo};

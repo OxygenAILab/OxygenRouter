@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P5 — TOTP primitive)
+- **RFC 6238 TOTP** in `crates/oxygenrouter-core/src/totp.rs`, with the parameters
+  the reference uses: HMAC-SHA1, 30-second period, six digits. Built against the
+  RFC rather than dependency-pulled so those parameters are explicit, plus
+  RFC 4648 base32 (no padding, tolerant of padding and lower case on input),
+  CSPRNG-backed secret generation, and `otpauth://` provisioning URIs with
+  percent-encoded labels.
+
+### Verified (P5 — TOTP)
+- **Against the RFC's own published vectors.** Appendix B prints eight-digit codes
+  for a known seed; `tests/totp.rs` asserts the generator reproduces all six SHA1
+  rows exactly. That is stronger than a self-consistent test, since a
+  wrong-but-tidy implementation still disagrees with every authenticator app.
+- Two corrections the vectors caught, both now pinned by tests:
+  1. A six-digit code is the eight-digit value **modulo 10⁶** — the *low* six
+     digits. Taking the leading six gives `942870` where the answer is `287082`.
+     Confirmed against an independent from-spec implementation before changing
+     anything, so the fix followed evidence rather than the failing assertion.
+  2. `hotp_value` must return the raw 31-bit truncation *before* `mod 10^digits`;
+     folding the modulus in made the eight-digit assertion re-reduce an
+     already-reduced value (`00287082`).
+- The `base32` encoder is checked against the RFC 4648 `foobar` vector, not just a
+  round trip. The ±1-step window is asserted to accept a neighbouring step and
+  reject one two steps away. Comparison is constant-time; malformed input (empty,
+  short, long, non-digit, full-width digits) is rejected without panicking.
+- **Not yet wired to HTTP.** No `/api/user/2fa/*`, no login gating, no backup
+  codes, no lockout. This lands the verifiable primitive; the API surface is next.
+- `cargo test --workspace` → **350 passed / 0 failed**, zero warnings.
+
 ### Added (P5 — access tokens)
 - **Access tokens** — `GET`/`POST /api/user/token` (generate),
   `DELETE /api/user/token` (revoke), `GET /api/user/token/status`, matching the

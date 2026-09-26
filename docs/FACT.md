@@ -293,6 +293,42 @@ absent), authenticate `/api/auth/me` with the token, rotate and confirm the old
 value `401`s, revoke, and confirm an unauthenticated generate is refused with
 `401`. Eight storage tests cover the same ground.
 
+### TOTP primitive (2026-09-26)
+
+`crates/oxygenrouter-core/src/totp.rs` implements RFC 6238 with the parameters the
+reference uses (HMAC-SHA1, 30-second period, six digits,
+`common.GenerateTOTPSecret`). Built against the RFC rather than pulled from a crate
+so those parameters are explicit.
+
+**Verified against the RFC's own published vectors.** Appendix B prints 8-digit
+codes for a known seed; `tests/totp.rs` asserts the generator reproduces all six
+SHA1 rows exactly. That is stronger evidence than a self-consistent test, because
+a wrong-but-internally-tidy implementation still disagrees with every
+authenticator app.
+
+Two corrections came out of writing that test, both worth recording:
+
+1. A six-digit code is the RFC's eight-digit value taken **modulo 10⁶** — the
+   *low* six digits, not the leading six. Taking `&expected[..6]` yields `942870`
+   where the correct answer is `287082`. Confirmed against an independent
+   from-spec implementation before changing anything.
+2. `hotp_value` must return the raw 31-bit truncation **before** `mod 10^digits`.
+   Folding the modulus in made the 8-digit assertion re-reduce an already-reduced
+   value (`00287082`), which is exactly the bug the raw-function split exists to
+   prevent.
+
+Also covered: base32 encode/decode (round-trip, the RFC 4648 `foobar` vector,
+padding and lower-case tolerance, alphabet rejection), unpadded 32-character
+secrets from CSPRNG bytes, `otpauth://` URIs with percent-encoded labels, a ±1
+step acceptance window that rejects a code two steps away, constant-time
+comparison, and rejection of malformed input (empty, short, long, non-digit,
+full-width digits) without panicking.
+
+**Not yet wired to HTTP:** no `/api/user/2fa/*` endpoints, no login gating, no
+backup codes, no lockout after repeated failures. The reference has all four
+(`controller/twofa.go`, `common/totp.go`); this commit lands the verifiable
+primitive, and the API surface is the next step.
+
 ### Test & build baseline (2026-09-25)
 - `cargo test --workspace` → **193 passed / 0 failed**, zero build warnings
   (`billing` 102 unit + 3 oracle-differential, `relay` 15 unit + 20 adaptor-contract,
