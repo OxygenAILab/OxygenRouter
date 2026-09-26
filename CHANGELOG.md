@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (security — console authentication) — **critical**
+- **49 of 86 console routes were reachable without any credential.** Each handler
+  authenticated itself, and a handler that forgot to call `auth_user` was simply
+  open, with nothing marking it as such. Verified anonymously against a live
+  instance before the fix:
+  - `GET /api/channels` returned every channel **including its upstream API key**.
+  - `PUT /api/channels/:id` repointed a channel's `base_url` — silently
+    redirecting all traffic, and the credential, to an attacker's host.
+  - `POST /api/keys` created a working API key attributed to nobody.
+  - `GET /api/settings` returned `local_api_token`; `GET /api/options` returned
+    all instance configuration; `GET /api/logs`, `/api/dashboard`,
+    `/api/models-metadata`, `/api/vendors`, `/api/model-maps` and `/api/rules`
+    were open as well.
+- Replaced per-handler checks with **one deny-by-default path-class gate** over
+  the whole `/api` tree (`access_guard` + `required_access` in `api.rs`). An
+  unclassified route now requires a session instead of being open, so the failure
+  mode of a new route is closed rather than exposed. Classes mirror the
+  reference's guards: public allow-list, any user, admin, and root-only for the
+  instance-wide surfaces (`option`, `settings`, `system-info`, `backup`, `plugin`,
+  `system-task`), matching its `RootAuth` groups.
+- Added a distinct **root** role, because the reference separates the instance
+  owner from an admin (its bootstrap user is role 100, root) and gates option
+  writes and system tasks on root alone. The bootstrap account is now root, which
+  also avoids locking the owner out of surfaces only root may reach.
+- **API keys are now scoped to their owner.** `list_keys` and `keys_usage` filter
+  to the caller (admins see all), `delete_key` refuses a key belonging to someone
+  else, and `create_key` takes ownership from the credential rather than the
+  request body — trusting a body-supplied `user_id` would have let any user create
+  keys billed to another's wallet.
+
+### Verified (security — console authentication)
+- The four attacks above re-run anonymously against a live instance now return
+  `401`, while `/api/status` and `/api/plans` stay public and the owner still
+  reaches the root-only surfaces (`200`). An ordinary user gets `403` on
+  `/api/channels`, `/api/settings`, `/api/options` and `/api/admin/users`, and
+  `200` on `/api/keys`.
+- Cross-user isolation: alice's key is invisible to bob, bob's delete attempt is
+  refused ("not your key"), and alice's key survives. A user asking for a key
+  attributed to someone else gets it attributed to themselves.
+- Path classification is unit-tested (8 cases), including that a lookalike prefix
+  like `/api/optionsfoo` does not inherit the `/api/options` class, that an
+  unclassified route fails closed, and that an unrecognised role string does not
+  escalate.
+- `cargo test --workspace` → **420 passed / 0 failed**, zero warnings.
+
 ### Added (P6 — subscription quota funds requests)
 - **A subscription's pool now actually pays for requests.** `FundingSource`
   (`Wallet` or `Subscription { user_id, subscription_id }`) chooses who funds a

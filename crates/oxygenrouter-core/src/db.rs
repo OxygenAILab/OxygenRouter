@@ -735,6 +735,19 @@ impl Database {
         rows.collect()
     }
 
+    /// One key by id, for ownership checks before a destructive operation.
+    pub fn get_api_key(&self, id: &str) -> SqliteResult<Option<ApiKey>> {
+        let conn = self.conn.lock();
+        let mut s = conn.prepare(
+            "SELECT id,key,name,priority,enabled,created_at,expires_at,quota_micros,used_micros,allowed_models,ip_allowlist,group_name,cross_group_retry,user_id FROM api_keys WHERE id=?1",
+        )?;
+        let mut rows = s.query_map(params![id], map_api_key)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn find_api_key_by_token(&self, token: &str) -> SqliteResult<Option<ApiKey>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
@@ -1693,7 +1706,12 @@ impl Database {
         }
         let password = std::env::var("OXYGENROUTER_ADMIN_PASSWORD")
             .unwrap_or_else(|_| Uuid::new_v4().simple().to_string());
-        self.create_user("admin", "admin@localhost", &password, UserRole::Admin)?;
+        // The first account is the instance owner, matching the reference, whose
+        // bootstrap user carries `role = 100` (root) rather than admin. It also
+        // matters functionally here: root-only surfaces (settings, options,
+        // system info, backups) would otherwise be unreachable on a fresh
+        // instance, since there would be no root to authorise them.
+        self.create_user("admin", "admin@localhost", &password, UserRole::Root)?;
         Ok(Some(("admin".to_string(), password)))
     }
 

@@ -337,6 +337,56 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription quota funds requests (2026-09-26)
 
+### Console authentication (fixed 2026-09-26) — **was critical**
+
+**49 of 86 console routes were reachable without a credential.** Authentication
+was per-handler, so a handler that never called `auth_user` was open, and nothing
+distinguished it from a guarded one. Verified anonymously against a live instance
+before the fix:
+
+| Request | Result |
+|---|---|
+| `GET /api/channels` | the channel list **including each upstream API key** |
+| `PUT /api/channels/:id` | repointed the channel's `base_url` to an attacker host |
+| `POST /api/keys` | created a working API key |
+| `GET /api/settings` | returned `local_api_token` |
+| `GET /api/options` | returned all instance configuration |
+
+The `PUT` is the worst of them: it silently redirects every relayed request — and
+the upstream credential attached to it — to a host of the caller's choosing.
+
+**The fix is structural, not a sweep of handlers.** One deny-by-default gate now
+wraps the whole `/api` tree (`access_guard` + `required_access` in `api.rs`), so an
+unclassified route requires a session instead of being open. A per-handler sweep
+would have fixed today's routes and left tomorrow's exposed exactly the same way;
+the failure mode of forgetting is now "closed" rather than "public".
+
+Classes mirror the reference's guards:
+
+| Class | Routes |
+|---|---|
+| Public | `/api/auth/{login,register}`, `/api/plans`, `/api/status` |
+| User | everything unclassified (fail-closed) |
+| Admin | `channels`, `models-metadata`, `vendors`, `model-maps`, `rules`, `admin`, `subscription/admin`, `authz` |
+| Root | `options`, `settings`, `system/info`, `backup`, `plugin`, `system-task`, `ratio_sync`, `performance` |
+
+The **root** class required a new role. The reference distinguishes the instance
+owner from an admin — its bootstrap user carries role 100 — and gates option
+writes, task plugins and system tasks on root alone. Our bootstrap account is now
+root, which also avoids the failure this change would otherwise have introduced:
+with every account an admin, nothing could have reached the root-only surfaces.
+
+**API keys are scoped to their owner.** `list_keys` and `keys_usage` filter to the
+caller (admins see all), `delete_key` refuses a key belonging to another user, and
+`create_key` takes ownership from the credential rather than the request body —
+trusting a body-supplied `user_id` would have let any user create keys billed to
+someone else's wallet.
+
+Verified live: the four attacks return `401`; the public surface still answers
+`200`; the owner reaches the root surfaces; an ordinary user gets `403` on
+`channels`/`settings`/`options`/`admin` and `200` on their own keys; and a second
+user cannot see or delete the first user's key.
+
 The pool is now wired into the billing path, which was the gap the previous entry
 recorded. A request is funded by a subscription when one can cover the
 reservation, otherwise by the wallet.

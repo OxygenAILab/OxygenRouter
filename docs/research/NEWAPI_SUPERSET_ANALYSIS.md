@@ -328,7 +328,7 @@ Legend: **M** = missing entirely · **P** = partial · **S** = stub · **✓** =
 | Auto-disable / multi-key rotation | full | partial | P |
 | Rate limiting | 6 scopes | none | **M** |
 | SSRF protection | ✓ | none | **M** |
-| Auth: sessions/access tokens/passkey/2FA/email/RBAC | full | password + sessions + access tokens + TOTP 2FA with login gating and recovery codes | **P** (missing: passkey, email verification, RBAC, step-up proofs, lockout) |
+| Auth: sessions/access tokens/passkey/2FA/email/RBAC | full | password + sessions + access tokens + TOTP 2FA with login gating and recovery codes + a deny-by-default console gate (public/user/admin/root) | **P** (missing: passkey, email verification, per-permission enforcement, step-up proofs, lockout) |
 | OAuth providers | GitHub/Discord/OIDC/LinuxDO/Telegram/WeChat/custom | none | **M** |
 | Payments | 5 providers + webhooks | manual order only | **M** |
 | Subscriptions | full (plans/orders/pre-consume) | plans, purchase, admin lifecycle, and a per-plan quota pool that funds requests via a `FundingSource` choice | **P** (missing: payment gateways, per-plan billing preferences, renewals) |

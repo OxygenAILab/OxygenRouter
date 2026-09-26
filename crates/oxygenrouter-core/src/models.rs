@@ -647,6 +647,9 @@ impl<T> ApiResponse<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
+    /// The instance owner. The reference separates root from admin because some
+    /// operations (option writes, task plugins, system tasks) are root-only.
+    Root,
     Admin,
     User,
 }
@@ -654,16 +657,29 @@ pub enum UserRole {
 impl UserRole {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Root => "root",
             Self::Admin => "admin",
             Self::User => "user",
         }
     }
     pub fn from_db(value: &str) -> Self {
-        if value == "admin" {
-            Self::Admin
-        } else {
-            Self::User
+        match value {
+            "root" => Self::Root,
+            "admin" => Self::Admin,
+            _ => Self::User,
         }
+    }
+
+    /// Whether this role may perform administrative operations.
+    ///
+    /// Root is a superset of admin, so a root check passes for both.
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Self::Root | Self::Admin)
+    }
+
+    /// Whether this role is the instance owner.
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
     }
 }
 

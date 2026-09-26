@@ -227,9 +227,15 @@ For documentation files (`*.md`), put it on a comment line near the top.
 - ✅ Relay layer is wired into the live proxy path (`oxygenrouter-proxy/src/dispatch.rs`)
   and billing runs on it: pre-consume → settle → refund, with the wallet, key usage
   and `request_logs.tokens_used` all moving on real requests. See `docs/FACT.md`.
-- Still open: relay streaming is buffered before adaptor translation (time-to-first-token),
-  and response shaping for native `/v1/messages` clients returns OpenAI-shaped JSON.
-- Local API key check is permissive — any `Bearer xxx` accepted (only channel credentials are validated upstream)
+- Still open: relay streaming is buffered before adaptor translation (time-to-first-token).
+- The **console** (`/api/*`) is gated by a deny-by-default access class — public,
+  user, admin, root — applied as one middleware over the whole tree rather than
+  per handler, so a new route fails closed. Root-only surfaces are those that
+  expose or rewrite instance configuration (`options`, `settings`, `system/info`,
+  `backup`, `plugin`, `system-task`). See `docs/FACT.md`.
+- The **relay** credential check is permissive by design: `/v1/*` accepts any
+  `Bearer xxx`, because channel-only deployments have no local key registry. This
+  is not the console path, which does authenticate.
 - No HTTPS for local server (rely on local trust)
 - Model map uses simple glob patterns; no full regex
 - Logs are in SQLite only; no streaming export

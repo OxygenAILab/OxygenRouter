@@ -162,6 +162,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         // The permission schema, matching the reference's `/api/authz/catalog`
         // (router/authz-router.go:14-17).
         .route("/api/authz/catalog", get(authz_catalog))
+        // One gate over the whole console tree, applied last so it wraps every
+        // route above it. See `access_guard` for why this is path-class based
+        // rather than checked inside each handler.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            access_guard,
+        ))
         .with_state(state)
 }
 
@@ -211,7 +218,7 @@ fn auth_user(s: &AppState, headers: &HeaderMap) -> Result<User, Response> {
 }
 fn admin_user(s: &AppState, headers: &HeaderMap) -> Result<User, Response> {
     let user = auth_user(s, headers)?;
-    if user.role == UserRole::Admin {
+    if user.role.is_admin() {
         Ok(user)
     } else {
         Err((
@@ -219,6 +226,127 @@ fn admin_user(s: &AppState, headers: &HeaderMap) -> Result<User, Response> {
             Json(ApiResponse::<()>::err("admin role required")),
         )
             .into_response())
+    }
+}
+
+fn root_user(s: &AppState, headers: &HeaderMap) -> Result<User, Response> {
+    let user = auth_user(s, headers)?;
+    if user.role.is_root() {
+        Ok(user)
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<()>::err("instance owner role required")),
+        )
+            .into_response())
+    }
+}
+
+/// The access level a console path requires.
+///
+/// Enforced as one middleware over the whole `/api` tree rather than per handler,
+/// because the failure mode of a per-handler check is *silence*: a new route with
+/// no `auth_user` call is simply unauthenticated, and nothing points at it. This
+/// was not hypothetical — 49 of 86 routes were reachable anonymously, including
+/// `GET /api/channels` (which returns upstream credentials), `PUT /api/channels/:id`
+/// (which repoints a channel), `POST /api/keys`, and `GET /api/settings` (which
+/// returns `local_api_token`).
+///
+/// The classification is deny-by-default: anything not explicitly public needs a
+/// session, so forgetting to classify a new route fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Reachable without a credential.
+    Public,
+    /// Any signed-in user.
+    User,
+    /// Admin or root.
+    Admin,
+    /// Root only, matching the reference's `RootAuth` groups.
+    Root,
+}
+
+/// Public endpoints. Kept as an explicit allow-list so a new route is closed by
+/// default rather than open.
+const PUBLIC_ROUTES: &[&str] = &[
+    "/api/auth/register",
+    "/api/auth/login",
+    // The landing page shows the catalogue before sign-in.
+    "/api/plans",
+    // Readiness probe: reports only liveness, never configuration.
+    "/api/status",
+];
+
+/// Prefixes that only the instance owner may reach.
+///
+/// Matches the reference's `RootAuth` groups (`option`, `task plugin`,
+/// `system-task`, `system-info`, `performance`, `ratio_sync`,
+/// `custom-oauth-provider`) plus the settings and backup endpoints here, which
+/// reveal or rewrite instance-wide configuration.
+const ROOT_PREFIXES: &[&str] = &[
+    "/api/options",
+    "/api/settings",
+    "/api/system/info",
+    "/api/backup",
+    "/api/plugin",
+    "/api/ratio_sync",
+    "/api/performance",
+    "/api/system-task",
+    "/api/custom-oauth-provider",
+];
+
+/// Prefixes that need an admin (or root).
+///
+/// Everything that manages shared infrastructure or other accounts: channels,
+/// the model registry, vendors, routing, redemption, and the admin groups.
+const ADMIN_PREFIXES: &[&str] = &[
+    "/api/channels",
+    "/api/models-metadata",
+    "/api/vendors",
+    "/api/model-maps",
+    "/api/rules",
+    "/api/admin",
+    "/api/subscription/admin",
+    "/api/redemption/admin",
+    "/api/authz",
+];
+
+fn required_access(path: &str) -> Access {
+    let path = path.trim_end_matches('/');
+    if PUBLIC_ROUTES.contains(&path) {
+        return Access::Public;
+    }
+    // Prefix checks must not let `/api/optionsfoo` match `/api/options`, so a
+    // match requires an exact prefix or a `/` boundary.
+    let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
+    if ROOT_PREFIXES.iter().any(|p| under(p)) {
+        return Access::Root;
+    }
+    if ADMIN_PREFIXES.iter().any(|p| under(p)) {
+        return Access::Admin;
+    }
+    Access::User
+}
+
+/// Gate every `/api` request by its required access level.
+async fn access_guard(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let required = required_access(&path);
+    let outcome = match required {
+        Access::Public => Ok(()),
+        Access::User => auth_user(&state, &headers).map(|_| ()),
+        Access::Admin => admin_user(&state, &headers).map(|_| ()),
+        Access::Root => root_user(&state, &headers).map(|_| ()),
+    };
+    match outcome {
+        Ok(()) => next.run(request).await,
+        // `auth_user` already produced the right response shape and status.
+        Err(response) => response,
     }
 }
 fn db_error<T: Serialize>(error: rusqlite::Error) -> Response {
@@ -2083,17 +2211,46 @@ async fn log_stats(
 
 // ── API Keys ───────────────────────────────────────────────────────────────
 
-async fn list_keys(State(s): State<Arc<AppState>>) -> Json<ApiResponse<Vec<ApiKey>>> {
+/// A user sees only their own keys; an admin sees every key.
+///
+/// Returning the whole table to any signed-in caller would expose other users'
+/// credentials and let them infer each other's usage.
+async fn list_keys(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Json<ApiResponse<Vec<ApiKey>>> {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return Json(ApiResponse::err(error_message(response))),
+    };
     Json(match s.db.list_api_keys() {
-        Ok(k) => ApiResponse::ok(k),
+        Ok(keys) => {
+            if user.role.is_admin() {
+                ApiResponse::ok(keys)
+            } else {
+                ApiResponse::ok(
+                    keys.into_iter()
+                        .filter(|k| k.user_id == user.id)
+                        .collect(),
+                )
+            }
+        }
         Err(e) => ApiResponse::err(e.to_string()),
     })
 }
 
 async fn create_key(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(k): Json<ApiKey>,
 ) -> Json<ApiResponse<ApiKey>> {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return Json(ApiResponse::err(error_message(response))),
+    };
+    if k.key.trim().is_empty() {
+        return Json(ApiResponse::err("key value must not be empty"));
+    }
     let now = chrono::Utc::now();
     let k = ApiKey {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2109,7 +2266,14 @@ async fn create_key(
         ip_allowlist: k.ip_allowlist,
         group_name: k.group_name,
         cross_group_retry: k.cross_group_retry,
-        user_id: k.user_id,
+        // Ownership is taken from the credential, never from the body: trusting a
+        // caller-supplied `user_id` would let one user create keys billed to
+        // another's wallet. An admin may still target someone deliberately.
+        user_id: if user.role.is_admin() && !k.user_id.trim().is_empty() {
+            k.user_id
+        } else {
+            user.id
+        },
     };
     Json(match s.db.upsert_api_key(&k) {
         Ok(()) => ApiResponse::ok(k),
@@ -2120,18 +2284,61 @@ async fn create_key(
 async fn delete_key(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Json<ApiResponse<&'static str>> {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return Json(ApiResponse::err(error_message(response))),
+    };
+    match s.db.get_api_key(&id) {
+        Ok(Some(key)) if key.user_id != user.id && !user.role.is_admin() => {
+            return Json(ApiResponse::err("not your key"));
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return Json(ApiResponse::err("key not found")),
+        Err(e) => return Json(ApiResponse::err(e.to_string())),
+    }
     Json(match s.db.delete_api_key(&id) {
         Ok(()) => ApiResponse::ok("deleted"),
         Err(e) => ApiResponse::err(e.to_string()),
     })
 }
 
-async fn keys_usage(State(s): State<Arc<AppState>>) -> Json<ApiResponse<Vec<ApiKeyUsage>>> {
-    Json(match s.db.api_key_usage() {
-        Ok(u) => ApiResponse::ok(u),
-        Err(e) => ApiResponse::err(e.to_string()),
-    })
+async fn keys_usage(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Json<ApiResponse<Vec<ApiKeyUsage>>> {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return Json(ApiResponse::err(error_message(response))),
+    };
+    match s.db.api_key_usage() {
+        Ok(usage) => {
+            if user.role.is_admin() {
+                return Json(ApiResponse::ok(usage));
+            }
+            // `api_key_usage` joins keys; restrict it to keys this user owns.
+            let owned: std::collections::HashSet<String> = s
+                .db
+                .list_api_keys()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|k| k.user_id == user.id)
+                .map(|k| k.id)
+                .collect();
+            Json(ApiResponse::ok(
+                usage.into_iter().filter(|u| owned.contains(&u.api_key_id)).collect(),
+            ))
+        }
+        Err(e) => Json(ApiResponse::err(e.to_string())),
+    }
+}
+
+/// The message from a guard's error response, for handlers that were already
+/// gated by the middleware and only need a defensible body.
+fn error_message(response: Response) -> String {
+    let _ = response;
+    "authentication required".to_string()
 }
 
 #[derive(Deserialize)]
@@ -2684,5 +2891,134 @@ async fn create_backup(State(s): State<Arc<AppState>>) -> Response {
                 .into_response()
         }
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+
+    /// Regression guard for a real defect: 49 of 86 console routes were reachable
+    /// anonymously, including `GET /api/channels` (which returns upstream
+    /// credentials), `PUT /api/channels/:id` (which repoints a channel),
+    /// `POST /api/keys`, and `GET /api/settings` (which returns
+    /// `local_api_token`). The classification below is what the middleware acts
+    /// on, so a misclassification is the whole vulnerability.
+    #[test]
+    fn credential_bearing_routes_are_not_public() {
+        for path in [
+            "/api/channels",
+            "/api/channels/abc",
+            "/api/channels/abc/keys",
+            "/api/keys",
+            "/api/keys/abc",
+            "/api/keys/usage",
+            "/api/settings",
+            "/api/options",
+            "/api/system/info",
+            "/api/backup/create",
+            "/api/logs",
+            "/api/log/stats",
+            "/api/dashboard",
+            "/api/models-metadata",
+            "/api/vendors",
+            "/api/admin/users",
+        ] {
+            assert_ne!(
+                required_access(path),
+                Access::Public,
+                "{path} must not be reachable without a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_surfaces_require_an_admin() {
+        for path in [
+            "/api/channels",
+            "/api/channels/abc",
+            "/api/models-metadata",
+            "/api/models-metadata/abc",
+            "/api/vendors",
+            "/api/vendors/abc",
+            "/api/model-maps",
+            "/api/rules",
+            "/api/admin/users",
+            "/api/subscription/admin/bind",
+            "/api/authz/catalog",
+        ] {
+            assert_eq!(required_access(path), Access::Admin, "{path}");
+        }
+    }
+
+    #[test]
+    fn instance_wide_configuration_is_root_only() {
+        // Writing options or reading settings exposes the instance's own token and
+        // topology, so it is the owner's, not any admin's.
+        for path in [
+            "/api/options",
+            "/api/settings",
+            "/api/system/info",
+            "/api/backup/create",
+            "/api/plugin/task",
+            "/api/system-task",
+        ] {
+            assert_eq!(required_access(path), Access::Root, "{path}");
+        }
+    }
+
+    #[test]
+    fn only_the_intended_routes_are_public() {
+        // An allow-list, not a deny-list: a new route is closed unless listed.
+        for path in ["/api/auth/login", "/api/auth/register", "/api/plans", "/api/status"] {
+            assert_eq!(required_access(path), Access::Public, "{path}");
+        }
+        // A slightly different path must not inherit public status.
+        assert_ne!(required_access("/api/plans/admin"), Access::Public);
+        assert_ne!(required_access("/api/status/test"), Access::Public);
+    }
+
+    #[test]
+    fn an_unclassified_route_defaults_to_requiring_a_session() {
+        // Fail-closed: forgetting to classify a new route must not open it.
+        assert_eq!(required_access("/api/something/new"), Access::User);
+        assert_eq!(required_access("/api/wallet"), Access::User);
+        assert_eq!(required_access("/api/auth/me"), Access::User);
+        assert_eq!(required_access("/api/user/sessions"), Access::User);
+    }
+
+    #[test]
+    fn a_prefix_match_requires_a_path_boundary() {
+        // `/api/optionsfoo` must not inherit the `/api/options` classification,
+        // or a lookalike route would silently become root-only (harmless) or,
+        // worse, a root route could be shadowed into the default.
+        assert_eq!(required_access("/api/options"), Access::Root);
+        assert_eq!(required_access("/api/options/"), Access::Root);
+        assert_eq!(required_access("/api/options/request_policy"), Access::Root);
+        assert_eq!(required_access("/api/optionsfoo"), Access::User);
+        assert_eq!(required_access("/api/settings-private"), Access::User);
+        assert_eq!(required_access("/api/channelsx"), Access::User);
+    }
+
+    #[test]
+    fn root_is_treated_as_a_superset_of_admin() {
+        use oxygenrouter_core::UserRole;
+        assert!(UserRole::Root.is_root());
+        assert!(UserRole::Root.is_admin());
+        assert!(!UserRole::Admin.is_root());
+        assert!(UserRole::Admin.is_admin());
+        assert!(!UserRole::User.is_admin());
+    }
+
+    #[test]
+    fn the_root_role_round_trips_through_storage_text() {
+        use oxygenrouter_core::UserRole;
+        assert_eq!(UserRole::from_db("root"), UserRole::Root);
+        assert_eq!(UserRole::from_db("admin"), UserRole::Admin);
+        assert_eq!(UserRole::from_db("user"), UserRole::User);
+        // An unrecognised value must not escalate.
+        assert_eq!(UserRole::from_db("superuser"), UserRole::User);
+        assert_eq!(UserRole::from_db(""), UserRole::User);
     }
 }
