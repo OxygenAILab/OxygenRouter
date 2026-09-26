@@ -13,6 +13,7 @@ import {
   WifiOff,
 } from "lucide-react";
 import { api, Channel, RequestLog, ApiKey } from "../lib/api";
+import { useAuth } from "../lib/auth";
 import { PageHeader } from "../App";
 import { useI18n } from "../lib/i18nContext";
 import Select from "../components/ui/Select";
@@ -44,6 +45,10 @@ function toLocalInput(date: Date) {
 
 export default function LogsPage() {
   const { t } = useI18n();
+  const { user } = useAuth();
+  // An admin sees the instance's logs; everyone else sees only their own, which
+  // the server enforces by role regardless of what is asked for.
+  const isAdmin = user?.role === "admin" || user?.role === "root";
   const [searchParams] = useSearchParams();
   const plan = searchParams.get("plan");
 
@@ -78,19 +83,29 @@ export default function LogsPage() {
   }, [range, start, end]);
 
   const { data, isLoading, refetch } = useQuery({
-    queryKey: ["logs", page, pageSize, search, status, model, channelId, apiKeyId, rangeBounds.start, rangeBounds.end],
+    queryKey: ["logs", isAdmin, page, pageSize, search, status, model, channelId, apiKeyId, rangeBounds.start, rangeBounds.end],
     queryFn: () =>
-      api.logs.query({
-        page,
-        pageSize,
-        search: search || undefined,
-        status,
-        model,
-        channelId,
-        apiKeyId,
-        start: rangeBounds.start,
-        end: rangeBounds.end,
-      }),
+      isAdmin
+        ? api.logs.query({
+            page,
+            pageSize,
+            search: search || undefined,
+            status,
+            model,
+            channelId,
+            apiKeyId,
+            start: rangeBounds.start,
+            end: rangeBounds.end,
+          })
+        : // Non-admins see only their own rows; the instance-wide route is
+          // admin-gated on the server, so asking for it would just 403.
+          api.logs.mine({
+            page,
+            pageSize,
+            search: search || undefined,
+            status,
+            model,
+          }),
     refetchInterval: live ? false : 10_000,
   });
 

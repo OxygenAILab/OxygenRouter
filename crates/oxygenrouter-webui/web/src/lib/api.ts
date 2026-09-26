@@ -50,7 +50,7 @@ export interface LogStats {
 let sessionToken: string | null = null;
 export function setSessionToken(token: string | null) { sessionToken = token; }
 
-export interface User { id: string; username: string; email: string; role: "admin" | "user"; status: string; balance_micros: number; created_at: string; updated_at: string; last_login_at: string | null; }
+export interface User { id: string; username: string; email: string; role: "root" | "admin" | "user"; status: string; balance_micros: number; created_at: string; updated_at: string; last_login_at: string | null; }
 export interface LedgerEntry { id: string; user_id: string; amount_micros: number; balance_after_micros: number; kind: string; description: string; reference_id: string | null; created_at: string; }
 export interface SubscriptionPlan { id: string; name: string; description: string; price_micros: number; quota_micros: number; duration_days: number; enabled: boolean; created_at: string; updated_at: string; }
 export interface Subscription { id: string; user_id: string; plan_id: string; status: string; started_at: string; expires_at: string; created_at: string; }
@@ -459,6 +459,17 @@ export const api = {
   },
   logs: {
     list: (limit = 100) => apiFetch<RequestLog[]>(`/logs?limit=${limit}`),
+    // The caller's own logs. A non-admin cannot reach the instance-wide route, so
+    // the console uses this for them; the scope is in the path, not a query flag.
+    mine: (params: { page?: number; pageSize?: number; search?: string; status?: string; model?: string } = {}) => {
+      const qs = new URLSearchParams();
+      if (params.page) qs.set("page", String(params.page));
+      if (params.pageSize) qs.set("page_size", String(params.pageSize));
+      if (params.search) qs.set("search", params.search);
+      if (params.status) qs.set("status", params.status);
+      if (params.model) qs.set("model", params.model);
+      return apiFetch<Paginated<RequestLog>>(`/logs/self?${qs.toString()}`);
+    },
     query: (params: {
       page?: number;
       pageSize?: number;

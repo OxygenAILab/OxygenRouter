@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (security — log and analytics scoping) — **high**
+- **Any signed-in user could read the instance's entire request-log table**, plus
+  `/api/log/stats`, `/api/dashboard` and `/api/analytics/flow`. Verified live
+  before the fix: an ordinary user's `GET /api/logs` returned other users' rows.
+  The reference gates its log listing on `AdminAuth` and serves a separate
+  `/log/self` for a user's own rows (`router/api-router.go:314,319`).
+- `/api/logs`, `/api/log`, `/api/logs/stream`, `/api/dashboard` and
+  `/api/analytics` joined the admin class, and the existing
+  `GET /api/logs/:id/secret`-style exception mechanism gained `/api/logs/self`, so
+  a user can still see their own activity.
+- Scoping is resolved in SQL (`query_request_logs_scoped`), not by filtering the
+  page afterwards: a post-filter would report a `total` and page boundaries the
+  caller cannot actually see. It also means `?api_key_id=someone-else` cannot
+  widen the scope, because the owner filter is applied independently of the
+  caller's query parameters. The console uses `/api/logs/self` for non-admins.
+
+### Verified (security — log and analytics scoping)
+- Live with two ordinary users each making a request: both now get `403` on
+  `/api/logs`, `/api/log/stats`, `/api/dashboard` and `/api/analytics/flow`;
+  each sees exactly **one** row through `/api/logs/self` (their own, not the
+  other's); and the admin still sees both rows through `/api/logs`.
+- Two unit tests pin the class assignment, including that `/api/logs/self` stays
+  user-reachable while `/api/logs` and `/api/logs/anything-else` stay admin-only.
+- `cargo test --workspace` → **434 passed / 0 failed**, zero warnings. `tsc
+  --noEmit` is clean, which is what caught the frontend's `User` type still
+  claiming `role` was only `"admin" | "user"` after the root role landed.
+
 ### Fixed (security — API keys and secret options) — **high**
 - **`GET /api/keys` and `GET /api/keys/query` returned every key's real value.**
   The reference masks in *both* (`controller/token.go:140,157`, via

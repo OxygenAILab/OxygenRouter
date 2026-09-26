@@ -64,6 +64,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/rules", post(create_rule))
         .route("/api/rules/:id", delete(delete_rule))
         .route("/api/logs", get(list_logs).delete(clear_logs))
+        // The caller's own logs, for any signed-in user; matches the reference's
+        // `/log/self` (`router/api-router.go:319`).
+        .route("/api/logs/self", get(list_my_logs))
         .route("/api/logs/stream", get(stream_logs))
         .route("/api/status", get(get_status))
         .route("/api/dashboard", get(get_dashboard))
@@ -311,12 +314,27 @@ const ADMIN_PREFIXES: &[&str] = &[
     "/api/subscription/admin",
     "/api/redemption/admin",
     "/api/authz",
+    // Instance-wide observability. The reference gates its log listing on
+    // `AdminAuth` (`router/api-router.go:314`) and serves a separate `/log/self`
+    // for a user's own rows; verified before this change that an ordinary user
+    // could read every user's logs and the aggregate dashboards.
+    "/api/logs",
+    "/api/log",
+    "/api/dashboard",
+    "/api/analytics",
 ];
+
+/// Routes under an admin prefix that any signed-in user may still reach, because
+/// they are scoped to the caller.
+const USER_SCOPED_EXCEPTIONS: &[&str] = &["/api/logs/self"];
 
 fn required_access(path: &str) -> Access {
     let path = path.trim_end_matches('/');
     if PUBLIC_ROUTES.contains(&path) {
         return Access::Public;
+    }
+    if USER_SCOPED_EXCEPTIONS.contains(&path) {
+        return Access::User;
     }
     // Prefix checks must not let `/api/optionsfoo` match `/api/options`, so a
     // match requires an exact prefix or a `/` boundary.
@@ -2627,11 +2645,26 @@ struct LogsQuery {
 async fn list_logs(
     State(s): State<Arc<AppState>>,
     Query(q): Query<LogsQuery>,
+    headers: HeaderMap,
 ) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(_) => return Json(ApiResponse::<Vec<RequestLog>>::err("authentication required")).into_response(),
+    };
+    // An admin reads the instance's logs; anyone else reads only their own, which
+    // the reference expresses as a separate `/log/self` route
+    // (`router/api-router.go:314,319`). Both shapes are served here so the console
+    // does not need two calls, but the scope is never the caller's choice: it
+    // follows the role, so `?api_key_id=someone-else` cannot widen it.
+    let scope = if user.role.is_admin() {
+        None
+    } else {
+        Some(user.id.clone())
+    };
     if q.paginated.unwrap_or(false) {
         let page = q.page.unwrap_or(1).max(1);
         let page_size = q.page_size.unwrap_or(20).clamp(1, 200);
-        return match s.db.query_request_logs(
+        return match s.db.query_request_logs_scoped(
             page,
             page_size,
             q.start.as_deref(),
@@ -2641,18 +2674,71 @@ async fn list_logs(
             q.api_key_id.as_deref(),
             q.status.as_deref(),
             q.search.as_deref(),
+            scope.as_deref(),
         ) {
             Ok((items, total)) => Json(PaginatedResponse::new(items, total, page, page_size)).into_response(),
             Err(e) => db_error::<Vec<RequestLog>>(e),
         };
     }
     let limit = q.limit.unwrap_or(100).min(1000);
-    Json(match s.db.list_request_logs(limit) {
-        Ok(logs) => ApiResponse::ok(logs),
+    // The unpaginated shape goes through the same scoped query so the two cannot
+    // disagree about who may see what.
+    Json(match s.db.query_request_logs_scoped(
+        1,
+        limit,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        scope.as_deref(),
+    ) {
+        Ok((logs, _)) => ApiResponse::ok(logs),
         Err(e) => ApiResponse::err(e.to_string()),
     })
     .into_response()
 }
+
+/// `GET /api/logs/self` — the caller's own logs, for any signed-in user.
+///
+/// Matches the reference's `/log/self` (`router/api-router.go:319`). It is an
+/// explicit route rather than a query flag, so the scope is visible in the URL and
+/// in access logs.
+async fn list_my_logs(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<LogsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(_) => {
+            return Json(ApiResponse::<Vec<RequestLog>>::err("authentication required"))
+                .into_response()
+        }
+    };
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(20).clamp(1, 200);
+    match s.db.query_request_logs_scoped(
+        page,
+        page_size,
+        q.start.as_deref(),
+        q.end.as_deref(),
+        q.model.as_deref(),
+        q.channel_id.as_deref(),
+        q.api_key_id.as_deref(),
+        q.status.as_deref(),
+        q.search.as_deref(),
+        Some(&user.id),
+    ) {
+        Ok((items, total)) => {
+            Json(PaginatedResponse::new(items, total, page, page_size)).into_response()
+        }
+        Err(e) => db_error::<Vec<RequestLog>>(e),
+    }
+}
+
 
 async fn clear_logs(State(s): State<Arc<AppState>>) -> Json<ApiResponse<usize>> {
     Json(match s.db.clear_request_logs() {
@@ -3382,5 +3468,39 @@ mod key_masking_tests {
         // A genuine value is not mistaken for one.
         assert!(!("sk-a-brand-new-token").ends_with('\u{2026}'));
         assert!(!("".to_string()).ends_with('\u{2026}'));
+    }
+}
+
+
+#[cfg(test)]
+mod log_scoping_tests {
+    use super::*;
+
+    /// Regression: an ordinary user could read the instance's whole log table and
+    /// the aggregate dashboards. The reference gates its log listing on AdminAuth
+    /// and serves a separate `/log/self` (`router/api-router.go:314,319`).
+    #[test]
+    fn instance_wide_observability_requires_an_admin() {
+        for path in [
+            "/api/logs",
+            "/api/logs/stream",
+            "/api/log",
+            "/api/log/stats",
+            "/api/dashboard",
+            "/api/analytics/flow",
+        ] {
+            assert_eq!(required_access(path), Access::Admin, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_self_scoped_route_stays_open_to_any_user() {
+        // A user must still be able to see their own activity, or the page is
+        // useless to them; the scope comes from the path, not a query flag.
+        assert_eq!(required_access("/api/logs/self"), Access::User);
+        assert_eq!(required_access("/api/logs/self/"), Access::User);
+        // It must not leak the instance-wide route open along with it.
+        assert_eq!(required_access("/api/logs"), Access::Admin);
+        assert_eq!(required_access("/api/logs/anything-else"), Access::Admin);
     }
 }

@@ -930,6 +930,31 @@ impl Database {
         status: Option<&str>,
         search: Option<&str>,
     ) -> SqliteResult<(Vec<RequestLog>, i64)> {
+        self.query_request_logs_scoped(
+            page, page_size, start, end, model, channel_id, api_key_id, status, search, None,
+        )
+    }
+
+    /// As [`Self::query_request_logs`], but optionally limited to one user's logs.
+    ///
+    /// `owner_user_id` is resolved through `api_keys`, because a log row records
+    /// the key that made the request, not the account behind it. Filtering in SQL
+    /// rather than after the fact keeps `total` and the page boundaries honest —
+    /// a post-filter would report counts the caller cannot actually see.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_request_logs_scoped(
+        &self,
+        page: i64,
+        page_size: i64,
+        start: Option<&str>,
+        end: Option<&str>,
+        model: Option<&str>,
+        channel_id: Option<&str>,
+        api_key_id: Option<&str>,
+        status: Option<&str>,
+        search: Option<&str>,
+        owner_user_id: Option<&str>,
+    ) -> SqliteResult<(Vec<RequestLog>, i64)> {
         let conn = self.conn.lock();
         let where_clause = "WHERE (?1 IS NULL OR created_at >= ?1) \
              AND (?2 IS NULL OR created_at < ?2) \
@@ -940,19 +965,20 @@ impl Database {
                    WHEN 'success' THEN status_code >= 200 AND status_code < 300 \
                    WHEN 'error' THEN status_code < 200 OR status_code >= 400 \
                    ELSE CAST(status_code AS TEXT) LIKE ?6 || '%' END) \
-             AND (?7 IS NULL OR path LIKE '%' || ?7 || '%' OR COALESCE(model,'') LIKE '%' || ?7 || '%' OR COALESCE(error,'') LIKE '%' || ?7 || '%')";
+             AND (?7 IS NULL OR path LIKE '%' || ?7 || '%' OR COALESCE(model,'') LIKE '%' || ?7 || '%' OR COALESCE(error,'') LIKE '%' || ?7 || '%') \
+             AND (?8 IS NULL OR api_key_id IN (SELECT id FROM api_keys WHERE user_id = ?8))";
         let total: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM request_logs {where_clause}"),
-            params![start, end, model, channel_id, api_key_id, status, search],
+            params![start, end, model, channel_id, api_key_id, status, search, owner_user_id],
             |r| r.get(0),
         )?;
         let offset = (page.max(1) - 1) * page_size.max(1);
         let mut stmt = conn.prepare(&format!(
             "SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at \
-             FROM request_logs {where_clause} ORDER BY created_at DESC LIMIT ?8 OFFSET ?9"
+             FROM request_logs {where_clause} ORDER BY created_at DESC LIMIT ?9 OFFSET ?10"
         ))?;
         let rows = stmt.query_map(
-            params![start, end, model, channel_id, api_key_id, status, search, page_size.max(1), offset],
+            params![start, end, model, channel_id, api_key_id, status, search, owner_user_id, page_size.max(1), offset],
             |r| {
                 Ok(RequestLog {
                     id: r.get(0)?,

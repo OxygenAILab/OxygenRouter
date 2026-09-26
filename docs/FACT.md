@@ -337,6 +337,32 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription quota funds requests (2026-09-26)
 
+### Logs and analytics are scoped by role (fixed 2026-09-27) — **was high**
+
+Any signed-in user could read the instance's **entire request-log table**, plus
+`/api/log/stats`, `/api/dashboard` and `/api/analytics/flow`. Verified live before
+the fix: an ordinary user's `GET /api/logs` returned other users' rows, including
+their paths, models and token counts.
+
+The reference splits this: the log listing is `AdminAuth`-gated and a user's own
+rows come from a separate `/log/self` route (`router/api-router.go:314,319`). Ours
+now matches — `/api/logs`, `/api/log`, `/api/logs/stream`, `/api/dashboard` and
+`/api/analytics` are admin; `/api/logs/self` is user-scoped.
+
+Two deliberate choices:
+
+- **The scope is resolved in SQL** (`query_request_logs_scoped`), not by filtering
+  a page after reading it. A post-filter would report a `total` and page
+  boundaries the caller cannot actually see, which is a subtle way to leak the
+  existence and volume of other users' activity.
+- **The scope follows the role, never a query parameter.** The owner filter is
+  applied independently of the caller's filters, so `?api_key_id=someone-else`
+  cannot widen it.
+
+Verified live: two ordinary users each made one request; both now get `403` on the
+instance-wide routes, each sees exactly **one** row via `/api/logs/self` (their
+own, not the other's), and the admin still sees both.
+
 ### API keys are masked, not listed (fixed 2026-09-27) — **was high**
 
 `GET /api/keys` and `GET /api/keys/query` returned every key's real value. The
