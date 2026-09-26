@@ -337,6 +337,37 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription quota funds requests (2026-09-26)
 
+### Channel credentials are not disclosed (fixed 2026-09-26) — **was high**
+
+Three related leaks, all verified live before the fix:
+
+1. **`GET /api/channels` returned every channel's raw upstream API key**, as did
+   `GET /api/channels/:id` and the response to `POST /api/channels/:id/keys`. The
+   reference omits the key from its list entirely (`controller/channel.go:251`,
+   `.Omit("key")`); its dedicated credential route is gated on root plus a
+   security proof (`controller.GetChannelKey`), which we do not have — so the safe
+   position is to disclose it nowhere.
+2. **Saving a channel destroyed its credential.** The console reads the list,
+   edits a field, and PUTs the whole object back. With a masked or blank
+   `api_key` that overwrote the real one: a round-trip PUT left the channel with
+   `api_key = ""`, silently disabling it.
+3. **`key_preview` disclosed short keys in full.** It returned the entire value
+   whenever the key was ten characters or fewer — a full disclosure for exactly
+   the short, low-entropy credentials most worth protecting.
+
+Read and update responses now carry a placeholder (`••••••••`), which lets a
+client distinguish "configured" from "not set" without reading the value.
+`update_channel` treats the placeholder **or** a blank as "leave unchanged" — the
+credential is therefore not clearable through this route, which is the safe
+direction: keeping a working key beats silently dropping one. `created_at` is
+preserved from the stored row rather than trusted from the body.
+
+Verified live end to end with a two-key channel (one long, one short): neither key
+appears in the list, the single read, or the key-status previews; a round-trip
+save with the masked value keeps both keys *and* applies the real edit; a
+blank-key save also preserves them; an explicit new key rotates successfully; and
+the upstream test still passes with a usable credential.
+
 ### Console authentication (fixed 2026-09-26) — **was critical**
 
 **49 of 86 console routes were reachable without a credential.** Authentication

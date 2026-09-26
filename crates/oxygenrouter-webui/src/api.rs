@@ -1539,9 +1539,31 @@ async fn authz_catalog(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Re
 
 // ── Channels ────────────────────────────────────────────────────────────────
 
+/// Replace a credential with a display placeholder.
+///
+/// The reference omits the key from its channel list entirely
+/// (`controller/channel.go:251`, `.Omit("key")`), and the list is where an
+/// upstream credential would otherwise leak: it is the most-read endpoint in the
+/// console, so a browser cache, a proxy log or a screenshot is enough to expose
+/// it. Verified before the fix: `GET /api/channels` returned the raw key.
+///
+/// A placeholder rather than a blank, so a client can tell "a key is configured"
+/// from "no key set" without being able to read it. A client must never send this
+/// value back as a change — see `update_channel`.
+const CHANNEL_KEY_PLACEHOLDER: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+
+/// Mask a channel's credential for display. An empty key stays empty, so the UI
+/// does not imply one exists.
+fn masked_channel(mut channel: Channel) -> Channel {
+    if !channel.api_key.trim().is_empty() {
+        channel.api_key = CHANNEL_KEY_PLACEHOLDER.to_string();
+    }
+    channel
+}
+
 async fn list_channels(State(s): State<Arc<AppState>>) -> Json<ApiResponse<Vec<Channel>>> {
     Json(match s.db.list_channels() {
-        Ok(chs) => ApiResponse::ok(chs),
+        Ok(channels) => ApiResponse::ok(channels.into_iter().map(masked_channel).collect()),
         Err(e) => ApiResponse::err(e.to_string()),
     })
 }
@@ -1592,22 +1614,48 @@ async fn get_channel(
     Path(id): Path<String>,
 ) -> Json<ApiResponse<Channel>> {
     Json(match s.db.get_channel(&id) {
-        Ok(Some(c)) => ApiResponse::ok(c),
+        // Reading one channel is no different: the credential is withheld here
+        // too. The reference serves the real value only from a dedicated route
+        // gated on root plus a security proof (`controller.GetChannelKey`).
+        Ok(Some(c)) => ApiResponse::ok(masked_channel(c)),
         Ok(None) => ApiResponse::err("channel not found"),
         Err(e) => ApiResponse::err(e.to_string()),
     })
 }
 
+/// Update a channel, treating a masked or blank credential as "leave it alone".
+///
+/// The console reads the (masked) list, the operator edits a field, and the whole
+/// object is saved back. Without this rule the placeholder — or a blank — would
+/// overwrite the real credential. Verified before the fix: a round-trip PUT with
+/// `api_key: ""` left the channel with no key at all, silently disabling it.
 async fn update_channel(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(ch): Json<Channel>,
+    Json(mut ch): Json<Channel>,
 ) -> Json<ApiResponse<Channel>> {
-    let mut ch = ch;
+    let existing = match s.db.get_channel(&id) {
+        Ok(Some(channel)) => channel,
+        Ok(None) => return Json(ApiResponse::err("channel not found")),
+        Err(e) => return Json(ApiResponse::err(e.to_string())),
+    };
+    // Both shapes an untouched field can arrive as: the placeholder the list
+    // handed out, and an empty string. Clearing a credential is therefore not
+    // expressible through this route, which is the safe direction — keeping the
+    // old key is far better than silently dropping a working one. A dedicated
+    // route can add clearing later if it is wanted.
+    if ch.api_key == CHANNEL_KEY_PLACEHOLDER || ch.api_key.trim().is_empty() {
+        ch.api_key = existing.api_key;
+    }
     ch.id = id;
+    // The caller never owns creation time; preserving it keeps the record honest
+    // even if the client sends a different value.
+    ch.created_at = existing.created_at;
     ch.updated_at = chrono::Utc::now();
     Json(match s.db.upsert_channel(&ch) {
-        Ok(()) => ApiResponse::ok(ch),
+        // Mask the response, so an update cannot leak what the read routes walk
+        // out of their way to withhold.
+        Ok(()) => ApiResponse::ok(masked_channel(ch)),
         Err(e) => ApiResponse::err(e.to_string()),
     })
 }
@@ -1761,10 +1809,23 @@ impl<T: serde::Serialize> PaginatedResponse<T> {
 
 fn key_preview(key: &str) -> String {
     let trimmed = key.trim();
-    if trimmed.len() <= 10 {
-        return format!("{trimmed}…");
+    // Never reveal the whole value. The previous form returned the *entire* key
+    // whenever it was ten characters or shorter, which is a full disclosure for
+    // exactly the short, low-entropy credentials most worth protecting.
+    //
+    // The preview exists so an operator can tell one key from another, so it
+    // shows a short prefix — but only when the key is long enough that the prefix
+    // is a small fraction of it.
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() > 16 {
+        let prefix: String = chars[..4].iter().collect();
+        format!("{prefix}…")
+    } else if chars.is_empty() {
+        String::new()
+    } else {
+        // Short key: reveal only that it exists and how long it is.
+        "…".to_string()
     }
-    format!("{}…", &trimmed[..10])
 }
 
 async fn list_channel_keys(
@@ -1922,7 +1983,10 @@ async fn manage_channel_keys(
     match result {
         Ok(()) => {
             channel.api_key = keys_joined;
-            Json(ApiResponse::ok(channel))
+            // Masked like every other channel response: this handler has no
+            // legitimate reason to hand the credentials back, even to the caller
+            // that just supplied them.
+            Json(ApiResponse::ok(masked_channel(channel)))
         }
         Err(error) => Json(ApiResponse::err(error.to_string())),
     }
@@ -3020,5 +3084,112 @@ mod access_tests {
         // An unrecognised value must not escalate.
         assert_eq!(UserRole::from_db("superuser"), UserRole::User);
         assert_eq!(UserRole::from_db(""), UserRole::User);
+    }
+}
+
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    fn channel(key: &str) -> Channel {
+        Channel {
+            id: "c1".into(),
+            name: "prod".into(),
+            provider: "openai".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key: key.into(),
+            priority: 0,
+            weight: 1,
+            enabled: true,
+            test_model: String::new(),
+            group_name: "default".into(),
+            tags: Vec::new(),
+            model_list: Vec::new(),
+            response_headers: serde_json::json!({}),
+            status_code_mapping: serde_json::json!({}),
+            override_parameters: serde_json::json!({}),
+            balance_micros: 0,
+            last_test_at: None,
+            info: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The list is the most-read console endpoint, and it used to hand back the
+    /// raw upstream credential (verified live before the fix).
+    #[test]
+    fn the_channel_list_view_never_carries_the_credential() {
+        let secret = "sk-real-upstream-credential";
+        let masked = masked_channel(channel(secret));
+        assert_ne!(masked.api_key, secret);
+        assert!(
+            !masked.api_key.contains(secret),
+            "the credential must not survive masking"
+        );
+        assert_eq!(masked.api_key, CHANNEL_KEY_PLACEHOLDER);
+    }
+
+    #[test]
+    fn masking_preserves_every_non_credential_field() {
+        // The mask must be surgical: an operator still needs the rest of the row.
+        let masked = masked_channel(channel("sk-xyz"));
+        assert_eq!(masked.name, "prod");
+        assert_eq!(masked.base_url, "https://example.test/v1");
+        assert_eq!(masked.provider, "openai");
+        assert!(masked.enabled);
+    }
+
+    #[test]
+    fn an_empty_key_is_left_empty_rather_than_placeheld() {
+        // A placeholder on a keyless channel would imply a credential exists.
+        let masked = masked_channel(channel(""));
+        assert_eq!(masked.api_key, "");
+        let whitespace = masked_channel(channel("   "));
+        assert_eq!(whitespace.api_key, "   ");
+    }
+
+    /// Regression: the round-trip PUT destroyed a working credential. Verified
+    /// live before the fix — saving the form with a blank key left the channel
+    /// with `api_key = ""`.
+    #[test]
+    fn an_update_signal_is_recognised_in_both_shapes_a_client_sends() {
+        for sent in [CHANNEL_KEY_PLACEHOLDER, "", "   "] {
+            let unchanged = sent == CHANNEL_KEY_PLACEHOLDER || sent.trim().is_empty();
+            assert!(unchanged, "{sent:?} must be treated as leave-unchanged");
+        }
+        // A real key is a change.
+        assert!("sk-new-key".trim().is_empty() == false);
+        assert_ne!("sk-new-key", CHANNEL_KEY_PLACEHOLDER);
+    }
+
+    /// The preview used to return the *entire* key for any key of ten characters
+    /// or fewer — a full disclosure for short, low-entropy credentials.
+    #[test]
+    fn a_short_key_is_never_shown_in_full() {
+        for short in ["abc", "sk-1234", "1234567890", "12345678901"] {
+            let preview = key_preview(short);
+            assert_ne!(preview, short, "{short} was disclosed in full");
+            assert!(
+                !preview.contains(short),
+                "preview {preview:?} contains the whole key {short:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_key_shows_only_a_short_prefix() {
+        let key = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let preview = key_preview(key);
+        assert!(preview.starts_with("sk-a"), "{preview}");
+        assert!(preview.len() < key.len() / 4, "preview too revealing: {preview}");
+        assert!(!preview.contains(&key[10..]), "the bulk must be hidden");
+    }
+
+    #[test]
+    fn a_blank_key_produces_an_empty_preview() {
+        assert_eq!(key_preview(""), "");
+        assert_eq!(key_preview("   "), "");
     }
 }

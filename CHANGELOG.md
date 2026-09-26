@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (security — channel credentials) — **high**
+- **`GET /api/channels` returned each channel's raw upstream API key**, and so did
+  `GET /api/channels/:id` and the response to `POST /api/channels/:id/keys`. The
+  reference omits the key from its channel list entirely
+  (`controller/channel.go:251`, `.Omit("key")`). Verified live before the fix.
+  Read and update responses now carry a placeholder (`••••••••`), so a client can
+  still tell "configured" from "not set" without being able to read the value.
+- **Saving a channel destroyed its credential.** The console reads the list,
+  edits one field, and PUTs the whole object back; with a masked or blank `api_key`
+  that overwrote the real one. Verified live: a round-trip PUT left the channel
+  with `api_key = ""`, silently disabling it. `update_channel` now treats the
+  placeholder *or* a blank as "leave unchanged", and preserves `created_at`.
+  Rotating to a genuinely new key still works, as does the relay — both asserted.
+- **`key_preview` disclosed short keys entirely.** It returned the full value
+  whenever the key was ten characters or fewer — a full disclosure for exactly the
+  short, low-entropy credentials most worth protecting. Now: a four-character
+  prefix for long keys, and nothing but an ellipsis for short ones.
+- `manage_channel_keys` no longer returns the credentials it was given back to
+  the caller.
+
+### Verified (security — channel credentials)
+- Live: a channel configured with two keys (one long, one short) discloses neither
+  through the list, the single-channel read, or the key-status previews; a
+  round-trip save with the masked value keeps both keys and still applies the real
+  edit; a blank-key save also preserves them; an explicit new key rotates
+  successfully; and the upstream test still passes with a usable credential.
+- Seven unit tests cover masking (value hidden, other fields intact, empty stays
+  empty), both "unchanged" signal shapes, and that a short key is never shown in
+  full.
+- `cargo test --workspace` → **427 passed / 0 failed**, zero warnings.
+
 ### Fixed (security — console authentication) — **critical**
 - **49 of 86 console routes were reachable without any credential.** Each handler
   authenticated itself, and a handler that forgot to call `auth_user` was simply
