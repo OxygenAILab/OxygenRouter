@@ -26,6 +26,7 @@ use super::{
     AuthSession, Channel, ChannelInfo, ChannelPerf, DashboardBreakdown, DashboardSnapshot,
     LedgerEntry, ModelMap, ModelMetadata, ModelTimeBucket, PaymentOrder, RedemptionCode, RequestLog,
     RouteRule, RouteType, Subscription, SubscriptionPlan, SystemStatus, TimeBucket, User, UserRole,
+    Vendor,
 };
 
 fn json_string<T: serde::Serialize>(value: &T) -> String {
@@ -75,6 +76,28 @@ fn map_model_metadata(row: &rusqlite::Row<'_>) -> SqliteResult<ModelMetadata> { 
             .with_timezone(&Utc),
     })
 }
+fn map_vendor(row: &rusqlite::Row<'_>) -> SqliteResult<Vendor> {
+    Ok(Vendor {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        icon: row.get(3)?,
+        status: row.get(4)?,
+        // Filled in by the caller when it joins the model registry; the table
+        // itself does not store a count, matching the reference.
+        model_count: 0,
+        created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+            .unwrap()
+            .with_timezone(&Utc),
+        updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+            .unwrap()
+            .with_timezone(&Utc),
+    })
+}
+
+/// Columns every vendor query selects, in the order [`map_vendor`] reads them.
+const VENDOR_COLUMNS: &str = "id,name,description,icon,status,created_at,updated_at";
+
 fn json_object(value: &str) -> serde_json::Value {
     serde_json::from_str(value)
         .ok()
@@ -210,6 +233,16 @@ impl Database {
             CREATE TABLE IF NOT EXISTS migrations (
                 version TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS vendors (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                icon        TEXT NOT NULL DEFAULT '',
+                status      INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_channels_priority ON channels(priority DESC);
@@ -1002,6 +1035,102 @@ impl Database {
 
     pub fn delete_model_metadata(&self, id: &str) -> SqliteResult<()> {
         self.conn.lock().execute("DELETE FROM model_metadata WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    // ── Vendors ───────────────────────────────────────────────────────────────
+
+    /// Every vendor, each carrying its derived model count.
+    ///
+    /// The count is a `LEFT JOIN` against the model registry, not a stored
+    /// column, so it cannot drift when a model is renamed or deleted — the same
+    /// choice the reference makes (`ModelCount` is `gorm:"-"`).
+    pub fn list_vendors(&self) -> SqliteResult<Vec<Vendor>> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {cols}, \
+                    (SELECT COUNT(*) FROM model_metadata m WHERE m.vendor = v.name) \
+             FROM vendors v ORDER BY v.name ASC",
+            cols = VENDOR_COLUMNS
+                .split(',')
+                .map(|c| format!("v.{}", c))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            let mut vendor = map_vendor(row)?;
+            vendor.model_count = row.get(7)?;
+            Ok(vendor)
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_vendor(&self, id: &str) -> SqliteResult<Option<Vendor>> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {cols}, \
+                    (SELECT COUNT(*) FROM model_metadata m WHERE m.vendor = v.name) \
+             FROM vendors v WHERE v.id = ?1",
+            cols = VENDOR_COLUMNS
+                .split(',')
+                .map(|c| format!("v.{}", c))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => {
+                let mut vendor = map_vendor(row)?;
+                vendor.model_count = row.get(7)?;
+                Ok(Some(vendor))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The vendor whose name matches exactly, if any.
+    ///
+    /// Vendor names are a uniqueness constraint, so a create can be refused
+    /// rather than silently producing two rows with the same name.
+    pub fn find_vendor_by_name(&self, name: &str) -> SqliteResult<Option<Vendor>> {
+        let conn = self.conn.lock();
+        let sql = format!("SELECT {VENDOR_COLUMNS} FROM vendors WHERE name = ?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(map_vendor(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_vendor(&self, v: &Vendor) -> SqliteResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"INSERT INTO vendors (id,name,description,icon,status,created_at,updated_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7)
+               ON CONFLICT(id) DO UPDATE SET
+                   name=excluded.name,
+                   description=excluded.description,
+                   icon=excluded.icon,
+                   status=excluded.status,
+                   updated_at=excluded.updated_at"#,
+            params![
+                v.id,
+                v.name,
+                v.description,
+                v.icon,
+                v.status,
+                v.created_at.to_rfc3339(),
+                v.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_vendor(&self, id: &str) -> SqliteResult<()> {
+        self.conn.lock().execute("DELETE FROM vendors WHERE id=?1", params![id])?;
         Ok(())
     }
 

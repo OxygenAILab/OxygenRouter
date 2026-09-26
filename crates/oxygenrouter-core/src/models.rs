@@ -591,6 +591,32 @@ fn default_one() -> i32 {
     1
 }
 
+/// A model vendor / supplier (NewAPI `vendors` table parity).
+///
+/// The reference keeps 44 of these and shows `model_count` on the list, computed
+/// from the model registry rather than stored (`model/vendor_meta.go:15-25`), so a
+/// rename or delete cannot leave the count stale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vendor {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// lucide icon name, e.g. `OpenAI` / `Claude.Color`.
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default = "default_one")]
+    pub status: i32,
+    /// Derived, not stored: how many registry models name this vendor.
+    #[serde(default)]
+    pub model_count: i64,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Multi-key management view for a single key slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelKeyStatus {

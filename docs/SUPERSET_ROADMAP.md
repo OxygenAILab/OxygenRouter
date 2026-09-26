@@ -472,7 +472,9 @@ with all three client dialects.
 
 - **Model metadata CRUD** (exists) + **official sync** from `basellm.github.io/llm-metadata`
   (ETag/version-guarded, i18n zh/en/ja) + missing-models view + square state.
-- **Vendor metadata** CRUD + merge/delete operations.
+- ✅ **Vendor metadata** CRUD (list/search/get/create/update/delete on
+  `/api/vendors`, with a derived `model_count`). Merge/multi-select operations
+  (`/api/vendors/operations`) are not implemented.
 - **Pricing config**: snapshot/preview/convert/batch-update/reset.
 - **Ratio sync**: from official preset / models.dev / channels (OpenRouter + models.dev
   conversion).

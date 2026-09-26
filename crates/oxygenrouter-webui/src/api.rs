@@ -39,6 +39,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/models-metadata/:id", delete(delete_model_metadata))
         .route("/api/models-metadata/missing", get(missing_model_metadata))
         .route("/api/models-metadata/sync", post(sync_model_metadata))
+        // Vendors, matching the reference's `/api/vendors` group
+        // (router/api-router.go:376-386).
+        .route("/api/vendors", get(list_vendors))
+        .route("/api/vendors", post(create_vendor))
+        .route("/api/vendors/search", get(search_vendors))
+        .route("/api/vendors/:id", get(get_vendor))
+        .route("/api/vendors/:id", put(update_vendor))
+        .route("/api/vendors/:id", delete(delete_vendor))
         .route("/api/channels/batch", patch(batch_update_channels))
         .route("/api/channels/batch", delete(batch_delete_channels))
         .route("/api/log/stats", get(log_stats))
@@ -1156,6 +1164,121 @@ async fn delete_model_metadata(
     Path(id): Path<String>,
 ) -> Json<ApiResponse<&'static str>> {
     Json(match s.db.delete_model_metadata(&id) {
+        Ok(()) => ApiResponse::ok("deleted"),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+// ── Vendors ───────────────────────────────────────────────────────────────
+
+/// Every vendor, each carrying a model count derived from the registry.
+async fn list_vendors(
+    State(s): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<oxygenrouter_core::Vendor>>> {
+    Json(match s.db.list_vendors() {
+        Ok(rows) => ApiResponse::ok(rows),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+/// Substring search over vendor name and description, case-insensitive.
+async fn search_vendors(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<SearchQuery>,
+) -> Json<ApiResponse<Vec<oxygenrouter_core::Vendor>>> {
+    let needle = q.search.unwrap_or_default().trim().to_lowercase();
+    Json(match s.db.list_vendors() {
+        Ok(rows) => {
+            if needle.is_empty() {
+                return Json(ApiResponse::ok(rows));
+            }
+            let matches = rows
+                .into_iter()
+                .filter(|v| {
+                    v.name.to_lowercase().contains(&needle)
+                        || v.description.to_lowercase().contains(&needle)
+                })
+                .collect();
+            ApiResponse::ok(matches)
+        }
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    search: Option<String>,
+}
+
+async fn get_vendor(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<oxygenrouter_core::Vendor>> {
+    match s.db.get_vendor(&id) {
+        Ok(Some(vendor)) => Json(ApiResponse::ok(vendor)),
+        Ok(None) => Json(ApiResponse::err("vendor not found")),
+        Err(error) => Json(ApiResponse::err(error.to_string())),
+    }
+}
+
+async fn create_vendor(
+    State(s): State<Arc<AppState>>,
+    Json(mut input): Json<oxygenrouter_core::Vendor>,
+) -> Json<ApiResponse<oxygenrouter_core::Vendor>> {
+    if input.name.trim().is_empty() {
+        return Json(ApiResponse::err("vendor name is required"));
+    }
+    // The name is unique, so a duplicate is refused with a readable message
+    // rather than surfacing a raw SQLite constraint error.
+    match s.db.find_vendor_by_name(&input.name) {
+        Ok(Some(_)) => return Json(ApiResponse::err("a vendor with that name already exists")),
+        Err(error) => return Json(ApiResponse::err(error.to_string())),
+        Ok(None) => {}
+    }
+    if input.id.is_empty() {
+        input.id = uuid::Uuid::new_v4().to_string();
+    }
+    let now = Utc::now();
+    input.created_at = now;
+    input.updated_at = now;
+    input.model_count = 0;
+    Json(match s.db.upsert_vendor(&input) {
+        Ok(()) => ApiResponse::ok(input),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+async fn update_vendor(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(mut input): Json<oxygenrouter_core::Vendor>,
+) -> Json<ApiResponse<oxygenrouter_core::Vendor>> {
+    if input.name.trim().is_empty() {
+        return Json(ApiResponse::err("vendor name is required"));
+    }
+    // A rename must not collide with a different vendor's name; matching our own
+    // row is fine, which is why the check excludes the id being updated.
+    match s.db.find_vendor_by_name(&input.name) {
+        Ok(Some(existing)) if existing.id != id => {
+            return Json(ApiResponse::err("a vendor with that name already exists"))
+        }
+        Err(error) => return Json(ApiResponse::err(error.to_string())),
+        _ => {}
+    }
+    input.id = id;
+    input.updated_at = Utc::now();
+    input.model_count = 0;
+    Json(match s.db.upsert_vendor(&input) {
+        Ok(()) => ApiResponse::ok(input),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+async fn delete_vendor(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<&'static str>> {
+    Json(match s.db.delete_vendor(&id) {
         Ok(()) => ApiResponse::ok("deleted"),
         Err(error) => ApiResponse::err(error.to_string()),
     })

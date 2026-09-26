@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P8 — vendors)
+- **Vendor registry** — `vendors` table plus the `/api/vendors` group (list,
+  search, get, create, update, delete), matching the reference's paths
+  (`router/api-router.go:376-386`). This subsystem was missing entirely; the
+  reference keeps 44 rows.
+- `model_count` is computed by a correlated subquery over `model_metadata`, not
+  stored, matching `model/vendor_meta.go:15-25` (field tag `gorm:"-"`). The
+  difference is observable: deleting a model with no other write lowers the count,
+  which a stored column could not do.
+- Duplicate vendor names are refused with a readable message rather than a raw
+  SQLite constraint error, and a rename that collides with a *different* vendor's
+  name is refused while renaming to one's own name is allowed.
+
+### Verified (P8 — vendors)
+- Live: create three vendors, refuse a duplicate, list in name order with counts,
+  attach two models and observe OpenAI's count become 2 (the other two staying 0),
+  substring search, rename, delete. Nine storage tests cover the same ground plus
+  the derived-count invariant directly.
+- `cargo test --workspace` → **313 passed / 0 failed**, zero warnings.
+
 ### Added (P4 — remaining relay endpoints)
 - `POST /v1/responses/compact`. Only the documented compaction fields are
   forwarded (`model`, `input`, `instructions`, `previous_response_id`,

@@ -214,10 +214,27 @@ Placeholder stubs (4–20 lines each): Sign-in, Sign-up, Wallet, Plans,
 Subscriptions, Admin Users, Admin Billing.
 
 ### Database
-16 tables in `crates/oxygenrouter-core/src/db.rs`: `channels`, `api_keys`,
-`model_maps`, `model_metadata`, `route_rules`, `request_logs`, `settings`,
-`migrations`, `users`, `auth_sessions`, `ledger_entries`, `subscription_plans`,
-`subscriptions`, `redemption_codes`, `redemption_uses`, `payment_orders`.
+17 tables in `crates/oxygenrouter-core/src/db.rs`: `channels`, `api_keys`,
+`model_maps`, `model_metadata`, `vendors`, `route_rules`, `request_logs`,
+`settings`, `migrations`, `users`, `auth_sessions`, `ledger_entries`,
+`subscription_plans`, `subscriptions`, `redemption_codes`, `redemption_uses`,
+`payment_orders`.
+
+### Vendors (2026-09-26)
+
+`vendors` and its `/api/vendors` group (list / search / get / create / update /
+delete, the paths the reference uses — `router/api-router.go:376-386`). It was
+missing entirely; the reference keeps 44 rows.
+
+`model_count` is derived by a correlated subquery over `model_metadata`, not
+stored. The reference makes the same choice (`model/vendor_meta.go:15-25`, field
+tag `gorm:"-"`), and the difference is observable: deleting a model with no other
+write lowers the count, which a stored column could not do. A test asserts exactly
+that (`crates/oxygenrouter-core/tests/vendors.rs`).
+
+Verified live: create three, refuse a duplicate name with a readable message,
+list in name order with counts, attach two models and watch OpenAI's count become
+2, substring search, rename, delete. Nine storage tests plus the live run.
 
 ### Test & build baseline (2026-09-25)
 - `cargo test --workspace` → **193 passed / 0 failed**, zero build warnings
