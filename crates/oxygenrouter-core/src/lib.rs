@@ -2,6 +2,7 @@
 //!
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
+pub mod authz;
 mod config;
 mod db;
 mod models;

@@ -445,7 +445,12 @@ with all three client dialects.
   failures and the security-proof step-up on enable/disable are **not** done.
 - **Email**: binding (start/resend/confirm), verification send, password reset.
 - **Universal security verification**: scope+context proof gate for sensitive ops.
-- **RBAC**: permission catalog + role baselines (`/api/authz/catalog`); audit log.
+- 🔶 **RBAC**: the permission catalog and role baselines are implemented and
+  served at `/api/authz/catalog`, matching the reference's three resources
+  (`channel`/`audit`/`task_plugin`) and two roles. **Enforcement is not**: the
+  reference evaluates these through Casbin on every admin route; every admin
+  route here still checks only the coarse `role == admin`. Audit logging of
+  administrative operations is also not implemented.
 - **Turnstile** on register/login/checkin/verification.
 
 ---

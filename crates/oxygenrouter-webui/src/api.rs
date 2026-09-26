@@ -129,6 +129,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/admin/orders", get(admin_orders))
         .route("/api/admin/orders/:id/complete", post(admin_complete_order))
         .route("/api/admin/ledger", get(admin_ledger))
+        // The permission schema, matching the reference's `/api/authz/catalog`
+        // (router/authz-router.go:14-17).
+        .route("/api/authz/catalog", get(authz_catalog))
         .with_state(state)
 }
 
@@ -1182,6 +1185,18 @@ async fn admin_ledger(
         Ok(value) => Json(ApiResponse::ok(value)).into_response(),
         Err(e) => db_error::<Vec<oxygenrouter_core::LedgerEntry>>(e),
     }
+}
+
+/// `GET /api/authz/catalog` — the permission schema for a permission editor.
+///
+/// Admin-gated like the reference (`router/authz-router.go:14-17`), because the
+/// catalog enumerates what an admin may do, including the privileges they do
+/// *not* hold.
+async fn authz_catalog(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    Json(ApiResponse::ok(oxygenrouter_core::authz::catalog())).into_response()
 }
 
 // ── Channels ────────────────────────────────────────────────────────────────

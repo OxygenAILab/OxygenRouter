@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P5 — permission catalog)
+- **`GET /api/authz/catalog`**, admin-gated like the reference
+  (`router/authz-router.go:14-17`): the resource/action registry plus each role's
+  baseline grant matrix, in `crates/oxygenrouter-core/src/authz.rs`. This is the
+  schema a permission editor renders.
+- Registry contents match the reference exactly (`service/authz/resources_*.go`):
+  `channel` × {`read`, `operate`, `write`, `sensitive_write`, `secret_view`},
+  `audit` × `read`, `task_plugin` × `bind`.
+
+### Verified (P5 — permission catalog)
+- The channel actions are five distinct privileges, and the **admin baseline
+  deliberately excludes** `sensitive_write`, `secret_view`, `audit/read` and
+  `task_plugin/bind`, while `root` is a superuser holding everything. Both facts
+  asserted live, since a catalog whose whole purpose is to separate privileges
+  would be pointless if its own baseline collapsed them.
+- Grants are **computed from the registry, never stored**, so the matrix cannot
+  disagree with the action definitions. A test checks every cell of every matrix
+  against the per-action lookup.
+- `default_roles` is not serialized (the reference tags it `json:"-"`); the live
+  check asserts an action object's keys are exactly
+  `action`/`label_key`/`description_key`, so the two payloads stay interchangeable.
+- A superuser is **not** a wildcard: an unregistered action reads as not-granted
+  rather than passing because the role is `root`, so a typo in a future check
+  cannot silently succeed.
+- Live: anonymous `401`, a normal user `403`, admin receives the catalog, and the
+  grant matrices match the expected baseline exactly.
+- **Not enforcement.** This is the catalog, not a policy engine; the reference
+  evaluates permissions through Casbin on every admin route and we do not yet.
+  Recorded in the roadmap rather than implied to be at parity.
+- `cargo test --workspace` → **373 passed / 0 failed**, zero warnings.
+
 ### Added (P5 — two-factor authentication)
 - **TOTP 2FA wired to HTTP**: `/api/user/2fa/{status,setup,enable,disable,backup_codes}`,
   matching the reference's paths (`router/api-router.go:129-133`), plus login

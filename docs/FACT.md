@@ -331,6 +331,47 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Two-factor gates login (2026-09-26)
 
+### Permission catalog (2026-09-26)
+
+`crates/oxygenrouter-core/src/authz.rs` holds the resource/action registry and the
+built-in roles, served at `GET /api/authz/catalog` and admin-gated like the
+reference (`router/authz-router.go:14-17`). It is the schema a permission editor
+renders: which privileges exist, and what each role holds by default.
+
+Registry contents match the reference exactly — three resources, taken from
+`service/authz/resources_*.go`:
+
+| Resource | Actions |
+|---|---|
+| `channel` | `read`, `operate`, `write`, `sensitive_write`, `secret_view` |
+| `audit` | `read` |
+| `task_plugin` | `bind` |
+
+The channel split is the point of the catalog: reading a channel list, testing a
+channel, retuning its routing, rewriting its credential, and reading that
+credential back are five privileges, and collapsing them into one "admin" bit is
+what a catalog exists to prevent. The **admin baseline deliberately excludes**
+`sensitive_write`, `secret_view`, `audit/read` and `task_plugin/bind`; `root` is a
+superuser and holds everything. Both facts are asserted live.
+
+Two properties are deliberate, both mirroring the reference:
+
+- **Grants are computed, never stored.** An action carries the `default_roles`
+  that receive it, and each role's matrix is derived from that. A stored matrix
+  could contradict the registry; a computed one cannot. A test asserts every cell
+  of every matrix agrees with the per-action lookup.
+- **`default_roles` is not serialized.** The reference tags it `json:"-"`, so the
+  client learns grants through `roles[].grants`. The live check asserts an action
+  object's keys are exactly `action`/`label_key`/`description_key`.
+
+Also asserted: a superuser is not a wildcard — an unregistered action reads as
+*not* granted rather than passing because the role is `root`, so a typo in a
+future check cannot silently succeed.
+
+**Not enforcement.** This is the catalog, not a policy engine. The reference
+evaluates these permissions through Casbin on every admin route; we do not yet, and
+`docs/SUPERSET_ROADMAP.md` records that gap rather than implying parity.
+
 Endpoints at `/api/user/2fa/{status,setup,enable,disable,backup_codes}`, matching
 the reference's paths (`router/api-router.go:129-133`). The critical property is
 that **a correct password no longer yields a session when 2FA is on**: login
