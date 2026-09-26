@@ -457,9 +457,22 @@ with all three client dialects.
 
 ## 7. P6 — Payments & Subscriptions
 
-- **Providers**: Stripe, Creem, Epay, Waffo, Waffo Pancake (+ manual/balance).
-- **Flows**: topup + subscription purchase; balance pay; order locking by trade-no.
-- **Webhooks**: signature verification per provider; rate-limited; idempotent credit.
+**Landed**
+- ✅ Plans CRUD + user purchase (balance pay) + the admin lifecycle
+  (`/api/subscription/admin/{bind,users/:id/subscriptions,plans/:id/subscriptions,
+  user_subscriptions/:id}`, invalidate/reset/delete). Granting does not charge,
+  matching `AdminBindSubscription`.
+- ✅ Manual payment orders, redemption codes (single-use + max-use).
+
+**Remaining**
+- ❌ **Providers**: Stripe, Creem, Epay, Waffo, Waffo Pancake.
+- ❌ **Webhooks**: signature verification per provider; rate-limited; idempotent credit.
+- ❌ Order locking by trade-no.
+- ❌ Per-plan quota grant: `plan.quota_micros` is stored but never credited, so a
+  purchased plan currently confers no spendable allowance. The reference credits
+  the user (`CreateUserSubscriptionFromPlanTx`). This is the largest functional
+  hole in the subscription feature.
+- ❌ Per-plan purchase limits (`MaxPurchasePerUser`) and renewal/reset cycles.
 - **Compliance**: `payment_compliance` gating (dashboard-session only).
 - **Return paths**: validated redirect URLs.
 - **Redemption**: codes with single-user-once + max-use (already partially done).

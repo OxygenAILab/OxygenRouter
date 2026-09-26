@@ -2343,6 +2343,14 @@ impl Database {
             .execute("DELETE FROM subscription_plans WHERE id=?1", params![id])?
             > 0)
     }
+    /// Buy a plan, debiting the wallet.
+    ///
+    /// A user may hold several active subscriptions at once, one per plan. The
+    /// reference behaves the same way: it bounds repeats of a *single* plan
+    /// (`MaxPurchasePerUser`) and never ends other plans when a new one is bought
+    /// (`model/subscription.go`). An earlier version here cancelled every other
+    /// active subscription, which silently destroyed an entitlement the user had
+    /// paid for — a regression against NewAPI, not a simplification.
     pub fn subscribe(&self, user_id: &str, plan_id: &str) -> SqliteResult<Subscription> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -2364,10 +2372,6 @@ impl Database {
                 "subscription already active".into(),
             ));
         }
-        tx.execute(
-            "UPDATE subscriptions SET status='cancelled' WHERE user_id=?1 AND status='active'",
-            params![user_id],
-        )?;
         let subscription = Subscription {
             id: Uuid::new_v4().to_string(),
             user_id: user_id.into(),
@@ -2391,6 +2395,127 @@ impl Database {
         tx.commit()?;
         Ok(subscription)
     }
+    /// Grant a subscription as an administrator, without charging the wallet.
+    ///
+    /// An admin grant is a gift, not a purchase: the reference's
+    /// `AdminBindSubscription` does not debit the user. Charging here would make
+    /// the operator's action cost the customer money.
+    ///
+    /// The same "one active subscription, per plan" rules as a purchase apply, so
+    /// a grant cannot leave a user holding two conflicting entitlements.
+    pub fn grant_subscription(&self, user_id: &str, plan_id: &str) -> SqliteResult<Subscription> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let plan = tx
+            .query_row(
+                "SELECT id,name,description,price_micros,quota_micros,duration_days,enabled,created_at,updated_at FROM subscription_plans WHERE id=?1",
+                params![plan_id],
+                Self::plan_from_row,
+            )
+            .optional()?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let now = Utc::now();
+        tx.execute(
+            "UPDATE subscriptions SET status='expired' WHERE user_id=?1 AND status='active' AND expires_at<=?2",
+            params![user_id, now.to_rfc3339()],
+        )?;
+        let same_plan_active: Option<String> = tx
+            .query_row(
+                "SELECT id FROM subscriptions WHERE user_id=?1 AND plan_id=?2 AND status='active' LIMIT 1",
+                params![user_id, plan.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if same_plan_active.is_some() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "subscription already active".into(),
+            ));
+        }
+        let subscription = Subscription {
+            id: Uuid::new_v4().to_string(),
+            user_id: user_id.into(),
+            plan_id: plan.id,
+            status: "active".into(),
+            started_at: now,
+            expires_at: now + Duration::days(plan.duration_days),
+            created_at: now,
+        };
+        tx.execute("INSERT INTO subscriptions (id,user_id,plan_id,status,started_at,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![subscription.id,subscription.user_id,subscription.plan_id,subscription.status,subscription.started_at.to_rfc3339(),subscription.expires_at.to_rfc3339(),subscription.created_at.to_rfc3339()])?;
+        tx.commit()?;
+        Ok(subscription)
+    }
+
+    /// Invalidate one subscription, returning whether it was live.
+    ///
+    /// Only an `active` row is touched. Marking an already-expired row
+    /// "invalidated" would rewrite history without changing any entitlement.
+    pub fn invalidate_subscription(&self, id: &str) -> SqliteResult<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE subscriptions SET status='cancelled' WHERE id=?1 AND status='active'",
+                params![id],
+            )?
+            > 0)
+    }
+
+    /// Delete a subscription row outright, returning whether it existed.
+    ///
+    /// Distinct from invalidating: this erases the record, so it is the operator's
+    /// tool for removing a mistaken grant rather than ending a live one.
+    pub fn delete_subscription(&self, id: &str) -> SqliteResult<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .execute("DELETE FROM subscriptions WHERE id=?1", params![id])?
+            > 0)
+    }
+
+    /// End every subscription for `user_id` whose plan is `plan_id`.
+    ///
+    /// Used when a plan is withdrawn or repriced: the reference has the same
+    /// per-plan reset, so an operator does not have to walk users one at a time.
+    /// Returns how many rows were ended.
+    pub fn reset_subscriptions_for_plan(&self, user_id: &str, plan_id: &str) -> SqliteResult<usize> {
+        Ok(self.conn.lock().execute(
+            "UPDATE subscriptions SET status='cancelled' WHERE user_id=?1 AND plan_id=?2 AND status='active'",
+            params![user_id, plan_id],
+        )?)
+    }
+
+    /// Every subscription on a plan, across all users, newest first.
+    ///
+    /// The admin view answers "who is on this plan", which the per-user list
+    /// cannot.
+    pub fn list_subscriptions_for_plan(&self, plan_id: &str) -> SqliteResult<Vec<Subscription>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,user_id,plan_id,status,started_at,expires_at,created_at FROM subscriptions
+             WHERE plan_id=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![plan_id], |row| {
+            Ok(Subscription {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                plan_id: row.get(2)?,
+                status: row.get(3)?,
+                started_at: Self::parse_time(row.get(4)?)?,
+                expires_at: Self::parse_time(row.get(5)?)?,
+                created_at: Self::parse_time(row.get(6)?)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Every subscription for a user, newest first, including inactive rows.
+    ///
+    /// The user-facing list is the same shape; naming it separately keeps the
+    /// admin call site readable when the semantics diverge.
+    pub fn list_all_subscriptions(&self, user_id: &str) -> SqliteResult<Vec<Subscription>> {
+        self.list_subscriptions(user_id)
+    }
+
     pub fn list_subscriptions(&self, user_id: &str) -> SqliteResult<Vec<Subscription>> {
         let conn = self.conn.lock();
         let mut stmt=conn.prepare("SELECT id,user_id,plan_id,status,started_at,expires_at,created_at FROM subscriptions WHERE user_id=?1 ORDER BY created_at DESC")?;
@@ -2679,7 +2804,10 @@ mod tests {
     }
 
     #[test]
-    fn subscription_purchase_debits_and_replaces_prior_subscription() {
+    fn a_purchase_does_not_end_the_users_other_subscription() {
+        // Regression: this used to cancel the first plan when the second was
+        // bought, destroying an entitlement the user had paid for. The reference
+        // allows several concurrent subscriptions, one per plan.
         let db = database();
         let user = db
             .create_user(
@@ -2725,7 +2853,8 @@ mod tests {
                 .find(|s| s.id == first_subscription.id)
                 .unwrap()
                 .status,
-            "cancelled"
+            "active",
+            "buying a second plan must not end the first"
         );
         assert_eq!(
             subscriptions

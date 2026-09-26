@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P6 — subscription admin lifecycle)
+- Seven routes under `/api/subscription/admin/*`, matching the reference's
+  `subscriptionAdminRoute` group: `bind`, a user's subscriptions, a plan's
+  subscribers, a user reset, a plan reset, `invalidate`, and `delete`. Previously
+  an admin could create plans but could not see or change who held them.
+
+### Fixed (P6 — subscription regression)
+- **Buying a plan cancelled the user's other plans.** Our `subscribe` ended every
+  other active subscription, so a user could hold only one. That is *less* than
+  NewAPI, which allows concurrent subscriptions and bounds repeats per plan
+  (`model/subscription.go`: `MaxPurchasePerUser`); the behaviour silently
+  destroyed an entitlement the user had paid for. A new test that granted two
+  plans and expected both to survive caught it — an existing unit test had
+  encoded the old behaviour as correct ("replaces prior subscription"), which is
+  why it had gone unnoticed. Both tests were corrected and the reasoning is now in
+  the function's doc comment.
+
+### Verified (P6 — subscription admin lifecycle)
+- **Granting does not charge**, matching `AdminBindSubscription`: a test asserts
+  the wallet and ledger are unchanged, alongside a contrasting test that a
+  *purchase* does debit, so the difference is real rather than an artefact of an
+  empty wallet.
+- **Invalidate ≠ delete**: invalidating keeps the row so the audit trail survives
+  and reports `404` on an already-inactive row rather than rewriting history;
+  deleting erases a mistaken grant.
+- Grants accept a disabled plan, and the plan-wide reset walks the per-user
+  primitive so there is one definition of "end a subscription".
+- Live: two plans granted concurrently (both stay active, balance unchanged), a
+  duplicate grant refused with `409`, subscriber listing, invalidate leaving the
+  other plan running, a repeat invalidate `404`, a plan reset, a delete, and a
+  customer token refused with `403`. Sixteen storage tests cover the same ground.
+- `cargo test --workspace` → **389 passed / 0 failed**, zero warnings.
+
 ### Added (P5 — permission catalog)
 - **`GET /api/authz/catalog`**, admin-gated like the reference
   (`router/authz-router.go:14-17`): the resource/action registry plus each role's

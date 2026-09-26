@@ -333,6 +333,47 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Permission catalog (2026-09-26)
 
+### Subscription admin lifecycle (2026-09-26)
+
+Seven routes under `/api/subscription/admin/*`, matching the reference's
+`subscriptionAdminRoute` group: bind a plan, list a user's subscriptions, list a
+plan's subscribers, reset a user's or a plan's subscriptions, invalidate one, and
+delete one. Previously an admin could create plans but could not see or change who
+held them.
+
+Two distinctions the endpoints preserve deliberately:
+
+- **Granting does not charge.** `AdminBindSubscription` in the reference does not
+  debit the user, and neither do we: an admin binding a plan is gifting it, and
+  reusing the purchase path would silently bill the customer for the operator's
+  action. A test asserts the wallet and the ledger are unchanged, alongside a
+  contrasting test that a *purchase* does debit — so the difference is real rather
+  than an artefact of the wallet happening to be empty.
+- **Invalidate ≠ delete.** Invalidating ends a live entitlement and keeps the row,
+  so the audit trail survives; deleting erases a mistaken grant. Invalidating an
+  already-inactive row reports `404` rather than rewriting history, so an operator
+  can tell "I just ended it" from "it was already over".
+
+Grants also accept a disabled plan (an operator may deliberately bind a retired
+one) and a full plan-wide reset is implemented by walking users through the
+per-user primitive, so there is one definition of "end a subscription".
+
+**A regression this work found and fixed.** Our `subscribe` cancelled every other
+active subscription when a new plan was bought, so a user could hold only one.
+That is *less* than NewAPI, which allows concurrent subscriptions and bounds
+repeats per plan (`model/subscription.go`: `MaxPurchasePerUser`). The behaviour
+silently destroyed an entitlement the user had paid for. It was caught because a
+new test granted two plans and expected both to survive; an existing unit test had
+encoded the old behaviour as correct ("replaces prior subscription"), which is why
+it had gone unnoticed. Both tests were corrected, and the reason is recorded in
+the function's doc comment so it is not "simplified" back.
+
+Verified live: create two plans, grant both (balance unchanged), confirm both stay
+active, refuse a duplicate grant with `409`, list a plan's subscribers, invalidate
+one (the other keeps running) and get `404` on a repeat, reset a whole plan, delete
+a record, and confirm a customer token gets `403`. Sixteen storage tests cover the
+same ground.
+
 `crates/oxygenrouter-core/src/authz.rs` holds the resource/action registry and the
 built-in roles, served at `GET /api/authz/catalog` and admin-gated like the
 reference (`router/authz-router.go:14-17`). It is the schema a permission editor

@@ -114,6 +114,36 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(admin_adjust_balance),
         )
         .route("/api/admin/plans", get(admin_plans).post(admin_create_plan))
+        // Subscription lifecycle, matching the reference's `/api/subscription/admin`
+        // group (router/api-router.go — `subscriptionAdminRoute`).
+        .route(
+            "/api/subscription/admin/bind",
+            post(admin_bind_subscription),
+        )
+        .route(
+            "/api/subscription/admin/users/:id/subscriptions",
+            get(admin_user_subscriptions),
+        )
+        .route(
+            "/api/subscription/admin/users/:id/subscriptions/reset",
+            post(admin_reset_user_subscriptions),
+        )
+        .route(
+            "/api/subscription/admin/user_subscriptions/:id/invalidate",
+            post(admin_invalidate_subscription),
+        )
+        .route(
+            "/api/subscription/admin/user_subscriptions/:id",
+            delete(admin_delete_subscription),
+        )
+        .route(
+            "/api/subscription/admin/plans/:id/subscriptions",
+            get(admin_plan_subscriptions),
+        )
+        .route(
+            "/api/subscription/admin/plans/:id/subscriptions/reset",
+            post(admin_reset_plan_subscriptions),
+        )
         .route(
             "/api/admin/plans/:id",
             put(admin_update_plan).delete(admin_delete_plan),
@@ -1027,6 +1057,186 @@ async fn admin_update_plan(
         Err(e) => db_error::<SubscriptionPlan>(e),
     }
 }
+
+// ── Admin: user subscription lifecycle ────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct GrantSubscriptionInput {
+    user_id: String,
+    plan_id: String,
+}
+
+/// `POST /api/subscription/admin/bind`
+///
+/// Grants a plan to a user without charging them — an admin gift, matching the
+/// reference's `AdminBindSubscription`, which likewise does not debit. The plan
+/// need not be enabled: an operator may bind a retired plan deliberately.
+async fn admin_bind_subscription(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<GrantSubscriptionInput>,
+) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    if input.user_id.trim().is_empty() || input.plan_id.trim().is_empty() {
+        return Json(ApiResponse::<oxygenrouter_core::Subscription>::err(
+            "user_id and plan_id are required",
+        ))
+        .into_response();
+    }
+    match s.db.grant_subscription(&input.user_id, &input.plan_id) {
+        Ok(subscription) => Json(ApiResponse::ok(subscription)).into_response(),
+        Err(e) if e.to_string().contains("subscription already active") => (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<oxygenrouter_core::Subscription>::err(
+                "subscription already active for this plan",
+            )),
+        )
+            .into_response(),
+        Err(e) if e.to_string().contains("Query returned no rows") => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<oxygenrouter_core::Subscription>::err(
+                "plan not found",
+            )),
+        )
+            .into_response(),
+        Err(e) => db_error::<oxygenrouter_core::Subscription>(e),
+    }
+}
+
+/// `GET /api/subscription/admin/users/:id/subscriptions`
+async fn admin_user_subscriptions(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    match s.db.list_all_subscriptions(&user_id) {
+        Ok(value) => Json(ApiResponse::ok(value)).into_response(),
+        Err(e) => db_error::<Vec<oxygenrouter_core::Subscription>>(e),
+    }
+}
+
+/// `POST /api/subscription/admin/user_subscriptions/:id/invalidate`
+///
+/// Ends a live subscription. Already-inactive rows are reported as not found
+/// rather than silently rewritten, so an operator can tell the difference
+/// between "I just ended it" and "it was already over".
+async fn admin_invalidate_subscription(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    match s.db.invalidate_subscription(&id) {
+        Ok(true) => Json(ApiResponse::ok("invalidated")).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<&str>::err("no active subscription with that id")),
+        )
+            .into_response(),
+        Err(e) => db_error::<&str>(e),
+    }
+}
+
+/// `DELETE /api/subscription/admin/user_subscriptions/:id`
+///
+/// Erases the record. Distinct from invalidating: this is for removing a mistaken
+/// grant, not for ending a live entitlement.
+async fn admin_delete_subscription(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    match s.db.delete_subscription(&id) {
+        Ok(true) => Json(ApiResponse::ok("deleted")).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<&str>::err("subscription not found")),
+        )
+            .into_response(),
+        Err(e) => db_error::<&str>(e),
+    }
+}
+
+/// `POST /api/subscription/admin/users/:id/subscriptions/reset`
+///
+/// Ends every active subscription the user holds on one plan.
+async fn admin_reset_user_subscriptions(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(input): Json<ResetSubscriptionsInput>,
+) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    match s.db.reset_subscriptions_for_plan(&user_id, &input.plan_id) {
+        Ok(count) => Json(ApiResponse::ok(count)).into_response(),
+        Err(e) => db_error::<usize>(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ResetSubscriptionsInput {
+    plan_id: String,
+}
+
+/// `GET /api/subscription/admin/plans/:id/subscriptions`
+///
+/// Who is on this plan, across all users.
+async fn admin_plan_subscriptions(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    match s.db.list_subscriptions_for_plan(&plan_id) {
+        Ok(value) => Json(ApiResponse::ok(value)).into_response(),
+        Err(e) => db_error::<Vec<oxygenrouter_core::Subscription>>(e),
+    }
+}
+
+/// `POST /api/subscription/admin/plans/:id/subscriptions/reset`
+///
+/// Ends every active subscription on a plan, for every user.
+async fn admin_reset_plan_subscriptions(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+) -> Response {
+    if let Err(response) = admin_user(&s, &headers) {
+        return response;
+    }
+    // Implemented over the per-user primitive so there is one definition of
+    // "end a subscription"; a separate bulk UPDATE could drift from it.
+    let subscriptions = match s.db.list_subscriptions_for_plan(&plan_id) {
+        Ok(value) => value,
+        Err(e) => return db_error::<usize>(e),
+    };
+    let mut ended = 0usize;
+    for subscription in subscriptions {
+        match s
+            .db
+            .reset_subscriptions_for_plan(&subscription.user_id, &plan_id)
+        {
+            Ok(n) => ended += n,
+            Err(e) => return db_error::<usize>(e),
+        }
+    }
+    Json(ApiResponse::ok(ended)).into_response()
+}
+
 async fn admin_delete_plan(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
