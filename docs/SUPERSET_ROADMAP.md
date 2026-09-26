@@ -408,13 +408,15 @@ Add missing endpoints on top of P1. Status as of `7f553df`:
 **Remaining**
 - ❌ `GET /v1/responses` WebSocket (Responses streaming session)
 - ❌ `GET /v1/realtime` WebSocket (Realtime API)
-- ❌ `POST /v1/responses/compact`, `POST /v1/alpha/search`
 - ✅ Native inbound `/v1beta/models/*path` now works against a plain OpenAI
   channel too: `convert/gemini_to_openai_request.rs` translates the request and
   the adaptor aims it at `{base}/v1/chat/completions`, both directions, streaming
   included. Verified live. (Was listed here as a gap; now closed.)
 - ❌ Codex credential refresh + usage endpoints
 - ❌ vLLM / SGLang per-channel metrics
+- ❌ `/mj/*` Midjourney action set, `/v1/tasks/*`, `/v1/video/*`, `/pg/chat/completions`
+  (reference route list: `router/relay-router.go`, `router/task-router.go`,
+  `router/video-router.go`)
 
 **Dialect handling is shared, not per-adaptor.** `adapters/openai_compat.rs` holds
 the Anthropic/Gemini re-routing and translation once, and `OpenAiAdaptor`,

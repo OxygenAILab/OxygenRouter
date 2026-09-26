@@ -25,18 +25,23 @@ This document records verified project facts. Update it whenever a fact changes.
 - **Icons**: lucide-react 0.294
 - **State management**: @tanstack/react-query 5
 
-### Implemented relay endpoints (29, `crates/oxygenrouter-webui/src/proxy.rs`)
+### Implemented relay endpoints
+
+Grouped below; the authoritative list is `SUPPORTED_ENDPOINTS` in
+`crates/oxygenrouter-webui/src/proxy.rs` (38 entries, and every one is driven
+through the real router by `proxy::tests::every_supported_endpoint_is_registered_in_the_router`).
 - `/v1/chat/completions` — streaming (SSE) + non-streaming
 - `/v1/completions`
 - `/v1/embeddings`, `/v1/engines/:model/embeddings`
 - `/v1/responses`
+- `/v1/responses/compact`, `/v1/alpha/search`
 - `/v1/messages` (Anthropic-format), `/v1/messages/count_tokens`
 - `/v1/rerank`
 - `/v1/moderations`, `/v1/edits`
 - `/v1beta/models/*path` — Gemini native inbound
 - `/v1/files`, `/v1/files/:id`, `/v1/files/:id/content`
 - `/v1/batches`, `/v1/batches/:id`, `/v1/batches/:id/cancel`
-- `/v1/fine_tuning/jobs` (+ `:id`, `:id/cancel`, `:id/events`)
+- `/v1/fine-tunes` (+ `:id`, `:id/cancel`, `:id/events`)
 - `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`
 - `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations`
 - `/v1/models` (three dialects), `/v1beta/models`, `/v1beta/openai/models`,

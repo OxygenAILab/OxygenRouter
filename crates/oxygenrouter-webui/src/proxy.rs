@@ -32,6 +32,8 @@ const SUPPORTED_ENDPOINTS: &[&str] = &[
     "POST /v1/engines/:model/embeddings",
     // Responses and Anthropic
     "POST /v1/responses",
+    "POST /v1/responses/compact",
+    "POST /v1/alpha/search",
     "POST /v1/messages",
     "POST /v1/messages/count_tokens",
     // Gemini native inbound
@@ -82,6 +84,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/v1/engines/:model/embeddings", any(engines_embeddings))
         // --- Responses, Anthropic and the Responses-adjacent helpers -------
         .route("/v1/responses", any(responses_endpoint))
+        .route("/v1/responses/compact", any(responses_compact_endpoint))
+        .route("/v1/alpha/search", any(alpha_search_endpoint))
         .route("/v1/messages", any(messages_endpoint))
         .route("/v1/messages/count_tokens", any(count_tokens_endpoint))
         // --- Google Gemini native inbound ---------------------------------
@@ -1228,6 +1232,94 @@ async fn count_tokens_endpoint(
     .await
 }
 
+/// `POST /v1/responses/compact` — Responses-API context compaction.
+///
+/// The reference forwards only the documented compaction fields and drops the
+/// Codex-parity extras (`tools`, `reasoning`, `text`) on the way upstream
+/// (`relay/responses_handler.go:23-39`, `dto/openai_responses_compaction_request.go`).
+/// It also keeps the request's own `input` verbatim, which is what makes the
+/// endpoint usable for compacting an existing context.
+async fn responses_compact_endpoint(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/responses/compact",
+        "/v1/responses/compact",
+        compact_body(body_bytes),
+        headers,
+        "gpt-4o-mini",
+    )
+    .await
+}
+
+/// The compaction fields the reference documents and forwards.
+///
+/// Everything else is a Codex-parity field it parses for client compatibility but
+/// deliberately does not send upstream
+/// (`dto/openai_responses_compaction_request.go:11-27`,
+/// `relay/responses_handler.go:23-39`). Forwarding `tools` or `reasoning` would
+/// hand the upstream fields its compaction endpoint does not define.
+const COMPACTION_FORWARDED_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "previous_response_id",
+    "parallel_tool_calls",
+    "service_tier",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_retention",
+];
+
+/// Reduce a compaction request body to the documented field set.
+///
+/// A body that is not a JSON object is returned untouched: an unusual client
+/// should get a real upstream error rather than a silent rewrite of its payload.
+fn compact_body(body_bytes: Vec<u8>) -> Vec<u8> {
+    match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        Ok(serde_json::Value::Object(obj)) => {
+            let kept: serde_json::Map<String, serde_json::Value> = obj
+                .into_iter()
+                .filter(|(k, _)| COMPACTION_FORWARDED_FIELDS.contains(&k.as_str()))
+                .collect();
+            serde_json::to_vec(&serde_json::Value::Object(kept)).unwrap_or(body_bytes)
+        }
+        _ => body_bytes,
+    }
+}
+
+/// `POST /v1/alpha/search` — Codex standalone web search.
+///
+/// Only some channel families implement it; the reference refuses the others so
+/// the scheduler retries elsewhere (`relay/alpha_search_handler.go:24-35`). The
+/// upstream returns no usage, so the reference bills a single
+/// `web_search_preview` call rather than inventing a token count.
+///
+/// We forward the raw body (unknown fields preserved, matching
+/// `buildAlphaSearchRequestBody`) and apply no charge: our billing engine is
+/// driven by upstream-reported usage, and charging a synthesised amount would be
+/// a guess rather than parity.
+async fn alpha_search_endpoint(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    relay_passthrough(
+        state,
+        "POST",
+        "/v1/alpha/search",
+        "/v1/alpha/search",
+        body_bytes,
+        headers,
+        "gpt-5.6-terra",
+    )
+    .await
+}
+
 /// Native Gemini inbound: `/v1beta/models/<model>:<verb>`.
 ///
 /// The client already speaks Gemini, so the body needs no conversion; the model
@@ -1749,6 +1841,51 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(parsed["object"], "list");
         assert!(parsed["data"][0].get("object").is_some());
+    }
+
+    #[test]
+    fn compaction_forwards_only_the_documented_fields() {
+        // Codex sends `tools`/`reasoning`/`text` for compatibility, but the
+        // reference drops them before the upstream call. Forwarding them would
+        // hand the compaction endpoint fields it does not define.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-5-codex",
+            "input": "context to compact",
+            "instructions": "be terse",
+            "previous_response_id": "resp_1",
+            "parallel_tool_calls": true,
+            "service_tier": "auto",
+            "prompt_cache_key": "k",
+            "prompt_cache_options": {"mode": "explicit"},
+            "prompt_cache_retention": "24h",
+            // Codex-parity fields, deliberately not forwarded:
+            "tools": [{"type": "web_search"}],
+            "reasoning": {"effort": "high"},
+            "text": {"format": {"type": "text"}},
+        }))
+        .unwrap();
+
+        let out: serde_json::Value =
+            serde_json::from_slice(&compact_body(body)).expect("valid JSON");
+        for kept in COMPACTION_FORWARDED_FIELDS {
+            assert!(out.get(*kept).is_some(), "{kept} must be forwarded");
+        }
+        for dropped in ["tools", "reasoning", "text"] {
+            assert!(
+                out.get(dropped).is_none(),
+                "{dropped} must not reach the compaction endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_leaves_a_non_object_body_untouched() {
+        // An unusual client should see the upstream's own error rather than a
+        // silently rewritten payload.
+        let raw = b"not json at all".to_vec();
+        assert_eq!(compact_body(raw.clone()), raw);
+        let array = b"[1,2,3]".to_vec();
+        assert_eq!(compact_body(array.clone()), array);
     }
 
     /// Drive one request through the real router and return (status, body).

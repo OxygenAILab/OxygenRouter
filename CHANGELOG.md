@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P4 — remaining relay endpoints)
+- `POST /v1/responses/compact`. Only the documented compaction fields are
+  forwarded (`model`, `input`, `instructions`, `previous_response_id`,
+  `parallel_tool_calls`, `service_tier`, `prompt_cache_key`,
+  `prompt_cache_options`, `prompt_cache_retention`); the Codex-parity extras
+  (`tools`, `reasoning`, `text`) are dropped before the upstream call, matching
+  `relay/responses_handler.go:23-39` and
+  `dto/openai_responses_compaction_request.go:11-27`. A body that is not a JSON
+  object passes through untouched so an unusual client gets the upstream's own
+  error rather than a silent rewrite.
+- `POST /v1/alpha/search` (Codex standalone web search), forwarding the raw body
+  so unknown fields survive, matching `buildAlphaSearchRequestBody`. No charge is
+  applied: the upstream returns no usage, our billing engine is driven by
+  reported usage, and synthesising an amount would be a guess rather than parity.
+
+### Verified (P4 — remaining relay endpoints)
+- Both endpoints live against the reference instance on an OpenAI channel.
+  `/v1/responses/compact` returns `200` with a Responses-shaped body from both
+  the reference and this relay. `/v1/alpha/search` returns the same `500`
+  `get_channel_failed` from both — the reference refuses it for a channel family
+  that does not support it (`relay/alpha_search_handler.go:24-35`), and we
+  forward that upstream answer rather than inventing one.
+- Field-trimming is unit-tested both ways: the nine documented fields survive and
+  the three Codex-parity fields do not, plus a non-object body is untouched.
+- `cargo test --workspace` → **304 passed / 0 failed**, zero warnings.
+
 ### Added (P4 — model listing dialects)
 - **`GET /v1/models` now answers in the client's own dialect, and the Gemini
   discovery routes exist.** Ours returned OpenAI shape to everyone, so an
