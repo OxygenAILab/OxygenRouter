@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P6 — subscription quota funds requests)
+- **A subscription's pool now actually pays for requests.** `FundingSource`
+  (`Wallet` or `Subscription { user_id, subscription_id }`) chooses who funds a
+  request, mirroring the reference's abstraction
+  (`service/funding_source.go`), and the proxy selects a subscription when one can
+  cover the reservation. A `Subscription` source spends its pool first and the
+  owner's wallet for anything beyond it.
+- `reserve_subscription_quota` / `adjust_subscription_quota` /
+  `restore_subscription_quota` on the store, plus the matching `BillingStore`
+  methods and the `DualStore` split that routes a subscription account between
+  pool and wallet.
+
+### Verified (P6 — subscription quota funds requests)
+- **Decisive live proof.** A user with a **zero wallet** is refused with `403`
+  (`insufficient balance: need 99, available 0`); granting them a plan makes the
+  identical request return `200` with content, and the pool records `amount_used
+  = 27` while the wallet stays at `0`. Invalidating the plan returns the request
+  to `403`. That is the whole claim, end to end.
+- Partial reservation: a pool smaller than the charge is drained and the wallet
+  covers the remainder, rather than the pool being skipped while its remaining
+  quota is stranded until expiry.
+- A refused reservation rolls the pool back, so a request that cannot be funded
+  costs nothing — asserted at the store level and exercised by the live `403`.
+- Settlement beyond the pool becomes wallet debt rather than a negative
+  subscription balance, matching the wallet's existing overrun rule.
+- An unlimited pool (`amount_total = 0`) funds any amount and records no usage.
+- The pre-existing wallet-only path is asserted unchanged, so no existing
+  deployment's billing shifts.
+- **A bug the tests caught, twice.** `restore_subscription_quota` originally
+  bounded the refund by the pool's *remaining room* instead of by what had been
+  used, so a drained pool — the case that matters — restored nothing and an
+  untouched pool would have gone negative. The same mistake was in the billing
+  test double; both are fixed, and the reason is in the code comment.
+- `cargo test --workspace` → **412 passed / 0 failed**, zero warnings.
+
 ### Added (P6 — subscription quota pool)
 - **A subscription's quota is now a real, spendable pool.** `subscriptions` gains
   `amount_total` (snapshotted from the plan's `quota_micros` at creation) and

@@ -12,7 +12,7 @@ use crate::chat_quota::{compute_chat_quota, ChatQuotaRequest};
 use crate::expr::{build_params, evaluate_with, quota_from_cost, used_vars, EvalContext};
 use crate::pricing::Pricing;
 use crate::quota_math::QuotaClamp;
-use crate::session::{BillingError, BillingSession, QuotaStore};
+use crate::session::{BillingError, BillingSession, FundingSource, QuotaStore};
 use crate::usage::BillingUsage;
 
 /// A resolved charge, with the audit trail needed to explain it in a log.
@@ -84,39 +84,134 @@ pub trait BillingStore: Send + Sync {
     ) -> Result<(), BillingError>;
     /// Current wallet balance, for the trust-bypass check.
     fn wallet_balance(&self, user_id: &str) -> Result<i64, BillingError>;
+
+    /// Reserve up to `amount` from a subscription's pool, returning how much was
+    /// taken. Partial by design: the caller covers the remainder from the wallet.
+    fn try_reserve_subscription(&self, id: &str, amount: i64) -> Result<i64, BillingError>;
+    /// Move quota out of a subscription's pool, permitted to exceed its ceiling
+    /// (the overflow is the wallet's debt, recorded there).
+    fn debit_subscription(&self, id: &str, amount: i64) -> Result<(), BillingError>;
+    /// Move quota back into a subscription's pool.
+    fn credit_subscription(&self, id: &str, amount: i64) -> Result<(), BillingError>;
+    /// Return up to `amount` to a subscription's pool, reporting how much fitted.
+    ///
+    /// Separate from [`Self::credit_subscription`] because a refund must know how
+    /// much the pool could absorb: anything it cannot take belongs to the wallet,
+    /// which funded that part in the first place.
+    fn restore_subscription_quota(&self, id: &str, amount: i64) -> Result<i64, BillingError>;
 }
 
-/// Split a reservation between the key and the wallet.
+/// Which account a name addresses, for the store split.
 ///
-/// A `QuotaStore` addresses one account, so the service presents two: the key
-/// is charged first (it has the hard ceiling) and the wallet second.
+/// A `QuotaStore` is given account *names*, but the three kinds of account need
+/// different handling: a key has a hard ceiling, a wallet may go negative, and a
+/// subscription pool is finite with the wallet behind it. Classifying by name is
+/// what keeps `BillingSession` free of storage knowledge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccountKind {
+    Key,
+    Subscription { overflow_user: String },
+    Wallet,
+}
+
+/// Split a reservation between the key and whichever funding account pays.
 struct DualStore<'a> {
     store: &'a dyn BillingStore,
     key_id: String,
+    /// The funding account name, when it is a subscription pool.
+    subscription_id: Option<String>,
+    /// The wallet that absorbs a subscription's overflow.
+    overflow_user: Option<String>,
+}
+
+impl<'a> DualStore<'a> {
+    fn new(store: &'a dyn BillingStore, key_id: &str) -> Self {
+        Self {
+            store,
+            key_id: key_id.to_string(),
+            subscription_id: None,
+            overflow_user: None,
+        }
+    }
+
+    /// Attach a subscription funding source, so its account name resolves to the
+    /// pool with `user_id` behind it.
+    fn with_subscription(mut self, subscription_id: &str, user_id: &str) -> Self {
+        self.subscription_id = Some(subscription_id.to_string());
+        self.overflow_user = Some(user_id.to_string());
+        self
+    }
+
+    fn classify(&self, account: &str) -> AccountKind {
+        if account == self.key_id {
+            return AccountKind::Key;
+        }
+        if self.subscription_id.as_deref() == Some(account) {
+            return AccountKind::Subscription {
+                overflow_user: self.overflow_user.clone().unwrap_or_default(),
+            };
+        }
+        AccountKind::Wallet
+    }
 }
 
 impl QuotaStore for DualStore<'_> {
-    /// Any account name other than the key is the wallet: a `BillingSession` is
-    /// only ever constructed with exactly these two accounts.
     fn try_reserve(&self, account: &str, amount: i64) -> Result<bool, BillingError> {
-        if account == self.key_id {
-            self.store.try_reserve_key(account, amount)
-        } else {
-            self.store.try_reserve_wallet(account, amount)
+        match self.classify(account) {
+            AccountKind::Key => self.store.try_reserve_key(account, amount),
+            AccountKind::Wallet => self.store.try_reserve_wallet(account, amount),
+            AccountKind::Subscription { overflow_user } => {
+                // Take what the pool has, then the remainder from the wallet.
+                let taken = self.store.try_reserve_subscription(account, amount)?;
+                let remainder = amount - taken;
+                if remainder == 0 {
+                    return Ok(true);
+                }
+                match self.store.try_reserve_wallet(&overflow_user, remainder) {
+                    Ok(true) => Ok(true),
+                    // The wallet cannot cover the rest: give the pool's part back
+                    // so a refused request leaves no trace on either account.
+                    Ok(false) => {
+                        self.store.credit_subscription(account, taken)?;
+                        Ok(false)
+                    }
+                    Err(error) => {
+                        self.store.credit_subscription(account, taken)?;
+                        Err(error)
+                    }
+                }
+            }
         }
     }
     fn debit(&self, account: &str, amount: i64) -> Result<(), BillingError> {
-        if account == self.key_id {
-            self.store.debit_key(account, amount)
-        } else {
-            self.store.debit_wallet(account, amount)
+        match self.classify(account) {
+            AccountKind::Key => self.store.debit_key(account, amount),
+            AccountKind::Wallet => self.store.debit_wallet(account, amount),
+            AccountKind::Subscription { overflow_user } => {
+                // A settlement beyond the pool is the wallet's debt.
+                let taken = self.store.try_reserve_subscription(account, amount)?;
+                let remainder = amount - taken;
+                if remainder > 0 {
+                    self.store.debit_wallet(&overflow_user, remainder)?;
+                }
+                Ok(())
+            }
         }
     }
     fn credit(&self, account: &str, amount: i64) -> Result<(), BillingError> {
-        if account == self.key_id {
-            self.store.credit_key(account, amount)
-        } else {
-            self.store.credit_wallet(account, amount)
+        match self.classify(account) {
+            AccountKind::Key => self.store.credit_key(account, amount),
+            AccountKind::Wallet => self.store.credit_wallet(account, amount),
+            AccountKind::Subscription { overflow_user } => {
+                // Refund into the pool first (so an expired-soon plan is made
+                // whole), and only push into the wallet what the pool refuses.
+                let restored = self.store.restore_subscription_quota(account, amount)?;
+                let remainder = amount - restored;
+                if remainder > 0 {
+                    self.store.credit_wallet(&overflow_user, remainder)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -303,10 +398,16 @@ impl BillingService {
         &self,
         store: &dyn BillingStore,
         key_id: &str,
-        user_id: &str,
+        funding: &FundingSource,
         is_playground: bool,
         reservation: i64,
     ) -> Result<(BillingSession, i64), BillingError> {
+        // The wallet behind this request, for the trust check and for reporting a
+        // real balance when a reservation is refused.
+        let user_id = match funding {
+            FundingSource::Wallet { user_id } => user_id.as_str(),
+            FundingSource::Subscription { user_id, .. } => user_id.as_str(),
+        };
         // Trust bypass: a well-funded account skips reservation entirely, which
         // keeps the hot path free of write contention.
         let trusted = if is_playground {
@@ -318,13 +419,19 @@ impl BillingService {
                 .unwrap_or(false)
         };
 
-        let session =
-            BillingSession::new(key_id.to_string(), user_id.to_string(), is_playground)
-                .trusted(trusted);
+        let session = BillingSession::new(
+            key_id.to_string(),
+            funding.account().to_string(),
+            is_playground,
+        )
+        .trusted(trusted);
 
-        let dual = DualStore {
-            store,
-            key_id: key_id.to_string(),
+        let dual = match funding {
+            FundingSource::Wallet { .. } => DualStore::new(store, key_id),
+            FundingSource::Subscription {
+                user_id,
+                subscription_id,
+            } => DualStore::new(store, key_id).with_subscription(subscription_id, user_id),
         };
         let reserved = session.pre_consume(&dual, reservation).map_err(|error| {
             // Turn the unset placeholder into the real balance so the client
@@ -355,10 +462,14 @@ impl BillingService {
         charge: &Charge,
         description: &str,
         reference_id: Option<&str>,
+        funding: &FundingSource,
     ) -> Result<(), BillingError> {
-        let dual = DualStore {
-            store,
-            key_id: key_id.to_string(),
+        let dual = match funding {
+            FundingSource::Wallet { .. } => DualStore::new(store, key_id),
+            FundingSource::Subscription {
+                user_id: payer,
+                subscription_id,
+            } => DualStore::new(store, key_id).with_subscription(subscription_id, payer),
         };
         session.note_clamp(charge.clamp.clone());
         // The session owns every balance movement (it holds the reservation and
@@ -381,10 +492,14 @@ impl BillingService {
         session: &BillingSession,
         key_id: &str,
         _user_id: &str,
+        funding: &FundingSource,
     ) -> Result<(), BillingError> {
-        let dual = DualStore {
-            store,
-            key_id: key_id.to_string(),
+        let dual = match funding {
+            FundingSource::Wallet { .. } => DualStore::new(store, key_id),
+            FundingSource::Subscription {
+                user_id: payer,
+                subscription_id,
+            } => DualStore::new(store, key_id).with_subscription(subscription_id, payer),
         };
         session.refund(&dual)
     }
@@ -402,6 +517,14 @@ mod tests {
         keys: Mutex<HashMap<String, i64>>,
         wallets: Mutex<HashMap<String, i64>>,
         ledger: Mutex<Vec<(String, i64)>>,
+        /// Subscription pools: `(total, used)`. Absent means unlimited.
+        subscriptions: Mutex<HashMap<String, Pool>>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Pool {
+        total: i64,
+        used: i64,
     }
 
     impl MemStore {
@@ -416,6 +539,17 @@ mod tests {
         }
         fn key_used(&self) -> i64 {
             *self.keys.lock().get("key").unwrap_or(&0)
+        }
+        /// Give `id` a finite pool, so the subscription path has something to
+        /// draw from.
+        fn with_subscription(&self, id: &str, total: i64) -> &Self {
+            self.subscriptions
+                .lock()
+                .insert(id.to_string(), Pool { total, used: 0 });
+            self
+        }
+        fn pool_used(&self, id: &str) -> i64 {
+            self.subscriptions.lock().get(id).map(|p| p.used).unwrap_or(0)
         }
     }
 
@@ -466,6 +600,57 @@ mod tests {
         }
         fn wallet_balance(&self, user: &str) -> Result<i64, BillingError> {
             Ok(*self.wallets.lock().get(user).unwrap_or(&0))
+        }
+
+        // The in-memory store predates subscriptions; these exercise the
+        // subscription path without a database. `0` total means unlimited, so a
+        // reservation takes whatever is asked and records nothing, matching the
+        // SQLite store's semantics.
+        fn try_reserve_subscription(&self, id: &str, amount: i64) -> Result<i64, BillingError> {
+            // Must compute *and* mark the reservation, like the SQLite store:
+            // a read-only simulation would let every request think the pool is
+            // untouched.
+            let mut pools = self.subscriptions.lock();
+            match pools.get_mut(id) {
+                None => Ok(amount),
+                Some(pool) => {
+                    if pool.total <= 0 {
+                        // Unlimited: nothing recorded.
+                        return Ok(amount);
+                    }
+                    let taken = ((pool.total - pool.used).max(0)).min(amount);
+                    pool.used += taken;
+                    Ok(taken)
+                }
+            }
+        }
+        fn debit_subscription(&self, id: &str, amount: i64) -> Result<(), BillingError> {
+            let mut pools = self.subscriptions.lock();
+            if let Some(pool) = pools.get_mut(id) {
+                pool.used += amount;
+            }
+            Ok(())
+        }
+        fn credit_subscription(&self, id: &str, amount: i64) -> Result<(), BillingError> {
+            let mut pools = self.subscriptions.lock();
+            if let Some(pool) = pools.get_mut(id) {
+                pool.used = (pool.used - amount).max(0);
+            }
+            Ok(())
+        }
+        fn restore_subscription_quota(&self, id: &str, amount: i64) -> Result<i64, BillingError> {
+            let mut pools = self.subscriptions.lock();
+            match pools.get_mut(id) {
+                None => Ok(0),
+                Some(pool) => {
+                    // Bounded by what was used, matching the SQLite store: a
+                    // restore reduces `used`, so the pool's *room* is the wrong
+                    // bound (it would restore nothing from a drained pool).
+                    let restored = pool.used.max(0).min(amount);
+                    pool.used -= restored;
+                    Ok(restored)
+                }
+            }
         }
     }
 
@@ -550,11 +735,12 @@ mod tests {
     fn full_lifecycle_debits_the_wallet() {
         let service = service();
         let store = MemStore::new(1_000_000, 1_000_000);
+        let wallet = FundingSource::Wallet { user_id: "user".into() };
         let body = serde_json::json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":100});
 
         let reservation = service.reservation("Ling-1T", "default", &body, "/v1/chat/completions");
         let (session, reserved) = service
-            .begin(&store, "key", "user", false, reservation)
+            .begin(&store, "key", &wallet, false, reservation)
             .expect("begin");
         assert_eq!(reserved, reservation);
         assert!(store.wallet() < 1_000_000, "wallet must be reserved against");
@@ -566,7 +752,7 @@ mod tests {
         };
         let charge = service.charge("Ling-1T", "default", &usage, &EvalContext::default());
         service
-            .settle(&store, &session, "key", "user", &charge, "test", None)
+            .settle(&store, &session, "key", "user", &charge, "test", None, &wallet)
             .expect("settle");
 
         assert_eq!(store.wallet(), 1_000_000 - charge.quota);
@@ -576,11 +762,12 @@ mod tests {
     fn failed_request_is_refunded_in_full() {
         let service = service();
         let store = MemStore::new(1_000_000, 1_000_000);
+        let wallet = FundingSource::Wallet { user_id: "user".into() };
         let body = serde_json::json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":100});
         let reservation = service.reservation("Ling-1T", "default", &body, "/v1/chat/completions");
-        let (session, _) = service.begin(&store, "key", "user", false, reservation).unwrap();
+        let (session, _) = service.begin(&store, "key", &wallet, false, reservation).unwrap();
 
-        service.refund(&store, &session, "key", "user").unwrap();
+        service.refund(&store, &session, "key", "user", &wallet).unwrap();
         assert_eq!(store.wallet(), 1_000_000);
     }
 
@@ -588,10 +775,11 @@ mod tests {
     fn insufficient_wallet_rejects_the_request() {
         let service = service();
         let store = MemStore::new(1_000_000, 10);
+        let wallet = FundingSource::Wallet { user_id: "user".into() };
         let body = serde_json::json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1000});
         let reservation = service.reservation("Ling-1T", "default", &body, "/v1/chat/completions");
         assert!(reservation > 10);
-        assert!(service.begin(&store, "key", "user", false, reservation).is_err());
+        assert!(service.begin(&store, "key", &wallet, false, reservation).is_err());
         // The key quota must not have been consumed by the failed attempt.
         assert_eq!(store.key_used(), 1_000_000);
         assert_eq!(store.wallet(), 10);
@@ -601,8 +789,9 @@ mod tests {
     fn settlement_overrunning_the_reservation_overdraws_the_wallet() {
         let service = service();
         let store = MemStore::new(1_000_000, 1_000);
+        let wallet = FundingSource::Wallet { user_id: "user".into() };
         let reservation = 100;
-        let (session, _) = service.begin(&store, "key", "user", false, reservation).unwrap();
+        let (session, _) = service.begin(&store, "key", &wallet, false, reservation).unwrap();
 
         let usage = BillingUsage {
             prompt_tokens: 1_000_000,
@@ -612,10 +801,168 @@ mod tests {
         let charge = service.charge("Ling-1T", "default", &usage, &EvalContext::default());
         assert!(charge.quota > reservation);
         service
-            .settle(&store, &session, "key", "user", &charge, "big", None)
+            .settle(&store, &session, "key", "user", &charge, "big", None, &wallet)
             .unwrap();
         assert_eq!(store.wallet(), 1_000 - charge.quota);
         assert!(store.wallet() < 0, "wallet should absorb the debt");
+    }
+
+    #[test]
+    fn a_subscription_pool_pays_before_the_wallet() {
+        // The pool is spent first, so a user's subscription is used up before
+        // their top-up balance.
+        let service = service();
+        let store = MemStore::new(1_000_000, 1_000_000);
+        store.with_subscription("sub-1", 10_000);
+        let funding = FundingSource::Subscription {
+            user_id: "user".into(),
+            subscription_id: "sub-1".into(),
+        };
+
+        let (session, reserved) = service.begin(&store, "key", &funding, false, 1_000).unwrap();
+        assert_eq!(reserved, 1_000);
+        assert_eq!(store.pool_used("sub-1"), 1_000, "the pool should be drawn on");
+        assert_eq!(store.wallet(), 1_000_000, "the wallet must be untouched");
+
+        let charge = Charge {
+            quota: 1_000,
+            ..service.charge("Ling-1T", "default", &BillingUsage::default(), &EvalContext::default())
+        };
+        service
+            .settle(&store, &session, "key", "user", &charge, "test", None, &funding)
+            .unwrap();
+        assert_eq!(store.pool_used("sub-1"), 1_000);
+        assert_eq!(store.wallet(), 1_000_000);
+    }
+
+    #[test]
+    fn a_pool_too_small_for_the_reservation_overflows_to_the_wallet() {
+        // Partial by design: what the pool cannot cover the wallet does, rather
+        // than the request being refused or the pool being skipped entirely.
+        let service = service();
+        let store = MemStore::new(1_000_000, 1_000_000);
+        store.with_subscription("sub-1", 100);
+        let funding = FundingSource::Subscription {
+            user_id: "user".into(),
+            subscription_id: "sub-1".into(),
+        };
+
+        let (_, reserved) = service.begin(&store, "key", &funding, false, 500).unwrap();
+        assert_eq!(reserved, 500);
+        assert_eq!(store.pool_used("sub-1"), 100, "the pool gives all it has");
+        assert_eq!(
+            store.wallet(),
+            1_000_000 - 400,
+            "the wallet covers the remainder"
+        );
+    }
+
+    #[test]
+    fn refusing_a_reservation_leaves_the_pool_untouched() {
+        // The rollback path: the pool is charged first, so a wallet that cannot
+        // cover the remainder must give the pool's part back. Otherwise a refused
+        // request would still cost the user quota.
+        let service = service();
+        let store = MemStore::new(1_000_000, 50);
+        store.with_subscription("sub-1", 100);
+        let funding = FundingSource::Subscription {
+            user_id: "user".into(),
+            subscription_id: "sub-1".into(),
+        };
+
+        let result = service.begin(&store, "key", &funding, false, 500);
+        assert!(result.is_err(), "500 cannot be funded by 100 + 50");
+        assert_eq!(store.pool_used("sub-1"), 0, "the pool must be rolled back");
+        assert_eq!(store.wallet(), 50, "the wallet must be untouched");
+        assert_eq!(store.key_used(), 1_000_000, "the key must be untouched");
+    }
+
+    #[test]
+    fn a_failed_subscription_request_restores_pool_and_wallet() {
+        let service = service();
+        let store = MemStore::new(1_000_000, 1_000_000);
+        store.with_subscription("sub-1", 100);
+        let funding = FundingSource::Subscription {
+            user_id: "user".into(),
+            subscription_id: "sub-1".into(),
+        };
+
+        let (session, _) = service.begin(&store, "key", &funding, false, 500).unwrap();
+        assert_eq!(store.pool_used("sub-1"), 100);
+        assert_eq!(store.wallet(), 1_000_000 - 400);
+
+        service.refund(&store, &session, "key", "user", &funding).unwrap();
+
+        assert_eq!(store.pool_used("sub-1"), 0, "the pool must be made whole");
+        assert_eq!(store.wallet(), 1_000_000, "and so must the wallet");
+    }
+
+    #[test]
+    fn settlement_beyond_the_pool_debts_the_wallet() {
+        // A stream that overruns its reservation must land somewhere real. The
+        // pool is finite, so the excess becomes wallet debt -- the same rule the
+        // wallet already follows for a reservation overrun.
+        let service = service();
+        // A small wallet, so the overrun genuinely has to go negative rather than
+        // merely shrinking.
+        let store = MemStore::new(1_000_000, 100);
+        store.with_subscription("sub-1", 200);
+        let funding = FundingSource::Subscription {
+            user_id: "user".into(),
+            subscription_id: "sub-1".into(),
+        };
+
+        let (session, _) = service.begin(&store, "key", &funding, false, 200).unwrap();
+        let charge = Charge {
+            quota: 900,
+            ..service.charge("Ling-1T", "default", &BillingUsage::default(), &EvalContext::default())
+        };
+        service
+            .settle(&store, &session, "key", "user", &charge, "big", None, &funding)
+            .unwrap();
+
+        // The pool is already drained by the reservation, so the entire excess is
+        // the wallet's.
+        assert_eq!(store.pool_used("sub-1"), 200, "the pool gave its whole ceiling");
+        assert_eq!(store.wallet(), 100 - 700, "the wallet pays the excess");
+        assert!(
+            store.wallet() < 0,
+            "the excess is wallet debt, got {}",
+            store.wallet()
+        );
+    }
+
+    #[test]
+    fn an_unlimited_pool_never_touches_the_wallet() {
+        // `total = 0` means unlimited, matching the reference.
+        let service = service();
+        let store = MemStore::new(1_000_000, 500);
+        store.with_subscription("sub-1", 0);
+        let funding = FundingSource::Subscription {
+            user_id: "user".into(),
+            subscription_id: "sub-1".into(),
+        };
+
+        let (_, reserved) = service.begin(&store, "key", &funding, false, 100_000).unwrap();
+        assert_eq!(reserved, 100_000);
+        assert_eq!(store.pool_used("sub-1"), 0, "unlimited records no usage");
+        assert_eq!(store.wallet(), 500, "the wallet must be untouched");
+    }
+
+    #[test]
+    fn a_wallet_source_behaves_exactly_as_before() {
+        // Regression guard for the funding split: the pre-existing path must be
+        // unchanged, or every non-subscriber's billing silently shifts.
+        let service = service();
+        let store = MemStore::new(1_000_000, 1_000_000);
+        let wallet = FundingSource::Wallet { user_id: "user".into() };
+
+        let (session, reserved) = service.begin(&store, "key", &wallet, false, 1_000).unwrap();
+        assert_eq!(reserved, 1_000);
+        assert_eq!(store.wallet(), 999_000, "the wallet pays directly");
+
+        service.refund(&store, &session, "key", "user", &wallet).unwrap();
+        assert_eq!(store.wallet(), 1_000_000);
     }
 
     #[test]

@@ -74,6 +74,38 @@ impl BillingStore for SqliteBillingStore {
     fn wallet_balance(&self, user_id: &str) -> Result<i64, BillingError> {
         self.db.wallet_balance(user_id).map_err(storage)
     }
+
+    fn try_reserve_subscription(&self, id: &str, amount: i64) -> Result<i64, BillingError> {
+        self.db
+            .reserve_subscription_quota(id, amount)
+            .map_err(storage)
+    }
+
+    fn debit_subscription(&self, id: &str, amount: i64) -> Result<(), BillingError> {
+        // A settlement beyond the pool is routed to the wallet by `DualStore`
+        // before it reaches here, so this only ever records what the pool held.
+        // A rejection would mean the accounting is inconsistent, which is worth
+        // surfacing rather than clamping.
+        match self.db.adjust_subscription_quota(id, amount).map_err(storage)? {
+            Ok(()) => Ok(()),
+            Err(overage) => Err(BillingError::Storage(format!(
+                "subscription {id} over-charged by {overage}"
+            ))),
+        }
+    }
+
+    fn credit_subscription(&self, id: &str, amount: i64) -> Result<(), BillingError> {
+        self.db
+            .restore_subscription_quota(id, amount)
+            .map(|_| ())
+            .map_err(storage)
+    }
+
+    fn restore_subscription_quota(&self, id: &str, amount: i64) -> Result<i64, BillingError> {
+        self.db
+            .restore_subscription_quota(id, amount)
+            .map_err(storage)
+    }
 }
 
 #[cfg(test)]

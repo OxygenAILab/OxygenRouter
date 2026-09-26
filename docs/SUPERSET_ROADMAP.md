@@ -468,16 +468,15 @@ with all three client dialects.
 - ❌ **Providers**: Stripe, Creem, Epay, Waffo, Waffo Pancake.
 - ❌ **Webhooks**: signature verification per provider; rate-limited; idempotent credit.
 - ❌ Order locking by trade-no.
-- 🔶 **Per-plan quota pool**: implemented at the storage layer — the pool lives on
-  the subscription (`amount_total`/`amount_used`), selection follows the
-  reference's soonest-expiry-first rule, and spend/refund are atomic. **Not yet
-  wired into the billing path**: `billing_target` still funds every request from
-  the wallet, so the pool is real but unused at request time. The reference routes
-  this through a `FundingSource` abstraction (`service/funding_source.go`) that
-  chooses subscription or wallet per billing preference, falling back to the
-  wallet when `AllowWalletOverflow` is set.
-- ❌ Per-plan billing preferences (`AllowBalancePay`, `AllowWalletOverflow`), group
-  upgrade/downgrade on grant, and renewal/reset cycles (`QuotaResetPeriod`).
+- ✅ **Per-plan quota pool**: funded and wired. The pool lives on the subscription
+  (`amount_total`/`amount_used`), selection follows the reference's
+  soonest-expiry-first rule, spend/refund are atomic, and the proxy routes each
+  request through a `FundingSource` that prefers a subscription and falls back to
+  the wallet. Verified end to end with a zero-wallet user.
+- ❌ Per-plan billing preferences (`AllowBalancePay`, `AllowWalletOverflow`): we
+  always fall back to the wallet, which matches the reference's *default* but not
+  its configurable refusal. Group upgrade/downgrade on grant, and renewal/reset
+  cycles (`QuotaResetPeriod`) are also missing.
 - ❌ Per-plan purchase limits (`MaxPurchasePerUser`) and renewal/reset cycles.
 - **Compliance**: `payment_compliance` gating (dashboard-session only).
 - **Return paths**: validated redirect URLs.

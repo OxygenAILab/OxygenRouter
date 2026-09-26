@@ -68,6 +68,52 @@ pub struct QuotaSnapshot {
     pub used: i64,
 }
 
+/// One account a request may be charged against, with the bookkeeping the
+/// session needs to adjust it later.
+///
+/// The reference routes this through a `FundingSource` trait
+/// (`service/funding_source.go`) that draws from a subscription or the wallet by
+/// billing preference. A subscription is not a wallet with a different balance:
+/// its pool is finite and pool-scoped, so a request that outruns it leaves a debt
+/// the wallet must absorb rather than a negative subscription balance. Carrying
+/// the two identities explicitly is what lets [`crate::session::BillingSession`]
+/// settle that overage somewhere real.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FundingSource {
+    /// The user's wallet. May go negative on settlement, as money owed.
+    Wallet { user_id: String },
+    /// A subscription's own pool, with the wallet as its overflow.
+    ///
+    /// `subscription_id` is the pool to charge; `user_id` pays anything the pool
+    /// cannot cover.
+    Subscription {
+        user_id: String,
+        subscription_id: String,
+    },
+}
+
+impl FundingSource {
+    /// The account name a `QuotaStore` addresses for the primary charge.
+    pub fn account(&self) -> &str {
+        match self {
+            FundingSource::Wallet { user_id } => user_id,
+            // The subscription id names the pool; the store recognises it because
+            // it is neither the key account nor a known user id.
+            FundingSource::Subscription {
+                subscription_id, ..
+            } => subscription_id,
+        }
+    }
+
+    /// The wallet that absorbs overflow, if this source has one.
+    pub fn overflow_user(&self) -> Option<&str> {
+        match self {
+            FundingSource::Wallet { .. } => None,
+            FundingSource::Subscription { user_id, .. } => Some(user_id),
+        }
+    }
+}
+
 /// One request's billing lifecycle.
 pub struct BillingSession {
     token_account: String,

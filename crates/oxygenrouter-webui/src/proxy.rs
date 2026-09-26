@@ -749,14 +749,47 @@ async fn dispatch(
             let amount = state
                 .billing
                 .reservation(&model, group, &body, path);
+            // Prefer a subscription's pool when one can fund this request, and
+            // fall back to the wallet otherwise. The reference makes the same
+            // choice through its `FundingSource` abstraction
+            // (`service/funding_source.go`); a subscription's quota is only
+            // spendable while it is active, which the lookup enforces.
+            let funding = match state
+                .db
+                .subscription_funding_source(&user_id, amount)
+            {
+                Ok(Some(subscription)) => {
+                    oxygenrouter_billing::FundingSource::Subscription {
+                        user_id: user_id.clone(),
+                        subscription_id: subscription.id,
+                    }
+                }
+                // No usable pool: the wallet pays, as it always has.
+                Ok(None) => oxygenrouter_billing::FundingSource::Wallet {
+                    user_id: user_id.clone(),
+                },
+                Err(error) => {
+                    // A lookup failure must not silently change who pays, but it
+                    // also must not block the request: fall back to the wallet,
+                    // which is the pre-existing behaviour.
+                    eprintln!(
+                        "[OxygenRouter] subscription lookup failed for user {user_id} ({error}); billing the wallet"
+                    );
+                    oxygenrouter_billing::FundingSource::Wallet {
+                        user_id: user_id.clone(),
+                    }
+                }
+            };
             match state.billing.begin(
                 state.billing_store.as_ref(),
                 &key_id,
-                &user_id,
+                &funding,
                 false,
                 amount,
             ) {
-                Ok((session, reserved)) => Some((session, reserved, key_id, user_id, group.to_string())),
+                Ok((session, reserved)) => {
+                    Some((session, reserved, key_id, user_id, group.to_string(), funding))
+                }
                 Err(error) => {
                     // A refused reservation is the client's condition, not a
                     // server fault. NewAPI answers insufficient quota with
@@ -808,7 +841,7 @@ async fn dispatch(
             // Settle at what the upstream actually reported. An upstream that
             // reports nothing is billed on the reservation estimate, matching
             // NewAPI's "keep the estimate" behaviour rather than charging zero.
-            if let Some((session, reserved, key_id, user_id, group)) = &reservation {
+            if let Some((session, reserved, key_id, user_id, group, funding)) = &reservation {
                 let usage = billing_usage_from(&r.usage, &model, path);
                 let ctx = EvalContext::default();
                 let charge = state.billing.charge(&model, group, &usage, &ctx);
@@ -835,6 +868,7 @@ async fn dispatch(
                     &charge,
                     &description,
                     None,
+                    funding,
                 ) {
                     eprintln!("[OxygenRouter] billing settle failed: {error}");
                 }
@@ -872,11 +906,11 @@ async fn dispatch(
         Err(e) => {
             let status = e.status();
             // A failed request must cost nothing: return the reservation.
-            if let Some((session, _reserved, key_id, user_id, _group)) = &reservation {
+            if let Some((session, _reserved, key_id, user_id, _group, funding)) = &reservation {
                 if let Err(error) =
                     state
                         .billing
-                        .refund(state.billing_store.as_ref(), session, key_id, user_id)
+                        .refund(state.billing_store.as_ref(), session, key_id, user_id, funding)
                 {
                     eprintln!("[OxygenRouter] billing refund failed: {error}");
                 }

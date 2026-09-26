@@ -2580,28 +2580,121 @@ impl Database {
         }))
     }
 
-    /// Consume `amount` from a subscription's pool.
+    /// Reserve up to `amount` of a subscription's pool, returning how much was
+    /// actually taken.
     ///
-    /// The guard is in the `WHERE` clause, so a concurrent request cannot drive
-    /// `amount_used` past `amount_total`: the same atomic-reserve pattern as the
-    /// wallet. Returns whether the consumption happened.
+    /// **Partial by design.** The reference refuses a reservation the pool cannot
+    /// cover and moves on (`model/subscription.go:1354-1358`); taking what is there
+    /// and letting the wallet cover the rest is strictly more useful, and it is
+    /// what lets a nearly-drained plan still pay for a small request instead of
+    /// being skipped while its remaining quota is stranded until expiry.
     ///
-    /// An unlimited pool (`amount_total = 0`) succeeds but records nothing,
-    /// matching the reference, which only accumulates `AmountUsed` when a total is
-    /// set. Both cases are expressed in one statement so there is a single
-    /// definition of "may this spend proceed": with an unlimited pool the guard
-    /// passes and the counter is left alone, so `amount_used` stays at 0 rather
-    /// than climbing against a total that does not exist.
-    pub fn consume_subscription_quota(&self, id: &str, amount: i64) -> SqliteResult<bool> {
+    /// The `SELECT` and the `UPDATE` run under one connection lock, so nothing can
+    /// interleave between reading the balance and writing it. That is the same
+    /// atomicity the wallet's conditional `UPDATE` provides, expressed as a
+    /// read-modify-write because the amount taken depends on the balance — and it
+    /// is sound here because this process is the only writer to the database.
+    ///
+    /// An unlimited pool (`amount_total = 0`) takes the full amount and records
+    /// nothing, matching the reference, which only accumulates `AmountUsed` when a
+    /// total exists.
+    pub fn reserve_subscription_quota(&self, id: &str, amount: i64) -> SqliteResult<i64> {
         if amount <= 0 {
-            return Ok(true);
+            return Ok(0);
         }
-        Ok(self.conn.lock().execute(
-            "UPDATE subscriptions
-                SET amount_used = CASE WHEN amount_total > 0 THEN amount_used + ?2 ELSE amount_used END
-              WHERE id = ?1 AND (amount_total = 0 OR amount_used + ?2 <= amount_total)",
-            params![id, amount],
-        )? > 0)
+        let conn = self.conn.lock();
+        let (total, used): (i64, i64) = conn.query_row(
+            "SELECT amount_total, amount_used FROM subscriptions WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if total <= 0 {
+            // Unlimited: nothing to record.
+            return Ok(amount);
+        }
+        let remaining = (total - used).max(0);
+        let consumed = remaining.min(amount);
+        if consumed == 0 {
+            return Ok(0);
+        }
+        conn.execute(
+            "UPDATE subscriptions SET amount_used = amount_used + ?2 WHERE id = ?1",
+            params![id, consumed],
+        )?;
+        Ok(consumed)
+    }
+
+    /// Adjust a subscription's usage by `delta` (positive consumes, negative
+    /// refunds), mirroring the reference's `PostConsumeUserSubscriptionDelta`.
+    ///
+    /// Returns `Ok(None)` when the adjustment was applied. When `delta` is
+    /// positive and the result would exceed a finite pool, returns the overage
+    /// instead of applying anything: the reference raises
+    /// (`model/subscription.go:1524-1527`) rather than silently clamping, so a
+    /// caller that over-charges a plan learns about it rather than quietly
+    /// under-billing.
+    ///
+    /// A negative delta is clamped at zero so a double refund cannot manufacture
+    /// quota.
+    pub fn adjust_subscription_quota(
+        &self,
+        id: &str,
+        delta: i64,
+    ) -> SqliteResult<Result<(), i64>> {
+        if delta == 0 {
+            return Ok(Ok(()));
+        }
+        let conn = self.conn.lock();
+        let (total, used): (i64, i64) = conn.query_row(
+            "SELECT amount_total, amount_used FROM subscriptions WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let new_used = (used + delta).max(0);
+        if total > 0 && new_used > total {
+            return Ok(Err(new_used - total));
+        }
+        conn.execute(
+            "UPDATE subscriptions SET amount_used = ?2 WHERE id = ?1",
+            params![id, new_used],
+        )?;
+        Ok(Ok(()))
+    }
+
+    /// Return up to `amount` to a subscription's pool, reporting how much fitted.
+    ///
+    /// Clamped at the pool's ceiling (and at zero on the way down), so a double
+    /// refund cannot manufacture quota. The return value matters: a refund larger
+    /// than the pool can hold must put the remainder back in the wallet, which is
+    /// where that part was charged.
+    pub fn restore_subscription_quota(&self, id: &str, amount: i64) -> SqliteResult<i64> {
+        if amount <= 0 {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let (total, used): (i64, i64) = conn.query_row(
+            "SELECT amount_total, amount_used FROM subscriptions WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if total <= 0 {
+            // Unlimited pools record nothing, so a refund has nothing to restore
+            // and the whole amount belongs back in the wallet.
+            return Ok(0);
+        }
+        // Bound the restore by what was actually consumed, not by the pool's
+        // remaining room: giving quota back *reduces* `amount_used`, so the most
+        // that can be restored is the usage itself. Bounding by `total - used`
+        // would return nothing from a fully-drawn pool (the case that matters)
+        // and drive `amount_used` negative on an untouched one.
+        let restored = used.max(0).min(amount);
+        if restored > 0 {
+            conn.execute(
+                "UPDATE subscriptions SET amount_used = amount_used - ?2 WHERE id = ?1",
+                params![id, restored],
+            )?;
+        }
+        Ok(restored)
     }
 
     /// Return quota to a subscription's pool after a failed request.

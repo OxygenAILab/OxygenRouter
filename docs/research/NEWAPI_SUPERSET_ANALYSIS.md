@@ -331,7 +331,7 @@ Legend: **M** = missing entirely · **P** = partial · **S** = stub · **✓** =
 | Auth: sessions/access tokens/passkey/2FA/email/RBAC | full | password + sessions + access tokens + TOTP 2FA with login gating and recovery codes | **P** (missing: passkey, email verification, RBAC, step-up proofs, lockout) |
 | OAuth providers | GitHub/Discord/OIDC/LinuxDO/Telegram/WeChat/custom | none | **M** |
 | Payments | 5 providers + webhooks | manual order only | **M** |
-| Subscriptions | full (plans/orders/pre-consume) | plans, purchase, admin lifecycle; **no quota grant from a plan** | **P** |
+| Subscriptions | full (plans/orders/pre-consume) | plans, purchase, admin lifecycle, and a per-plan quota pool that funds requests via a `FundingSource` choice | **P** (missing: payment gateways, per-plan billing preferences, renewals) |
 | Async tasks + artifacts | full | none | **M** |
 | JS plugin runtime + marketplace | full (sobek) | none | **M** |
 | Image / audio endpoints | ✓ | pass-through | P |

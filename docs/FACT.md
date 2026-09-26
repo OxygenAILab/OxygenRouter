@@ -335,6 +335,48 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription admin lifecycle (2026-09-26)
 
+### Subscription quota funds requests (2026-09-26)
+
+The pool is now wired into the billing path, which was the gap the previous entry
+recorded. A request is funded by a subscription when one can cover the
+reservation, otherwise by the wallet.
+
+`FundingSource` (`crates/oxygenrouter-billing/src/session.rs`) names the payer:
+`Wallet { user_id }` or `Subscription { user_id, subscription_id }`. The proxy
+asks `subscription_funding_source` for a usable pool and passes the choice through
+`begin` / `settle` / `refund`. `DualStore` then splits a subscription account's
+charge: the pool takes what it can, the wallet covers the rest and absorbs any
+settlement overrun. That mirrors the reference's `service/funding_source.go`,
+where a funding source is an abstraction rather than a wallet with a different
+balance.
+
+**The end-to-end proof**, which is the whole claim: a user with a **zero wallet**
+is refused with `403 insufficient balance: need 99, available 0`; granting them a
+plan makes the identical request return `200` with content, and the subscription
+records `amount_used = 27` while the wallet stays at `0`. Invalidating the plan
+returns the request to `403`.
+
+Behaviour, each pinned by a test:
+
+- **Partial reservation.** A pool smaller than the charge is drained and the
+  wallet covers the remainder. The reference skips a pool it cannot fully cover
+  (`model/subscription.go:1354-1358`); taking what is there is strictly more
+  useful, because a nearly-drained plan still pays for small requests instead of
+  stranding its remaining quota until expiry.
+- **A refused reservation rolls the pool back**, so an unfundable request costs
+  nothing on either account.
+- **Settlement beyond the pool becomes wallet debt**, not a negative subscription
+  balance — the same rule the wallet already follows for an overrun.
+- **An unlimited pool** funds any amount and records no usage.
+- **The wallet-only path is unchanged**, asserted so no existing deployment's
+  billing shifts.
+
+**A bug the tests caught, twice.** `restore_subscription_quota` first bounded the
+refund by the pool's *remaining room* rather than by what had been used, so a
+drained pool — the case that matters — restored nothing, and an untouched pool
+would have been driven negative. The same mistake was duplicated in the billing
+test double; fixing the test double is what made the store bug visible.
+
 ### Subscription quota pool (2026-09-26)
 
 A subscription now carries a real spendable pool: `subscriptions.amount_total`

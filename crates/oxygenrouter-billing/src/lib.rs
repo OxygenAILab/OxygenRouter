@@ -40,7 +40,7 @@ pub use quota_math::{
     quota_round, quota_round_checked, wallet_quota_from_decimal, QuotaClamp, QuotaClampKind,
     MAX_QUOTA, MAX_WALLET_QUOTA, MIN_QUOTA,
 };
-pub use session::{BillingError, BillingSession, BillingState};
+pub use session::{BillingError, BillingSession, BillingState, FundingSource};
 pub use service::{
     BillingPath, BillingPolicy, BillingService, BillingStore, Charge,
 };

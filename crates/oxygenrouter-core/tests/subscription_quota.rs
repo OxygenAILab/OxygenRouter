@@ -90,7 +90,8 @@ fn spending_reduces_the_pool() {
     plan(&f.db, "p1", 1_000, 30);
     let sub = f.db.grant_subscription(&f.alice.id, "p1").unwrap();
 
-    assert!(f.db.consume_subscription_quota(&sub.id, 400).unwrap());
+    // The return value is how much the pool actually took.
+    assert_eq!(f.db.reserve_subscription_quota(&sub.id, 400).unwrap(), 400);
     let listed = f.db.list_subscriptions(&f.alice.id).unwrap();
     assert_eq!(listed[0].amount_used, 400);
     assert_eq!(listed[0].remaining(), Some(600));
@@ -104,10 +105,11 @@ fn spending_cannot_exceed_the_pool() {
     plan(&f.db, "p1", 1_000, 30);
     let sub = f.db.grant_subscription(&f.alice.id, "p1").unwrap();
 
-    assert!(f.db.consume_subscription_quota(&sub.id, 1_000).unwrap());
-    assert!(
-        !f.db.consume_subscription_quota(&sub.id, 1).unwrap(),
-        "an exhausted pool must refuse further spend"
+    assert_eq!(f.db.reserve_subscription_quota(&sub.id, 1_000).unwrap(), 1_000);
+    assert_eq!(
+        f.db.reserve_subscription_quota(&sub.id, 1).unwrap(),
+        0,
+        "an exhausted pool must take nothing"
     );
     assert_eq!(
         f.db.list_subscriptions(&f.alice.id).unwrap()[0].amount_used,
@@ -123,7 +125,11 @@ fn an_unlimited_pool_records_no_usage() {
     plan(&f.db, "unlimited", 0, 30);
     let sub = f.db.grant_subscription(&f.alice.id, "unlimited").unwrap();
 
-    assert!(f.db.consume_subscription_quota(&sub.id, 5_000).unwrap());
+    assert_eq!(
+        f.db.reserve_subscription_quota(&sub.id, 5_000).unwrap(),
+        5_000,
+        "an unlimited pool takes the full amount"
+    );
     let listed = f.db.list_subscriptions(&f.alice.id).unwrap();
     assert_eq!(listed[0].amount_used, 0);
 }
@@ -170,7 +176,7 @@ fn an_exhausted_pool_is_skipped_in_favour_of_one_that_can_pay() {
     plan(&f.db, "backup", 1_000, 365);
     let drained = f.db.grant_subscription(&f.alice.id, "drained").unwrap();
     f.db.grant_subscription(&f.alice.id, "backup").unwrap();
-    f.db.consume_subscription_quota(&drained.id, 100).unwrap();
+    assert_eq!(f.db.reserve_subscription_quota(&drained.id, 100).unwrap(), 100);
 
     let chosen = f
         .db
@@ -222,7 +228,7 @@ fn a_refund_returns_quota_and_cannot_go_negative() {
     let f = setup();
     plan(&f.db, "p1", 1_000, 30);
     let sub = f.db.grant_subscription(&f.alice.id, "p1").unwrap();
-    f.db.consume_subscription_quota(&sub.id, 300).unwrap();
+    assert_eq!(f.db.reserve_subscription_quota(&sub.id, 300).unwrap(), 300);
 
     f.db.refund_subscription_quota(&sub.id, 300).unwrap();
     assert_eq!(
@@ -244,7 +250,7 @@ fn a_refund_restores_a_pool_that_had_been_exhausted() {
     let f = setup();
     plan(&f.db, "p1", 100, 30);
     let sub = f.db.grant_subscription(&f.alice.id, "p1").unwrap();
-    f.db.consume_subscription_quota(&sub.id, 100).unwrap();
+    assert_eq!(f.db.reserve_subscription_quota(&sub.id, 100).unwrap(), 100);
     assert!(f.db.subscription_funding_source(&f.alice.id, 100).unwrap().is_none());
 
     f.db.refund_subscription_quota(&sub.id, 100).unwrap();
@@ -260,7 +266,11 @@ fn a_zero_amount_spend_needs_no_pool() {
     plan(&f.db, "p1", 100, 30);
     let sub = f.db.grant_subscription(&f.alice.id, "p1").unwrap();
 
-    assert!(f.db.consume_subscription_quota(&sub.id, 0).unwrap());
+    assert_eq!(
+        f.db.reserve_subscription_quota(&sub.id, 0).unwrap(),
+        0,
+        "a zero amount takes nothing"
+    );
     assert_eq!(
         f.db.list_subscriptions(&f.alice.id).unwrap()[0].amount_used,
         0
@@ -276,7 +286,7 @@ fn each_subscription_keeps_its_own_pool() {
     let a = f.db.grant_subscription(&f.alice.id, "a").unwrap();
     f.db.grant_subscription(&f.alice.id, "b").unwrap();
 
-    f.db.consume_subscription_quota(&a.id, 250).unwrap();
+    assert_eq!(f.db.reserve_subscription_quota(&a.id, 250).unwrap(), 250);
 
     let listed = f.db.list_subscriptions(&f.alice.id).unwrap();
     let a_row = listed.iter().find(|s| s.plan_id == "a").unwrap();
