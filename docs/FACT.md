@@ -337,6 +337,41 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription quota funds requests (2026-09-26)
 
+### API keys are masked, not listed (fixed 2026-09-27) — **was high**
+
+`GET /api/keys` and `GET /api/keys/query` returned every key's real value. The
+console masked it for *display*, which made the leak easy to miss — the raw value
+was still in the response body, so a browser cache, a proxy log or a screenshot
+held a working credential. Verified live before the fix.
+
+The reference masks in **both** its list and its search
+(`controller/token.go:140,157`) through `model.MaskTokenKey`, so the mask here is
+ported branch for branch:
+
+| Key length | Shown |
+|---|---|
+| 0 | empty |
+| ≤ 4 | all `*` |
+| ≤ 8 | `ab****yz` |
+| > 8 | `abcd**********wxyz` |
+
+`GET /api/keys/:id/secret` is the single deliberate disclosure route, mirroring
+the reference's separate credential route (`controller.GetTokenKey`). It is
+owner-or-admin gated. A masked list plus one explicit route replaces an unmasked
+list: the disclosure is requested on purpose, appears in logs under its own path,
+and never rides along in a bulk response. The console's copy buttons now use it.
+
+**A related round-trip footgun, fixed alongside.** `PUT /api/options` wrote its
+value blindly, so a client that read the masked option list and saved it back
+would replace a real secret with the mask — the same shape of bug that destroyed
+channel credentials. A value ending in the preview ellipsis is now treated as
+unchanged; setting a genuine value still works. Verified live on a stored secret:
+saving the preview returns `unchanged`, and a new value still applies.
+
+Also found in this sweep and **not** a defect: `get_options` already masks its
+`secret` entries, and `settings` / `system/info` expose `local_api_token` only to
+the root class, which is the owner.
+
 ### Channel credentials are not disclosed (fixed 2026-09-26) — **was high**
 
 Three related leaks, all verified live before the fix:

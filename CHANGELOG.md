@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (security — API keys and secret options) — **high**
+- **`GET /api/keys` and `GET /api/keys/query` returned every key's real value.**
+  The reference masks in *both* (`controller/token.go:140,157`, via
+  `model.MaskTokenKey`), and the console's own display masking was cosmetic — the
+  raw value was still in the response body, so a browser cache, a proxy log or a
+  screenshot held a working credential. Both routes now return the reference's
+  mask (`abcd**********wxyz`, `ab****yz`, `****`), ported branch for branch
+  including its short-key cases. Verified live before the fix that the raw key was
+  present.
+- Added `GET /api/keys/:id/secret` as the one deliberate disclosure route,
+  mirroring the reference's separate credential route. It is owner-or-admin
+  gated, so a masked list plus this route replaces an unmasked list, and the
+  disclosure is explicit, separately logged, and never a side effect of a bulk
+  read. The console's copy buttons now use it.
+- **A secret option could be overwritten by its own preview.**
+  `PUT /api/options` wrote the value blindly, so a client that read the masked
+  list and saved it back would replace the real secret with the mask — the same
+  round-trip footgun that destroyed channel credentials. A value ending in the
+  preview ellipsis is now treated as unchanged, and a genuine value still saves.
+
+### Verified (security — API keys and secret options)
+- Live: a created key is returned in full once (creation is when the caller needs
+  it); the list and the search both mask it with the reference's format and hide
+  the interior; `GET /api/keys/:id/secret` returns it to the owner, refuses
+  another user ("not your key"), and refuses an anonymous caller (`401`).
+- Live: on a stored secret, saving the preview that `GET /api/options` returned is
+  reported as `unchanged` and leaves the real value intact, while setting a
+  genuinely new value still applies.
+- Five unit tests cover the masking algorithm (all four length branches), that a
+  realistic key's interior is hidden, that multi-byte input cannot panic a byte
+  slice, that other fields survive masking, and that a preview is recognised as a
+  no-change signal.
+- `cargo test --workspace` → **432 passed / 0 failed**, zero warnings. `npm run
+  build` succeeds; `tsc --noEmit` is clean.
+
 ### Fixed (security — channel credentials) — **high**
 - **`GET /api/channels` returned each channel's raw upstream API key**, and so did
   `GET /api/channels/:id` and the response to `POST /api/channels/:id/keys`. The

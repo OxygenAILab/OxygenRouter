@@ -187,9 +187,17 @@ export default function KeysPage() {
       render: (k) => (
         <div className="flex items-center gap-1.5 font-mono text-xs">
           <span className="truncate" style={{ maxWidth: 150 }}>
-            {k.key.slice(0, 7)}{"•".repeat(Math.max(0, Math.min(k.key.length - 10, 12)))}
+            {k.key}
           </span>
-          <button className="icon-button" title={t.keys.copyKey} onClick={() => navigator.clipboard?.writeText(k.key)}>
+          <button
+            className="icon-button"
+            title={t.keys.copyKey}
+            onClick={async () => {
+              // The list is masked, so the real value is fetched on demand.
+              const full = await api.keys.reveal(k.id);
+              navigator.clipboard?.writeText(full.key);
+            }}
+          >
             <Copy size={13} />
           </button>
         </div>
@@ -268,7 +276,15 @@ export default function KeysPage() {
               </button>
             )}
             items={[
-              { id: "copy", label: t.keys.copyKey, icon: Copy, onSelect: () => navigator.clipboard?.writeText(k.key) },
+              {
+                id: "copy",
+                label: t.keys.copyKey,
+                icon: Copy,
+                onSelect: async () => {
+                  const full = await api.keys.reveal(k.id);
+                  navigator.clipboard?.writeText(full.key);
+                },
+              },
               { id: "del", label: t.keys.delete, icon: Trash2, danger: true, onSelect: () => { if (confirm(t.keys.deleteConfirm(k.name))) deleteMutation.mutate(k.id); } },
             ]}
           />

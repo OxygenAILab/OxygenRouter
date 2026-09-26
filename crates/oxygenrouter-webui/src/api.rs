@@ -53,6 +53,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/keys", get(list_keys))
         .route("/api/keys", post(create_key))
         .route("/api/keys/:id", delete(delete_key))
+        // The deliberate disclosure route; see `reveal_key`.
+        .route("/api/keys/:id/secret", get(reveal_key))
         .route("/api/keys/usage", get(keys_usage))
         .route("/api/keys/query", get(query_keys))
         .route("/api/model-maps", get(list_model_maps))
@@ -2275,6 +2277,47 @@ async fn log_stats(
 
 // ── API Keys ───────────────────────────────────────────────────────────────
 
+/// How much of an API key a read may disclose.
+///
+/// Ports the reference's `MaskTokenKey` (`model/token.go:63`) exactly, including
+/// the short-key branches: it reveals nothing for a key of four characters or
+/// fewer, two characters at each end up to eight, and four at each end beyond
+/// that. Listing a token's real value would make every console read — a browser
+/// cache, a proxy log, a screenshot — a credential disclosure, and the reference
+/// masks in *both* its list and its search for that reason
+/// (`controller/token.go:140,157`).
+///
+/// The full value stays available from `create_key`, which is the one moment a
+/// caller legitimately needs it.
+pub fn mask_api_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let len = chars.len();
+    if key.is_empty() {
+        return String::new();
+    }
+    if len <= 4 {
+        return "*".repeat(len);
+    }
+    if len <= 8 {
+        let head: String = chars[..2].iter().collect();
+        let tail: String = chars[len - 2..].iter().collect();
+        return format!("{head}****{tail}");
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[len - 4..].iter().collect();
+    format!("{head}**********{tail}")
+}
+
+/// Mask the value of every API key in a list, for read responses.
+fn masked_keys(keys: Vec<ApiKey>) -> Vec<ApiKey> {
+    keys.into_iter()
+        .map(|mut key| {
+            key.key = mask_api_key(&key.key);
+            key
+        })
+        .collect()
+}
+
 /// A user sees only their own keys; an admin sees every key.
 ///
 /// Returning the whole table to any signed-in caller would expose other users'
@@ -2290,13 +2333,13 @@ async fn list_keys(
     Json(match s.db.list_api_keys() {
         Ok(keys) => {
             if user.role.is_admin() {
-                ApiResponse::ok(keys)
+                ApiResponse::ok(masked_keys(keys))
             } else {
-                ApiResponse::ok(
+                ApiResponse::ok(masked_keys(
                     keys.into_iter()
                         .filter(|k| k.user_id == user.id)
                         .collect(),
-                )
+                ))
             }
         }
         Err(e) => ApiResponse::err(e.to_string()),
@@ -2368,6 +2411,38 @@ async fn delete_key(
     })
 }
 
+/// `GET /api/keys/:id/secret` — the one route that returns a key's real value.
+///
+/// Listing is masked so a console read cannot leak credentials; this is the
+/// deliberate exception, mirroring the reference's separate credential route
+/// (`controller.GetTokenKey`, gated on the owner). Keeping it distinct means the
+/// disclosure is requested explicitly, appears in logs under its own path, and
+/// never rides along in a bulk response.
+async fn reveal_key(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(_) => return Json(ApiResponse::err("authentication required")),
+    };
+    match s.db.get_api_key(&id) {
+        Ok(Some(key)) => {
+            // Owner or admin only: someone else's key is not readable even by id.
+            if key.user_id != user.id && !user.role.is_admin() {
+                return Json(ApiResponse::err("not your key"));
+            }
+            Json(ApiResponse::ok(serde_json::json!({
+                "id": key.id,
+                "key": key.key,
+            })))
+        }
+        Ok(None) => Json(ApiResponse::err("key not found")),
+        Err(e) => Json(ApiResponse::err(e.to_string())),
+    }
+}
+
 async fn keys_usage(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2414,12 +2489,33 @@ struct KeysQuery {
 
 async fn query_keys(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<KeysQuery>,
 ) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return Json(ApiResponse::<Vec<ApiKey>>::err(error_message(response))).into_response(),
+    };
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(20).clamp(1, 200);
     match s.db.list_api_keys_paged(page, page_size, q.search.as_deref()) {
-        Ok((items, total)) => Json(PaginatedResponse::new(items, total, page, page_size)).into_response(),
+        Ok((items, total)) => {
+            // Same rule as the list: a search must not be a way to read a key.
+            // Restricted to the caller's own keys unless they are an admin, so a
+            // search cannot enumerate other users' tokens either.
+            let visible: Vec<ApiKey> = if user.role.is_admin() {
+                items
+            } else {
+                items.into_iter().filter(|k| k.user_id == user.id).collect()
+            };
+            let total = if user.role.is_admin() {
+                total
+            } else {
+                visible.len() as i64
+            };
+            Json(PaginatedResponse::new(masked_keys(visible), total, page, page_size))
+                .into_response()
+        }
         Err(error) => db_error::<Vec<ApiKey>>(error),
     }
 }
@@ -2786,6 +2882,13 @@ async fn update_option(
     };
     if let Err(error) = oxygenrouter_core::validate_option(schema.kind, &input.value) {
         return Json(ApiResponse::err(error));
+    }
+    // A secret that reads as a mask is not a new value. Without this, a client
+    // that renders the whole option list and saves it back would overwrite the
+    // real secret with its own preview — the same round-trip footgun that
+    // destroyed channel credentials. Setting a genuine value still works.
+    if schema.secret && input.value.ends_with('\u{2026}') {
+        return Json(ApiResponse::ok("unchanged"));
     }
     Json(match s.db.set_setting(schema.key, &input.value) {
         Ok(()) => ApiResponse::ok("updated"),
@@ -3191,5 +3294,93 @@ mod credential_tests {
     fn a_blank_key_produces_an_empty_preview() {
         assert_eq!(key_preview(""), "");
         assert_eq!(key_preview("   "), "");
+    }
+}
+
+
+#[cfg(test)]
+mod key_masking_tests {
+    use super::*;
+
+    /// The reference's `MaskTokenKey` (`model/token.go:63`) branch by branch.
+    /// Listing a live token would make every console read a credential
+    /// disclosure, and the reference masks in both its list and its search
+    /// (`controller/token.go:140,157`).
+    #[test]
+    fn masking_matches_the_reference_algorithm() {
+        assert_eq!(mask_api_key(""), "");
+        // <= 4: nothing is revealed, not even the length in characters.
+        assert_eq!(mask_api_key("ab"), "**");
+        assert_eq!(mask_api_key("abcd"), "****");
+        // <= 8: two at each end.
+        assert_eq!(mask_api_key("abcde"), "ab****de");
+        assert_eq!(mask_api_key("abcdefgh"), "ab****gh");
+        // > 8: four at each end.
+        assert_eq!(mask_api_key("abcdefghi"), "abcd**********fghi");
+        assert_eq!(
+            mask_api_key("sk-abcdefghijklmnop"),
+            "sk-a**********mnop"
+        );
+    }
+
+    #[test]
+    fn masking_never_reveals_the_interior() {
+        // A realistic token: the middle carries the entropy.
+        let key = "sk-1234567890abcdefghijklmnopqrstuvwxyz";
+        let masked = mask_api_key(key);
+        assert!(!masked.contains(&key[6..key.len() - 6]), "interior leaked: {masked}");
+        assert!(masked.starts_with("sk-1"), "{masked}");
+        assert!(masked.ends_with("wxyz"), "{masked}");
+    }
+
+    #[test]
+    fn masking_handles_multibyte_input_without_panicking() {
+        // `key[..4]` byte-slicing would panic on a multi-byte character; the
+        // implementation counts characters instead.
+        let masked = mask_api_key("密钥一abcdefghijklmnop密钥二");
+        assert!(!masked.is_empty());
+        assert!(masked.contains("****"), "{masked}");
+    }
+
+    #[test]
+    fn a_masked_list_keeps_every_other_field() {
+        use oxygenrouter_core::ApiKey;
+        let key = ApiKey {
+            id: "k1".into(),
+            key: "sk-abcdefghijklmnop".into(),
+            name: "prod".into(),
+            priority: 3,
+            user_id: "u1".into(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+            quota_micros: 1000,
+            used_micros: 10,
+            allowed_models: vec!["gpt-4o".into()],
+            ip_allowlist: vec![],
+            group_name: "default".into(),
+            cross_group_retry: true,
+        };
+        let masked = masked_keys(vec![key]);
+        assert_eq!(masked[0].key, "sk-a**********mnop");
+        // The record must stay usable: name, quota and limits are intact.
+        assert_eq!(masked[0].name, "prod");
+        assert_eq!(masked[0].quota_micros, 1000);
+        assert_eq!(masked[0].used_micros, 10);
+        assert_eq!(masked[0].allowed_models, vec!["gpt-4o".to_string()]);
+        assert_eq!(masked[0].priority, 3);
+    }
+
+    /// Regression: a client that saves the option list back would otherwise
+    /// overwrite a real secret with the preview we handed it — the same
+    /// round-trip footgun that destroyed channel credentials.
+    #[test]
+    fn a_masked_secret_is_recognised_as_unchanged() {
+        // What `get_options` returns for a set secret.
+        let preview = format!("{}…", &"sk-live-token-value"[..6]);
+        assert!(preview.ends_with('\u{2026}'), "{preview}");
+        // A genuine value is not mistaken for one.
+        assert!(!("sk-a-brand-new-token").ends_with('\u{2026}'));
+        assert!(!("".to_string()).ends_with('\u{2026}'));
     }
 }

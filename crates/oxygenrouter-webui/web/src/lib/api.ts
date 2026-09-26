@@ -436,6 +436,8 @@ export const api = {
     list: () => apiFetch<ApiKey[]>('/keys'),
     create: (k: Partial<ApiKey>) => apiFetch<ApiKey>('/keys', { method: 'POST', body: JSON.stringify(k) }),
     delete: (id: string) => apiFetch<string>(`/keys/${id}`, { method: 'DELETE' }),
+    // The list is masked, so a copy of the real value is requested explicitly.
+    reveal: (id: string) => apiFetch<{ id: string; key: string }>(`/keys/${id}/secret`),
     usage: () => apiFetch<ApiKeyUsage[]>('/keys/usage'),
     query: (params: { page?: number; pageSize?: number; search?: string } = {}) => {
       const qs = new URLSearchParams();
