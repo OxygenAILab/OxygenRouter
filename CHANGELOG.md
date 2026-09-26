@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P5 — two-factor authentication)
+- **TOTP 2FA wired to HTTP**: `/api/user/2fa/{status,setup,enable,disable,backup_codes}`,
+  matching the reference's paths (`router/api-router.go:129-133`), plus login
+  gating and recovery codes.
+
+### Verified (P5 — two-factor authentication)
+- **A correct password no longer yields a session when 2FA is on.** Login accepts
+  an optional `code`; without a valid TOTP or recovery code no `session_token` is
+  issued. A second factor that still handed out a session would be decorative, so
+  the live check asserts the token is absent, not merely that the status is `401`.
+- Verified against an **independent from-spec TOTP implementation**, not just our
+  own: password-only login refused after activation, password + wrong code
+  refused, password + an externally generated code accepted, a recovery code
+  accepted then rejected on replay, and disable refused with a wrong code.
+- **Setup stages; enable activates.** A mis-scanned or discarded QR code cannot
+  lock an account out, because the secret only takes effect once a valid code
+  proves the operator can generate one.
+- **Recovery codes are stored as salted Argon2 digests**, never in the clear, and
+  each is consumed on use. A test reads the raw database column and asserts the
+  plaintext is absent.
+- Disable requires the second factor (it is what an attacker with a stolen
+  session would want), and clears the secret and codes so a later re-enable
+  cannot silently reuse a revoked value.
+- **A real bug the tests caught:** the first implementation compared backup codes
+  by hashing the candidate and comparing digest strings. That cannot work —
+  Argon2 embeds a random salt, so two hashes of the same code differ and every
+  recovery code would have been rejected. Verification now parses the stored PHC
+  string and calls `verify_password`.
+- `cargo test --workspace` → **362 passed / 0 failed**, zero warnings.
+
 ### Added (P5 — TOTP primitive)
 - **RFC 6238 TOTP** in `crates/oxygenrouter-core/src/totp.rs`, with the parameters
   the reference uses: HMAC-SHA1, 30-second period, six digits. Built against the

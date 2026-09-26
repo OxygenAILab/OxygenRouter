@@ -91,6 +91,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/user/token", post(generate_access_token))
         .route("/api/user/token", delete(revoke_access_token))
         .route("/api/user/token/status", get(access_token_status))
+        // Two-factor, matching the reference's `/api/user/2fa/*`
+        // (router/api-router.go:129-133).
+        .route("/api/user/2fa/status", get(two_fa_status))
+        .route("/api/user/2fa/setup", post(two_fa_setup))
+        .route("/api/user/2fa/enable", post(two_fa_enable))
+        .route("/api/user/2fa/disable", post(two_fa_disable))
+        .route("/api/user/2fa/backup_codes", post(two_fa_backup_codes))
         .route("/api/wallet", get(wallet))
         .route("/api/subscriptions/me", get(my_subscriptions))
         .route("/api/subscriptions/subscribe", post(subscribe))
@@ -199,6 +206,10 @@ struct RegisterInput {
 struct LoginInput {
     username: String,
     password: String,
+    /// The second factor, when the account has 2FA enabled. Optional so the
+    /// first attempt can return "code required" rather than a bare rejection.
+    #[serde(default)]
+    code: Option<String>,
 }
 #[derive(Serialize)]
 struct LoginResponse {
@@ -219,15 +230,40 @@ async fn register(State(s): State<Arc<AppState>>, Json(input): Json<RegisterInpu
 }
 async fn login(State(s): State<Arc<AppState>>, Json(input): Json<LoginInput>) -> Response {
     match s.db.authenticate(&input.username, &input.password) {
-        Ok(Some(user)) => match s.db.create_session(&user.id, chrono::Duration::days(7)) {
-            Ok(session) => Json(ApiResponse::ok(LoginResponse {
-                user,
-                session_token: session.token,
-                expires_at: session.expires_at,
-            }))
-            .into_response(),
-            Err(e) => db_error::<LoginResponse>(e),
-        },
+        Ok(Some(user)) => {
+            // Two-factor gate. When a user has 2FA on, a correct password is only
+            // the first factor: no session is issued until a valid code is
+            // supplied. A password alone must not produce a usable credential, or
+            // the second factor would be decorative.
+            if let Ok(Some(_)) = s.db.enabled_two_fa_secret(&user.id) {
+                let Some(code) = input.code.as_deref().filter(|c| !c.trim().is_empty()) else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(ApiResponse::<TwoFactorRequired>::err(
+                            "two-factor code required",
+                        )),
+                    )
+                        .into_response();
+                };
+                let accepted = verify_two_factor(&s, &user.id, code);
+                if !accepted {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(ApiResponse::<LoginResponse>::err("invalid verification code")),
+                    )
+                        .into_response();
+                }
+            }
+            match s.db.create_session(&user.id, chrono::Duration::days(7)) {
+                Ok(session) => Json(ApiResponse::ok(LoginResponse {
+                    user,
+                    session_token: session.token,
+                    expires_at: session.expires_at,
+                }))
+                .into_response(),
+                Err(e) => db_error::<LoginResponse>(e),
+            }
+        }
         Ok(None) => (
             StatusCode::UNAUTHORIZED,
             Json(ApiResponse::<LoginResponse>::err(
@@ -256,6 +292,34 @@ async fn me(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
         Ok(user) => Json(ApiResponse::ok(user)).into_response(),
         Err(response) => response,
     }
+}
+
+/// Marker type for the "send a code" response, so the client can tell the
+/// difference between a rejected password and a pending second factor.
+#[derive(serde::Serialize)]
+struct TwoFactorRequired {
+    two_factor_required: bool,
+}
+
+/// Accept a TOTP code or a single-use recovery code.
+///
+/// The recovery path consumes the code, so a leaked code cannot be replayed.
+fn verify_two_factor(state: &AppState, user_id: &str, code: &str) -> bool {
+    let totp_ok = state
+        .db
+        .enabled_two_fa_secret(user_id)
+        .ok()
+        .flatten()
+        .and_then(|secret| oxygenrouter_core::totp::base32_decode(&secret))
+        .map(|decoded| oxygenrouter_core::totp::verify(&decoded, code))
+        .unwrap_or(false);
+    if totp_ok {
+        return true;
+    }
+    state
+        .db
+        .consume_two_fa_backup_code(user_id, code)
+        .unwrap_or(false)
 }
 
 // ── Sessions ──────────────────────────────────────────────────────────────
@@ -412,6 +476,227 @@ async fn revoke_access_token(State(s): State<Arc<AppState>>, headers: HeaderMap)
         Ok(removed) => Json(ApiResponse::ok(removed)).into_response(),
         Err(error) => Json(ApiResponse::<bool>::err(error.to_string())).into_response(),
     }
+}
+
+// ── Two-factor authentication ─────────────────────────────────────────────
+
+/// How many recovery codes a setup issues. The reference uses four 8-character
+/// codes (`common.BackupCodeCount` / `BackupCodeLength`).
+const BACKUP_CODE_COUNT: usize = 4;
+const BACKUP_CODE_LENGTH: usize = 8;
+
+/// A recovery code from an unambiguous alphabet.
+///
+/// `I`/`O`/`0`/`1` are excluded so a code read off a screen or paper cannot be
+/// mistyped into a different valid code.
+fn new_backup_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = Vec::new();
+    while bytes.len() < BACKUP_CODE_LENGTH {
+        bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    bytes
+        .into_iter()
+        .take(BACKUP_CODE_LENGTH)
+        .map(|b| ALPHABET[b as usize % ALPHABET.len()] as char)
+        .collect()
+}
+
+/// `GET /api/user/2fa/status`
+///
+/// Reports whether 2FA is on and how many recovery codes remain. Never the secret.
+async fn two_fa_status(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let enabled = match s.db.enabled_two_fa_secret(&user.id) {
+        Ok(secret) => secret.is_some(),
+        Err(error) => {
+            return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response()
+        }
+    };
+    let remaining = s.db.two_fa_backup_code_digests(&user.id).map(|d| d.len()).unwrap_or(0);
+    Json(ApiResponse::ok(serde_json::json!({
+        "enabled": enabled,
+        "backup_codes_remaining": if enabled { remaining } else { 0 },
+    })))
+    .into_response()
+}
+
+/// `POST /api/user/2fa/setup`
+///
+/// Generates and stages a secret, returning it once with a provisioning URI. The
+/// secret is not active until a code is confirmed, so a mis-scanned or
+/// discarded QR code cannot lock the account out.
+async fn two_fa_setup(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let secret = oxygenrouter_core::totp::generate_secret();
+    if let Err(error) = s.db.set_pending_two_fa_secret(&user.id, &secret) {
+        return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response();
+    }
+    let issuer = s
+        .db
+        .get_setting("SiteName")
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "OxygenRouter".to_string());
+    let uri = oxygenrouter_core::totp::provisioning_uri(&issuer, &user.username, &secret);
+    Json(ApiResponse::ok(serde_json::json!({
+        "secret": secret,
+        "otpauth_uri": uri,
+        "issuer": issuer,
+        "account": user.username,
+    })))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TwoFaCodeInput {
+    code: String,
+}
+
+/// `POST /api/user/2fa/enable`
+///
+/// Activates two-factor once the caller proves they can generate a valid code,
+/// and returns the recovery codes — the only time they are shown.
+async fn two_fa_enable(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<TwoFaCodeInput>,
+) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let secret = match s.db.pending_two_fa_secret(&user.id) {
+        Ok(Some(secret)) => secret,
+        Ok(None) => {
+            return Json(ApiResponse::<serde_json::Value>::err(
+                "start a two-factor setup first",
+            ))
+            .into_response()
+        }
+        Err(error) => {
+            return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response()
+        }
+    };
+    let decoded = match oxygenrouter_core::totp::base32_decode(&secret) {
+        Some(bytes) => bytes,
+        None => {
+            return Json(ApiResponse::<serde_json::Value>::err(
+                "stored secret is not valid base32",
+            ))
+            .into_response()
+        }
+    };
+    if !oxygenrouter_core::totp::verify(&decoded, &input.code) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::<serde_json::Value>::err("invalid verification code")),
+        )
+            .into_response();
+    }
+
+    let codes: Vec<String> = (0..BACKUP_CODE_COUNT).map(|_| new_backup_code()).collect();
+    if let Err(error) = s.db.enable_two_fa(&user.id, &codes) {
+        return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response();
+    }
+    Json(ApiResponse::ok(serde_json::json!({
+        "enabled": true,
+        "backup_codes": codes,
+    })))
+    .into_response()
+}
+
+/// `POST /api/user/2fa/disable`
+///
+/// Requires a valid code or recovery code: turning 2FA off is exactly the action
+/// an attacker with a stolen session would want, so it is gated by the second
+/// factor rather than by the session alone.
+async fn two_fa_disable(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<TwoFaCodeInput>,
+) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let secret = match s.db.enabled_two_fa_secret(&user.id) {
+        Ok(Some(secret)) => secret,
+        Ok(None) => {
+            return Json(ApiResponse::<serde_json::Value>::err(
+                "two-factor is not enabled",
+            ))
+            .into_response()
+        }
+        Err(error) => {
+            return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response()
+        }
+    };
+    let valid = oxygenrouter_core::totp::base32_decode(&secret)
+        .map(|decoded| oxygenrouter_core::totp::verify(&decoded, &input.code))
+        .unwrap_or(false)
+        || s.db
+            .consume_two_fa_backup_code(&user.id, &input.code)
+            .unwrap_or(false);
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::<serde_json::Value>::err("invalid verification code")),
+        )
+            .into_response();
+    }
+    match s.db.disable_two_fa(&user.id) {
+        Ok(()) => Json(ApiResponse::ok("disabled")).into_response(),
+        Err(error) => Json(ApiResponse::<&str>::err(error.to_string())).into_response(),
+    }
+}
+
+/// `POST /api/user/2fa/backup_codes`
+///
+/// Reissues recovery codes, invalidating the previous set.
+async fn two_fa_backup_codes(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<TwoFaCodeInput>,
+) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let secret = match s.db.enabled_two_fa_secret(&user.id) {
+        Ok(Some(secret)) => secret,
+        Ok(None) => {
+            return Json(ApiResponse::<serde_json::Value>::err(
+                "two-factor is not enabled",
+            ))
+            .into_response()
+        }
+        Err(error) => {
+            return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response()
+        }
+    };
+    let valid = oxygenrouter_core::totp::base32_decode(&secret)
+        .map(|decoded| oxygenrouter_core::totp::verify(&decoded, &input.code))
+        .unwrap_or(false);
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::<serde_json::Value>::err("invalid verification code")),
+        )
+            .into_response();
+    }
+    let codes: Vec<String> = (0..BACKUP_CODE_COUNT).map(|_| new_backup_code()).collect();
+    if let Err(error) = s.db.enable_two_fa(&user.id, &codes) {
+        return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response();
+    }
+    Json(ApiResponse::ok(serde_json::json!({"backup_codes": codes}))).into_response()
 }
 async fn wallet(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let user = match auth_user(&s, &headers) {

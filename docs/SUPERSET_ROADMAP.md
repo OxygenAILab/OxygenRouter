@@ -439,9 +439,10 @@ with all three client dialects.
 - **OAuth providers**: GitHub, Discord, LinuxDO, OIDC, Telegram, WeChat, + custom
   generic providers (DB-driven, access-policy engine).
 - **Passkey / WebAuthn**: register/verify/delete, discoverable login, step-up verify.
-- 🔶 **TOTP 2FA**: the RFC 6238 primitive is implemented and verified against the
-  RFC's published vectors (`core/totp.rs`). The API surface — `/api/user/2fa/*`,
-  login gating, backup codes, lockout — is **not** done yet.
+- ✅ **TOTP 2FA**: RFC 6238 primitive verified against the RFC's published vectors
+  (`core/totp.rs`), and wired to `/api/user/2fa/{status,setup,enable,disable,backup_codes}`
+  with login gating and single-use recovery codes. Lockout after repeated
+  failures and the security-proof step-up on enable/disable are **not** done.
 - **Email**: binding (start/resend/confirm), verification send, password reset.
 - **Universal security verification**: scope+context proof gate for sensitive ops.
 - **RBAC**: permission catalog + role baselines (`/api/authz/catalog`); audit log.

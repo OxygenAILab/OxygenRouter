@@ -105,10 +105,45 @@ fn json_object(value: &str) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 fn optional_datetime(value: Option<String>) -> Option<DateTime<Utc>> {
-    value
-        .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-        .map(|value| value.with_timezone(&Utc))
+    value.and_then(|v| DateTime::parse_from_rfc3339(&v).ok()).map(|d| d.with_timezone(&Utc))
 }
+
+/// Digest a backup code for storage.
+///
+/// A backup code is a second password, so it is stored the same way one is: a
+/// salted Argon2 hash, never the value.
+fn digest_backup_code(code: &str) -> String {
+    Database::hash_password(&normalize_backup_code(code)).unwrap_or_default()
+}
+
+/// Whether `candidate` matches a stored backup-code digest.
+///
+/// Argon2 embeds a random salt in each hash, so two hashes of the same code are
+/// *different strings* — comparing digests for equality never matches. The
+/// candidate must be verified against the parsed PHC string instead.
+fn backup_code_matches(candidate: &str, stored_digest: &str) -> bool {
+    let normalized = normalize_backup_code(candidate);
+    match PasswordHash::new(stored_digest) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(normalized.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Normalise a backup code before hashing or verifying.
+///
+/// A user reading the code off paper may type it in lower case or with
+/// separators, and rejecting that would be a usability failure rather than a
+/// security one.
+fn normalize_backup_code(code: &str) -> String {
+    code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
 fn glob_match(pattern: &str, input: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
@@ -326,6 +361,12 @@ impl Database {
             // hands it to the client once, on generation.
             "ALTER TABLE users ADD COLUMN access_token TEXT",
             "ALTER TABLE users ADD COLUMN access_token_created_at TEXT",
+            // Two-factor state. The secret is stored unencrypted because it must
+            // be recoverable to verify codes; backup codes are stored as digests
+            // so a database read does not yield usable recovery credentials.
+            "ALTER TABLE users ADD COLUMN two_fa_secret TEXT",
+            "ALTER TABLE users ADD COLUMN two_fa_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN two_fa_backup_codes TEXT NOT NULL DEFAULT '[]'",
         ] {
             let _ = conn.execute(sql, []);
         }
@@ -1929,6 +1970,113 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    // ── Two-factor authentication ─────────────────────────────────────────────
+
+    /// The pending (not yet enabled) two-factor secret, if a setup is in progress.
+    pub fn pending_two_fa_secret(&self, user_id: &str) -> SqliteResult<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT two_fa_secret FROM users WHERE id=?1 AND two_fa_enabled=0",
+            params![user_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|opt| opt.flatten())
+    }
+
+    /// Whether two-factor is active for `user_id`, and its secret.
+    ///
+    /// `None` means 2FA is off. The secret is returned because verification needs
+    /// it; it is never sent to a client after setup.
+    pub fn enabled_two_fa_secret(&self, user_id: &str) -> SqliteResult<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT two_fa_secret FROM users WHERE id=?1 AND two_fa_enabled=1",
+            params![user_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|opt| opt.flatten())
+    }
+
+    /// Store a candidate secret without activating it.
+    ///
+    /// Staging before activation is what makes setup safe: the operator proves
+    /// they can generate a valid code before 2FA starts gating their logins, so a
+    /// mis-scanned QR code cannot lock them out.
+    pub fn set_pending_two_fa_secret(&self, user_id: &str, secret: &str) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "UPDATE users SET two_fa_secret=?1, two_fa_enabled=0, two_fa_backup_codes='[]', updated_at=?2 WHERE id=?3",
+            params![secret, Utc::now().to_rfc3339(), user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Activate two-factor with the given backup codes.
+    ///
+    /// Codes are stored as digests, never in the clear: they are equivalent to a
+    /// second password, and a database read should not yield usable ones. They are
+    /// returned to the caller once, at generation.
+    pub fn enable_two_fa(&self, user_id: &str, backup_codes: &[String]) -> SqliteResult<()> {
+        let digests: Vec<String> = backup_codes.iter().map(|c| digest_backup_code(c)).collect();
+        self.conn.lock().execute(
+            "UPDATE users SET two_fa_enabled=1, two_fa_backup_codes=?1, updated_at=?2 WHERE id=?3",
+            params![json_string(&digests), Utc::now().to_rfc3339(), user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Turn two-factor off and clear the secret and backup codes.
+    ///
+    /// Clearing matters: leaving a secret behind would let a later re-enable
+    /// silently reuse a value the user believes they revoked.
+    pub fn disable_two_fa(&self, user_id: &str) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "UPDATE users SET two_fa_enabled=0, two_fa_secret=NULL, two_fa_backup_codes='[]', updated_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), user_id],
+        )?;
+        Ok(())
+    }
+
+    /// The stored backup-code digests for `user_id`.
+    pub fn two_fa_backup_code_digests(&self, user_id: &str) -> SqliteResult<Vec<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT two_fa_backup_codes FROM users WHERE id=?1",
+            params![user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map(|opt| opt.map(|raw| json_value::<Vec<String>>(&raw)).unwrap_or_default())
+    }
+
+    /// Consume a backup code, returning whether it was valid.
+    ///
+    /// A matched code is removed, so each code works exactly once. The whole set
+    /// is rewritten so the removal is atomic with respect to the read.
+    pub fn consume_two_fa_backup_code(&self, user_id: &str, candidate: &str) -> SqliteResult<bool> {
+        let conn = self.conn.lock();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT two_fa_backup_codes FROM users WHERE id=?1 AND two_fa_enabled=1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else { return Ok(false) };
+        let mut digests: Vec<String> = json_value(&raw);
+        let before = digests.len();
+        digests.retain(|d| !backup_code_matches(candidate, d));
+        if digests.len() == before {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE users SET two_fa_backup_codes=?1, updated_at=?2 WHERE id=?3",
+            params![json_string(&digests), Utc::now().to_rfc3339(), user_id],
+        )?;
+        Ok(true)
     }
 
     fn credit_tx(
