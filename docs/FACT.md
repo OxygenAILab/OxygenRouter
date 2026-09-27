@@ -337,6 +337,42 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription quota funds requests (2026-09-26)
 
+### The role hierarchy is enforced (fixed 2026-09-28) — **was critical**
+
+An ordinary admin could **promote itself to the owner role**. Verified live before
+the fix: `PUT /api/admin/users/<its-own-id>` with `{"role":"root"}` was granted
+`root`, and in the same run the admin **demoted the owner to a normal user**. Both
+are full takeovers of the instance from a credential meant to be less privileged
+than the owner's. Also reachable: creating a root or peer-admin account, crediting
+any account including its own, and deleting a peer.
+
+The cause was that `role` came from the request body with no check on what the
+caller was allowed to grant or manage. The reference's `controller/user.go` has
+two guards, both now ported:
+
+| Rule | Reference | Meaning |
+|---|---|---|
+| `can_manage(actor, target)` | `canManageTargetRole` (`:382`) | `actor == root \|\| actor.rank > target.rank` |
+| `can_assign(actor, assigned)` | `CreateUser` (`:987`) | `assigned.rank < actor.rank` |
+
+They are **independent checks, and both are needed**. Editing a *subordinate*
+upward fails the assignment rule; editing a *peer* downward fails the target rule.
+Applying only one leaves a hole — a self-promotion is a peer edit *and* an upward
+assignment, so it happens to be caught by either, but a peer demotion is caught
+only by the target rule.
+
+Both are applied on **create, update, delete and balance-adjust** — every route
+that writes to another account. The self-check that existed on delete ("cannot
+delete current admin") covered only the actor's own row, not a peer's.
+
+Ranks mirror the reference's constants (root 100, admin 10, user 1) because its
+checks are ordinal comparisons rather than set membership.
+
+Verified live: all of the above now return `403`, while an admin can still edit,
+credit, create and delete a plain user (`200`) and the owner can still promote a
+user to admin (`200`) — so the guard closes the escalation without freezing
+administration.
+
 ### Logs and analytics are scoped by role (fixed 2026-09-27) — **was high**
 
 Any signed-in user could read the instance's **entire request-log table**, plus

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (security — role hierarchy) — **critical**
+- **An ordinary admin could promote itself to the owner role.** Verified live
+  before the fix: a plain admin `PUT /api/admin/users/<its-own-id>` with
+  `{"role":"root"}` was granted `root`; in the same run it also **demoted the
+  owner to a normal user**. Both are full takeovers of the instance, from a
+  credential that is meant to be less privileged than the owner's.
+- Also allowed: an admin could create a **root** account or a peer admin, credit
+  any account including itself, and delete a peer. Every one of these is refused
+  now.
+- Ported the reference's hierarchy rules (`controller/user.go`): `can_manage`
+  is its `canManageTargetRole` (`myRole == root || myRole > targetRole`) and
+  `can_assign` is its creation guard (`assigned < actor`, strictly below, so an
+  admin cannot mint a peer). Both are applied on create, update, delete and
+  balance-adjust. They are independent checks — an admin editing a *subordinate*
+  upward fails the assignment rule, and editing a *peer* downward fails the target
+  rule — so neither alone is sufficient.
+- Role ranks mirror the reference's constants (root 100, admin 10, user 1),
+  because its checks are ordinal comparisons rather than set membership.
+
+### Verified (security — role hierarchy)
+- Live against a fresh instance: an admin's self-promotion to `root`, creation of
+  a peer or a root, demotion of the owner, deletion of the owner, and crediting
+  the owner or itself all return `403`.
+- The same run confirms legitimate management still works: an admin edits a user,
+  credits a user, creates a user and deletes that user (`200`), and the owner
+  still promotes a user to admin (`200`).
+- Five unit tests pin both rules, their independence, and the rank ordering.
+- `cargo test --workspace` → **439 passed / 0 failed**, zero warnings.
+
 ### Fixed (security — log and analytics scoping) — **high**
 - **Any signed-in user could read the instance's entire request-log table**, plus
   `/api/log/stats`, `/api/dashboard` and `/api/analytics/flow`. Verified live

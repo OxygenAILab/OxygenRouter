@@ -1032,9 +1032,21 @@ async fn admin_create_user(
     headers: HeaderMap,
     Json(input): Json<AdminUserInput>,
 ) -> Response {
-    if let Err(response) = admin_user(&s, &headers) {
-        return response;
+    let actor = match admin_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
     };
+    // The actor must outrank the role it is handing out. Without this an ordinary
+    // admin could create a root account — or a peer admin — and then use it.
+    if !UserRole::can_assign(&actor.role, &input.role) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<User>::err(
+                "cannot create an account at or above your own role",
+            )),
+        )
+            .into_response();
+    }
     let Some(password) = input.password else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1071,9 +1083,43 @@ async fn admin_update_user(
     Path(id): Path<String>,
     Json(input): Json<AdminUserInput>,
 ) -> Response {
-    if let Err(response) = admin_user(&s, &headers) {
-        return response;
+    let actor = match admin_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
     };
+    let existing = match s.db.get_user(&id) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<User>::err("user not found")),
+            )
+                .into_response()
+        }
+        Err(e) => return db_error::<User>(e),
+    };
+    // Two independent rules, both from the reference (`controller/user.go:670-679`):
+    // the actor must outrank the account it is editing, and must outrank the role
+    // it is assigning. Checking only the first would still allow an admin to edit a
+    // *peer* upward — most damagingly itself.
+    if !UserRole::can_manage(&actor.role, &existing.role) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<User>::err(
+                "cannot manage an account at or above your own role",
+            )),
+        )
+            .into_response();
+    }
+    if !UserRole::can_assign(&actor.role, &input.role) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<User>::err(
+                "cannot assign a role at or above your own",
+            )),
+        )
+            .into_response();
+    }
     match s.db.update_user(
         &id,
         &input.username,
@@ -1106,6 +1152,29 @@ async fn admin_delete_user(
         )
             .into_response();
     }
+    // Deleting is the strongest write, so it needs the same hierarchy rule as
+    // editing: an admin must not delete a peer or the owner. The self-check above
+    // covers only the actor's own row.
+    match s.db.get_user(&id) {
+        Ok(Some(target)) if !UserRole::can_manage(&admin.role, &target.role) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ApiResponse::<&str>::err(
+                    "cannot delete an account at or above your own role",
+                )),
+            )
+                .into_response()
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<&str>::err("user not found")),
+            )
+                .into_response()
+        }
+        Err(e) => return db_error::<&str>(e),
+    }
     match s.db.delete_user(&id) {
         Ok(true) => Json(ApiResponse::ok("deleted")).into_response(),
         Ok(false) => (
@@ -1122,9 +1191,35 @@ async fn admin_adjust_balance(
     Path(id): Path<String>,
     Json(input): Json<BalanceAdjustmentInput>,
 ) -> Response {
-    if let Err(response) = admin_user(&s, &headers) {
-        return response;
+    let actor = match admin_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
     };
+    // Crediting an account is a write in the same sense as editing it, so the
+    // hierarchy applies: an admin must not top up a peer or the owner out of the
+    // operator's float.
+    match s.db.get_user(&id) {
+        Ok(Some(target)) if !UserRole::can_manage(&actor.role, &target.role) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ApiResponse::<oxygenrouter_core::LedgerEntry>::err(
+                    "cannot adjust an account at or above your own role",
+                )),
+            )
+                .into_response()
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<oxygenrouter_core::LedgerEntry>::err(
+                    "user not found",
+                )),
+            )
+                .into_response()
+        }
+        Err(e) => return db_error::<oxygenrouter_core::LedgerEntry>(e),
+    }
     match s
         .db
         .admin_adjust_balance(&id, input.amount_micros, &input.description)
@@ -3502,5 +3597,76 @@ mod log_scoping_tests {
         // It must not leak the instance-wide route open along with it.
         assert_eq!(required_access("/api/logs"), Access::Admin);
         assert_eq!(required_access("/api/logs/anything-else"), Access::Admin);
+    }
+}
+
+
+#[cfg(test)]
+mod role_hierarchy_tests {
+    use oxygenrouter_core::UserRole;
+
+    /// Regression: an ordinary admin promoted itself to root and demoted the
+    /// owner, both verified live before the fix. The reference guards this with
+    /// `canManageTargetRole` (`controller/user.go:382`) and a `>= myRole` check on
+    /// creation (`controller/user.go:987`).
+    #[test]
+    fn an_admin_cannot_manage_a_peer_or_the_owner() {
+        use UserRole::*;
+        // An admin may manage a user…
+        assert!(UserRole::can_manage(&Admin, &User));
+        // …but not a peer, and not the owner.
+        assert!(!UserRole::can_manage(&Admin, &Admin));
+        assert!(!UserRole::can_manage(&Admin, &Root));
+        // A user manages nobody.
+        assert!(!UserRole::can_manage(&User, &User));
+        assert!(!UserRole::can_manage(&User, &Admin));
+        assert!(!UserRole::can_manage(&User, &Root));
+    }
+
+    #[test]
+    fn the_owner_can_manage_everyone() {
+        use UserRole::*;
+        assert!(UserRole::can_manage(&Root, &Root));
+        assert!(UserRole::can_manage(&Root, &Admin));
+        assert!(UserRole::can_manage(&Root, &User));
+    }
+
+    #[test]
+    fn an_admin_cannot_mint_a_peer_or_a_root() {
+        use UserRole::*;
+        // Strictly below, matching the reference's `user.Role >= myRole` refusal.
+        assert!(UserRole::can_assign(&Admin, &User));
+        assert!(!UserRole::can_assign(&Admin, &Admin));
+        assert!(!UserRole::can_assign(&Admin, &Root));
+        assert!(UserRole::can_assign(&Root, &Admin));
+        assert!(UserRole::can_assign(&Root, &User));
+        // Nobody but root may create root, and root may not create root either —
+        // the reference's comparison is strict, so a second owner needs a
+        // deliberate promotion by an existing owner.
+        assert!(!UserRole::can_assign(&Root, &Root));
+    }
+
+    #[test]
+    fn rank_is_ordered_root_admin_user() {
+        use UserRole::*;
+        assert!(Root.rank() > Admin.rank());
+        assert!(Admin.rank() > User.rank());
+        // The exact values mirror the reference's constants.
+        assert_eq!(Root.rank(), 100);
+        assert_eq!(Admin.rank(), 10);
+        assert_eq!(User.rank(), 1);
+    }
+
+    /// The two rules must both hold: managing a peer is refused even when the
+    /// assigned role would be lower, and assigning upward is refused even when the
+    /// target is a subordinate.
+    #[test]
+    fn both_rules_are_independent() {
+        use UserRole::*;
+        // Editing a peer downward: target check fails.
+        assert!(!UserRole::can_manage(&Admin, &Admin));
+        // Editing a subordinate upward: assignment check fails.
+        assert!(UserRole::can_manage(&Admin, &User));
+        assert!(!UserRole::can_assign(&Admin, &Admin));
     }
 }

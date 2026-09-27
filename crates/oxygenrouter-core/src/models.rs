@@ -681,6 +681,38 @@ impl UserRole {
     pub fn is_root(&self) -> bool {
         matches!(self, Self::Root)
     }
+
+    /// Privilege rank, ordered so a higher number may manage a lower one.
+    ///
+    /// The values mirror the reference's constants (`root = 100`, `admin = 10`,
+    /// `user = 1`), because its checks are ordinal comparisons rather than set
+    /// membership: `canManageTargetRole` is `myRole == root || myRole > targetRole`.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Root => 100,
+            Self::Admin => 10,
+            Self::User => 1,
+        }
+    }
+
+    /// Whether `actor` may administer an account holding `target`.
+    ///
+    /// Ports the reference's `canManageTargetRole` (`controller/user.go:382`):
+    /// root may manage anyone, and otherwise the actor must outrank the target.
+    /// Without this an ordinary admin can act on a peer or on the owner — which is
+    /// how an admin could promote itself to root by editing its own row.
+    pub fn can_manage(actor: &Self, target: &Self) -> bool {
+        actor.is_root() || actor.rank() > target.rank()
+    }
+
+    /// Whether `actor` may assign `assigned` when creating an account.
+    ///
+    /// Ports the reference's `CreateUser` guard (`controller/user.go:987`), which
+    /// refuses `assigned >= actor`. Strictly-below is deliberate: an admin must
+    /// not mint another admin, or the hierarchy is not a hierarchy.
+    pub fn can_assign(actor: &Self, assigned: &Self) -> bool {
+        assigned.rank() < actor.rank()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
