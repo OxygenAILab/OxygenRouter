@@ -174,6 +174,13 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+/// Minimum accepted password length when the caller has no policy override.
+///
+/// The value the schema ships as `MinPasswordLength`'s default. Kept here so the
+/// fallback used by the storage layer and the fallback used by the console
+/// cannot drift apart.
+pub const DEFAULT_MIN_PASSWORD_LEN: usize = 8;
+
 impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
@@ -1748,7 +1755,29 @@ impl Database {
         password: &str,
         role: UserRole,
     ) -> SqliteResult<User> {
-        if username.trim().len() < 3 || password.len() < 8 || !email.contains('@') {
+        self.create_user_with_min_password_len(
+            username,
+            email,
+            password,
+            role,
+            DEFAULT_MIN_PASSWORD_LEN,
+        )
+    }
+
+    /// `create_user` with an explicit password-length policy.
+    ///
+    /// The length is counted in **characters**, not bytes: `MinPasswordLength`
+    /// is documented as a length, and a byte count would silently accept a
+    /// shorter password written in a multi-byte script.
+    pub fn create_user_with_min_password_len(
+        &self,
+        username: &str,
+        email: &str,
+        password: &str,
+        role: UserRole,
+        min_password_len: usize,
+    ) -> SqliteResult<User> {
+        if username.trim().len() < 3 || password.chars().count() < min_password_len || !email.contains('@') {
             return Err(rusqlite::Error::InvalidQuery);
         }
         let now = Utc::now();

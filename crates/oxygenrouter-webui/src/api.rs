@@ -438,12 +438,64 @@ fn login_lock_scope(headers: &HeaderMap) -> String {
     format!("login:{}", crate::proxy::caller_address(headers))
 }
 
+/// Reject an account request with a message that says what is actually wrong.
+///
+/// The storage layer enforces the same rules and answers with
+/// `rusqlite::Error::InvalidQuery`, whose `Display` is "Query is not read-only".
+/// That is accurate for SQLite and meaningless to somebody filling in a form, so
+/// the check is repeated here where a useful sentence can be returned. The
+/// storage-layer guard stays: defence in depth, not the error-reporting path.
+fn validate_new_account(
+    username: &str,
+    email: &str,
+    password: &str,
+    min_password_len: usize,
+) -> Result<(), String> {
+    if username.trim().chars().count() < 3 {
+        return Err("username must be at least 3 characters".to_string());
+    }
+    if !email.contains('@') {
+        return Err("a valid email address is required".to_string());
+    }
+    // Counted in characters, matching the storage layer and the option's name.
+    if password.chars().count() < min_password_len {
+        return Err(format!(
+            "password must be at least {min_password_len} characters"
+        ));
+    }
+    Ok(())
+}
+
 async fn register(State(s): State<Arc<AppState>>, Json(input): Json<RegisterInput>) -> Response {
-    match s.db.create_user(
+    // Three options the console has always shown as live switches. Nothing read
+    // them, so self-registration could not be switched off and the length rule
+    // was hard-coded to 8 regardless of what the field said.
+    let policy = s.auth_policy();
+    if !policy.registration_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<User>::err("registration is disabled")),
+        )
+            .into_response();
+    }
+    if let Err(reason) = validate_new_account(
+        &input.username,
+        &input.email,
+        &input.password,
+        policy.min_password_len,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<User>::err(reason)),
+        )
+            .into_response();
+    }
+    match s.db.create_user_with_min_password_len(
         &input.username,
         &input.email,
         &input.password,
         UserRole::User,
+        policy.min_password_len,
     ) {
         Ok(user) => (StatusCode::CREATED, Json(ApiResponse::ok(user))).into_response(),
         Err(e) => db_error::<User>(e),
@@ -456,6 +508,19 @@ async fn login(
 ) -> Response {
     if let Some(locked) = login_lock_response(&s, &headers) {
         return locked;
+    }
+    // `PasswordLoginEnabled` off means the password form is not a valid way in,
+    // even with correct credentials. Checked after the lock so a disabled
+    // instance still reports the lock state rather than leaking that the policy
+    // differs; the reference refuses here too (`controller/user.go:54`).
+    if !s.auth_policy().password_login_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<LoginResponse>::err(
+                "password sign-in is disabled",
+            )),
+        )
+            .into_response();
     }
     match s.db.authenticate(&input.username, &input.password) {
         Ok(Some(user)) => {
@@ -1123,9 +1188,27 @@ async fn admin_create_user(
         )
             .into_response();
     };
+    if let Err(reason) = validate_new_account(
+        &input.username,
+        &input.email,
+        &password,
+        s.auth_policy().min_password_len,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<User>::err(reason)),
+        )
+            .into_response();
+    }
     match s
         .db
-        .create_user(&input.username, &input.email, &password, input.role)
+        .create_user_with_min_password_len(
+            &input.username,
+            &input.email,
+            &password,
+            input.role,
+            s.auth_policy().min_password_len,
+        )
     {
         Ok(mut user) => {
             if input.status != "active" {

@@ -18,6 +18,31 @@ use crate::billing_store::SqliteBillingStore;
 
 const LOG_BROADCAST_CAPACITY: usize = 100;
 
+/// The account-creation and password-sign-in rules for this instance.
+///
+/// Derived from the option store by `AppState::auth_policy`, never cached.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthPolicy {
+    /// `RegistrationEnabled` — may a visitor create an account at all.
+    pub registration_enabled: bool,
+    /// `PasswordLoginEnabled` — does the password form work.
+    pub password_login_enabled: bool,
+    /// `MinPasswordLength`, in characters.
+    pub min_password_len: usize,
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        Self {
+            // Open by default: an instance whose operator has not opened the
+            // console yet must still be usable.
+            registration_enabled: true,
+            password_login_enabled: true,
+            min_password_len: oxygenrouter_core::DEFAULT_MIN_PASSWORD_LEN,
+        }
+    }
+}
+
 pub struct AppState {
     pub db: Arc<Database>,
     pub db_path: PathBuf,
@@ -163,6 +188,51 @@ impl AppState {
             RateLimit::disabled()
         } else {
             RateLimit::new(attempts.min(u32::MAX as i64) as u32, Self::LOGIN_LOCK_WINDOW_SECS)
+        }
+    }
+
+    /// Whether a caller may create an account and sign in with a password.
+    ///
+    /// Three options that the console has always presented as live switches but
+    /// which no code read, so the instance behaved as if all three were on:
+    ///
+    /// * `RegistrationEnabled` — the master switch for account creation.
+    /// * `PasswordLoginEnabled` — whether the password form works at all.
+    /// * `MinPasswordLength` — the length rule, previously hard-coded to 8 and
+    ///   therefore unaffected by the field the console showed.
+    ///
+    /// The reference enforces all three (`controller/user.go:218,222,54`).
+    /// Read per call rather than cached, for the reason given on
+    /// `fetch_policy`: a cache needs invalidating by whoever writes the option,
+    /// and one missed call site silently reverts to the old policy.
+    pub fn auth_policy(&self) -> AuthPolicy {
+        let read_bool = |key: &str, fallback: bool| -> bool {
+            self.db
+                .get_setting(key)
+                .ok()
+                .flatten()
+                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(fallback)
+        };
+        let min_password_len = self
+            .db
+            .get_setting("MinPasswordLength")
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            // A nonsensical value (zero or negative) would disable the rule
+            // entirely, so fall back to the shipped default instead.
+            .filter(|n| *n >= 1)
+            .map(|n| n.min(1024) as usize)
+            .unwrap_or(oxygenrouter_core::DEFAULT_MIN_PASSWORD_LEN);
+        AuthPolicy {
+            registration_enabled: read_bool("RegistrationEnabled", true),
+            password_login_enabled: read_bool("PasswordLoginEnabled", true),
+            min_password_len,
         }
     }
 
