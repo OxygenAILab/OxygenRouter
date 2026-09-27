@@ -378,7 +378,7 @@ A superset claim is only meaningfully testable if it is expressed as counts and 
 | D3 | Retry backoff with jitter (NewAPI: none) | exponential + jitter, configurable |
 | D4 | Enforced global concurrency ceiling (NewAPI: not enforced) | tokio semaphore bound to `max_concurrent_requests` |
 | D5 | Dynamic `/v1/models` from DB + adapter model lists | replaces static list |
-| D6 | Full API-key update semantics | PUT update, not create/delete only |
+| D6 | Full API-key update semantics | ✅ `PUT /api/keys/:id` (`update_key`): edits name, enabled, priority, expiry, quota, model allowlist, IP allowlist, group and cross-group retry, with the credential, owner, id, creation time and accumulated usage immutable. Console edit dialog still pending. |
 | D7 | Design-system conformance (Apple design standards) as a gate | anti-slop checklist enforced in review |
 | D8 | Real, reproducible benchmark harness proving parity | see §7 |
 

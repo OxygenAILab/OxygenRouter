@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (D6 — API-key update semantics)
+- **`PUT /api/keys/:id`**, closing the last undelivered superset delta. The
+  reference has full update semantics (`controller/token.go:383`, updating the
+  column set its `model/token.go:315` names); we had only create and delete. That
+  is not merely ergonomic: without an update, changing a name or extending an
+  expiry required deleting the key and making a new one, which **rotates the
+  credential** and breaks every client using it.
+- Editable: name, enabled, priority, expiry, quota, model allowlist, IP allowlist,
+  group and cross-group retry. Immutable by construction: the credential itself,
+  its owner (`user_id`), its `id`, `created_at` and accumulated `used_micros` are
+  copied from the stored row, never read from the body. Omitted fields are left
+  unchanged.
+
+### Verified (D6 — API-key update semantics)
+- Live: an update renames and re-quotas a key while `GET /api/keys/:id/secret`
+  confirms the credential is unchanged; omitted fields keep their stored values;
+  a body carrying `key`, `user_id`, `used_micros` or `id` cannot rewrite any of
+  them; another user's edit is refused ("not your key"); an empty name and a
+  negative quota are refused; an unknown id is `404`; an anonymous caller gets
+  `401`. The update response is masked like every other read, so it cannot
+  disclose the value the list withholds.
+- Three unit tests pin the field set, including that the dangerous names are not
+  part of the update struct at all — so a later "just reuse `ApiKey`" refactor
+  fails a test rather than silently making the credential writable.
+- `cargo test --workspace` → **446 passed / 0 failed**, zero warnings.
+
 ### Fixed (security — role hierarchy) — **critical**
 - **An ordinary admin could promote itself to the owner role.** Verified live
   before the fix: a plain admin `PUT /api/admin/users/<its-own-id>` with

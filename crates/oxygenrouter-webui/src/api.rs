@@ -53,6 +53,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/keys", get(list_keys))
         .route("/api/keys", post(create_key))
         .route("/api/keys/:id", delete(delete_key))
+        // D6: full update semantics, matching the reference's `PUT /token/`.
+        .route("/api/keys/:id", put(update_key))
         // The deliberate disclosure route; see `reveal_key`.
         .route("/api/keys/:id/secret", get(reveal_key))
         .route("/api/keys/usage", get(keys_usage))
@@ -2501,6 +2503,115 @@ async fn create_key(
     })
 }
 
+/// The fields an update may change.
+///
+/// Deliberately a separate struct rather than a whole `ApiKey`: a full-object PUT
+/// would let a client rewrite `used_micros` (erasing usage), `user_id`
+/// (re-attributing the key to someone else's wallet) or `key` (rotating the
+/// credential silently). The reference restricts its update to exactly these
+/// columns (`model/token.go:315`, `token.Update()`), and excludes the key itself.
+#[derive(Deserialize)]
+struct KeyUpdateInput {
+    name: String,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    expires_at: Option<chrono::DateTime<Utc>>,
+    /// `null` means "leave unchanged"; a value is a new ceiling.
+    #[serde(default)]
+    quota_micros: Option<i64>,
+    #[serde(default)]
+    allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    ip_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    group_name: Option<String>,
+    #[serde(default)]
+    cross_group_retry: Option<bool>,
+}
+
+/// `PUT /api/keys/:id` — edit a key without replacing it.
+///
+/// This is the superset delta D6: the reference has full update semantics, and we
+/// had only create/delete. Update is not just ergonomics — without it the only way
+/// to change a name or extend an expiry is to delete the key and make a new one,
+/// which rotates the credential and breaks every client using it.
+///
+/// Immutable by construction: the credential (`key`), its owner (`user_id`),
+/// its creation time and its accumulated usage (`used_micros`) are all copied from
+/// the stored row, never read from the body.
+async fn update_key(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<KeyUpdateInput>,
+) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(_) => return Json(ApiResponse::<ApiKey>::err("authentication required")).into_response(),
+    };
+    let mut key = match s.db.get_api_key(&id) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<ApiKey>::err("key not found")),
+            )
+                .into_response()
+        }
+        Err(e) => return Json(ApiResponse::<ApiKey>::err(e.to_string())).into_response(),
+    };
+    // An owner may edit their own key; an admin may edit anyone's. Anything else
+    // is someone else's credential.
+    if key.user_id != user.id && !user.role.is_admin() {
+        return Json(ApiResponse::<ApiKey>::err("not your key")).into_response();
+    }
+    if input.name.trim().is_empty() {
+        return Json(ApiResponse::<ApiKey>::err("name must not be empty")).into_response();
+    }
+    if let Some(quota) = input.quota_micros {
+        if quota < 0 {
+            return Json(ApiResponse::<ApiKey>::err("quota must not be negative"))
+                .into_response();
+        }
+    }
+
+    key.name = input.name;
+    if let Some(v) = input.enabled {
+        key.enabled = v;
+    }
+    if let Some(v) = input.priority {
+        key.priority = v;
+    }
+    if let Some(v) = input.expires_at {
+        key.expires_at = Some(v);
+    }
+    if let Some(v) = input.quota_micros {
+        key.quota_micros = v;
+    }
+    if let Some(v) = input.allowed_models {
+        key.allowed_models = v;
+    }
+    if let Some(v) = input.ip_allowlist {
+        key.ip_allowlist = v;
+    }
+    if let Some(v) = input.group_name {
+        key.group_name = v;
+    }
+    if let Some(v) = input.cross_group_retry {
+        key.cross_group_retry = v;
+    }
+
+    match s.db.upsert_api_key(&key) {
+        // Masked like every other read, so an update cannot disclose the value the
+        // list withholds.
+        Ok(()) => Json(ApiResponse::ok(masked_keys(vec![key]).remove(0))).into_response(),
+        Err(e) => Json(ApiResponse::<ApiKey>::err(e.to_string())).into_response(),
+    }
+}
+
 async fn delete_key(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3844,5 +3955,84 @@ mod classification_audit_tests {
         ] {
             assert_ne!(required_access(path), Access::Public, "{path}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod key_update_tests {
+    use super::*;
+
+    fn parse(json: &str) -> KeyUpdateInput {
+        serde_json::from_str(json).expect("update input must deserialize")
+    }
+
+    /// The update deliberately accepts a narrow field set. A full-object PUT would
+    /// let a client rewrite the credential, its owner or its accumulated usage.
+    /// This pins that the dangerous names are simply not part of the struct, so a
+    /// later "just reuse `ApiKey`" refactor fails here rather than in production.
+    #[test]
+    fn the_update_cannot_carry_immutable_fields() {
+        // Unknown fields are ignored by serde, so none of these can reach storage
+        // through this type.
+        let input = parse(
+            r#"{
+                "name": "renamed",
+                "key": "sk-attacker",
+                "user_id": "someone-else",
+                "used_micros": 0,
+                "id": "hijacked",
+                "created_at": "2000-01-01T00:00:00Z"
+            }"#,
+        );
+        // The only identity-bearing value that survives is the name.
+        assert_eq!(input.name, "renamed");
+        // Everything optional defaults to absent, i.e. "leave unchanged".
+        assert!(input.enabled.is_none());
+        assert!(input.priority.is_none());
+        assert!(input.expires_at.is_none());
+        assert!(input.quota_micros.is_none());
+        assert!(input.allowed_models.is_none());
+        assert!(input.ip_allowlist.is_none());
+        assert!(input.group_name.is_none());
+        assert!(input.cross_group_retry.is_none());
+    }
+
+    /// The reference restricts its update to a known column set
+    /// (`model/token.go:315`), and so does this.
+    #[test]
+    fn the_update_accepts_the_editable_fields() {
+        let input = parse(
+            r#"{
+                "name": "n",
+                "enabled": false,
+                "priority": 3,
+                "expires_at": "2030-01-01T00:00:00Z",
+                "quota_micros": 42,
+                "allowed_models": ["gpt-4o"],
+                "ip_allowlist": ["10.0.0.1"],
+                "group_name": "vip",
+                "cross_group_retry": false
+            }"#,
+        );
+        assert_eq!(input.name, "n");
+        assert_eq!(input.enabled, Some(false));
+        assert_eq!(input.priority, Some(3));
+        assert!(input.expires_at.is_some());
+        assert_eq!(input.quota_micros, Some(42));
+        assert_eq!(input.allowed_models, Some(vec!["gpt-4o".to_string()]));
+        assert_eq!(input.ip_allowlist, Some(vec!["10.0.0.1".to_string()]));
+        assert_eq!(input.group_name, Some("vip".to_string()));
+        assert_eq!(input.cross_group_retry, Some(false));
+    }
+
+    #[test]
+    fn only_the_name_is_required() {
+        // A minimal update renames and touches nothing else, which is what makes
+        // extending an expiry or fixing a typo safe.
+        let input = parse(r#"{"name": "renamed"}"#);
+        assert_eq!(input.name, "renamed");
+        // Omitting the name is a parse error rather than a silent no-op.
+        assert!(serde_json::from_str::<KeyUpdateInput>(r#"{"enabled": true}"#).is_err());
     }
 }

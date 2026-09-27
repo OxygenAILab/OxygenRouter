@@ -337,6 +337,32 @@ reference requires for enable/disable (`controller/twofa.go`).
 
 ### Subscription quota funds requests (2026-09-26)
 
+### API keys can be edited without rotating them (2026-09-28)
+
+`PUT /api/keys/:id` closes the last undelivered superset delta (D6). The reference
+has full update semantics (`controller/token.go:383`, writing the column set its
+`model/token.go:315` names); we had only create and delete.
+
+That gap was not merely ergonomic. Without an update, changing a key's name or
+extending its expiry meant deleting it and creating a new one, which **rotates the
+credential** and breaks every client already using it.
+
+Editable: `name`, `enabled`, `priority`, `expires_at`, `quota_micros`,
+`allowed_models`, `ip_allowlist`, `group_name`, `cross_group_retry`. Omitted fields
+are left unchanged.
+
+Immutable by construction — copied from the stored row, never read from the body:
+`key`, `user_id`, `id`, `created_at` and `used_micros`. This is enforced by the
+input type being a narrow struct rather than a whole `ApiKey`; a full-object PUT
+would let a caller rewrite `used_micros` (erasing usage), `user_id` (billing
+someone else's wallet) or `key` (silently rotating the credential). A test asserts
+those names are not part of the struct at all, so a later "just reuse `ApiKey`"
+refactor fails rather than quietly reopening it.
+
+Verified live: the credential is unchanged after an update, omitted fields keep
+their values, immutable fields cannot be rewritten, another user's edit is refused,
+an unknown id is `404`, and the response is masked like every other read.
+
 ### The role hierarchy is enforced (fixed 2026-09-28) — **was critical**
 
 An ordinary admin could **promote itself to the owner role**. Verified live before
