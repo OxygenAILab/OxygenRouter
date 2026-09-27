@@ -6,6 +6,7 @@ pub mod authz;
 mod config;
 mod db;
 mod models;
+pub mod net;
 mod options;
 pub mod totp;
 

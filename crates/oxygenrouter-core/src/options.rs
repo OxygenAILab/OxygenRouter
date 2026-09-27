@@ -109,7 +109,12 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("UserAgent", Operations, String, "OxygenRouter/0.1.0", "User-Agent sent upstream"),
     // Security
     schema!("LocalApiToken", Security, String, "", "Bearer token required from local clients", secret),
-    schema!("IpAllowlistEnabled", Security, Bool, "false", "Enforce token IP allowlists"),
+    // No `IpAllowlistEnabled`. The reference has no such switch: a token's own
+    // `allow_ips` is enforced whenever it is set (`middleware/auth.go:424`), and
+    // an empty list means unrestricted. Offering a global switch here would let
+    // an operator believe they had disabled a protection that is still active in
+    // the only direction that matters, and its shipped default of `false` would
+    // have contradicted the enforcement we already had.
     schema!("MaxLoginAttempts", Security, Int, "5", "Failed sign-ins before a temporary lock"),
     schema!("AuditLogEnabled", Security, Bool, "true", "Record administrative operations"),
     // Models

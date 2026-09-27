@@ -181,6 +181,23 @@ pub struct Database {
 /// cannot drift apart.
 pub const DEFAULT_MIN_PASSWORD_LEN: usize = 8;
 
+/// True when `remote_ip` is admitted by a token's allowlist.
+///
+/// The caller has already established the list is non-empty; an empty list means
+/// "no restriction" and never reaches here.
+fn token_ip_allowed(allowlist: &[String], remote_ip: &str) -> bool {
+    if allowlist.iter().any(|entry| entry.trim() == "*") {
+        return true;
+    }
+    // An unresolvable caller address cannot be matched against anything, so it is
+    // refused rather than admitted. A list the operator wrote is a restriction,
+    // and "we could not tell where you are" is not an exemption from it.
+    let Ok(ip) = remote_ip.trim().parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    crate::net::ip_listed(ip, allowlist)
+}
+
 impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
@@ -840,12 +857,12 @@ impl Database {
         {
             return Err(ApiKeyResolutionError::ModelDisallowed);
         }
-        if !key.ip_allowlist.is_empty()
-            && !key
-                .ip_allowlist
-                .iter()
-                .any(|ip| ip == "*" || ip == remote_ip)
-        {
+        // The console has always described this field as "exact IP or *", but
+        // the reference token model accepts CIDRs too (`model/token.go:84`, and
+        // its own tests use `198.51.100.0/24`), and an address list that cannot
+        // express a subnet is not much use to an operator. `*` stays as the
+        // documented escape hatch.
+        if !key.ip_allowlist.is_empty() && !token_ip_allowed(&key.ip_allowlist, remote_ip) {
             return Err(ApiKeyResolutionError::IpDisallowed);
         }
         Ok(key)
@@ -3437,6 +3454,49 @@ mod tests {
         // Clearing is explicit and complete.
         assert_eq!(db.clear_audit_logs().unwrap(), 1);
         assert_eq!(db.count_audit_logs().unwrap(), 0);
+    }
+
+    /// The token allowlist used to compare addresses as strings, so a subnet
+    /// could not be expressed and `10.0.0.0/8` matched nothing. The reference
+    /// accepts CIDRs (`model/token.go:84`) and its own tests use
+    /// `198.51.100.0/24`. `*` remains the documented escape hatch.
+    #[test]
+    fn a_token_allowlist_accepts_cidrs_exact_addresses_and_star() {
+        let db = database();
+        let key_with = |id: &str, allow: Vec<&str>| {
+            let mut k = ApiKey::new(format!("sk-{id}"), id.to_string());
+            k.ip_allowlist = allow.into_iter().map(|s| s.to_string()).collect();
+            db.upsert_api_key(&k).unwrap();
+            format!("sk-{id}")
+        };
+
+        // A subnet is a subnet, not a string.
+        let token = key_with("cidr", vec!["10.0.0.0/8"]);
+        assert!(db.resolve_api_key(&token, "m", "10.1.2.3").is_ok());
+        assert!(db.resolve_api_key(&token, "m", "11.1.2.3").is_err());
+
+        // An exact address still works, whitespace and all.
+        let token = key_with("exact", vec![" 203.0.113.7 "]);
+        assert!(db.resolve_api_key(&token, "m", "203.0.113.7").is_ok());
+        assert!(db.resolve_api_key(&token, "m", "203.0.113.8").is_err());
+
+        // `*` admits anyone, which is what the console promises.
+        let token = key_with("star", vec!["*"]);
+        assert!(db.resolve_api_key(&token, "m", "192.0.2.9").is_ok());
+
+        // An empty list is "no restriction", not "deny everyone".
+        let token = key_with("open", vec![]);
+        assert!(db.resolve_api_key(&token, "m", "192.0.2.9").is_ok());
+
+        // A caller whose address cannot be determined is refused when a list is
+        // configured: "we cannot tell where you are" is not an exemption.
+        let token = key_with("strict", vec!["10.0.0.0/8"]);
+        assert!(db.resolve_api_key(&token, "m", "unknown").is_err());
+        assert!(db.resolve_api_key(&token, "m", "").is_err());
+
+        // A typo must not widen the list.
+        let token = key_with("typo", vec!["10.0.0.0/99"]);
+        assert!(db.resolve_api_key(&token, "m", "10.0.0.0").is_err());
     }
 }
 

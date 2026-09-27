@@ -266,49 +266,16 @@ pub fn domain_listed(host: &str, list: &[String]) -> bool {
     })
 }
 
-/// True when `ip` falls in any listed CIDR or equals a listed address.
-pub fn ip_listed(ip: IpAddr, list: &[String]) -> bool {
-    list.iter().any(|entry| match parse_cidr(entry.trim()) {
-        Some((network, prefix)) => cidr_contains(network, prefix, ip),
-        None => entry.trim().parse::<IpAddr>().map(|e| e == ip).unwrap_or(false),
-    })
-}
-
-/// Parse `a.b.c.d/len` or `::/len` into a network address and prefix length.
-fn parse_cidr(entry: &str) -> Option<(IpAddr, u8)> {
-    let (addr, prefix) = match entry.split_once('/') {
-        Some((a, p)) => (a.parse::<IpAddr>().ok()?, p.parse::<u8>().ok()?),
-        None => return None,
-    };
-    let max = if addr.is_ipv4() { 32 } else { 128 };
-    (prefix <= max).then_some((addr, prefix))
-}
-
-fn cidr_contains(network: IpAddr, prefix: u8, ip: IpAddr) -> bool {
-    match (network, ip) {
-        (IpAddr::V4(net), IpAddr::V4(ip)) => {
-            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-            (u32::from(net) & mask) == (u32::from(ip) & mask)
-        }
-        (IpAddr::V6(net), IpAddr::V6(ip)) => {
-            let mask = if prefix == 0 {
-                0u128
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            (u128::from(net) & mask) == (u128::from(ip) & mask)
-        }
-        // A v4-mapped v6 address is checked against a v4 rule and vice versa.
-        (IpAddr::V4(net), IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
-            Some(v4) => cidr_contains(IpAddr::V4(net), prefix, IpAddr::V4(v4)),
-            None => false,
-        },
-        (IpAddr::V6(net), IpAddr::V4(ip)) => match net.to_ipv4_mapped() {
-            Some(v4) => cidr_contains(IpAddr::V4(v4), prefix, IpAddr::V4(ip)),
-            None => false,
-        },
-    }
-}
+/// True when ip falls in any listed CIDR or equals a listed address.
+///
+/// Re-exported from oxygenrouter-core::net, which owns the single
+/// implementation: a token allowlist needs exactly these rules and the storage
+/// layer cannot depend on this crate, so the matcher moved down instead of being
+/// copied. One implementation means the SSRF filter and the key allowlist can
+/// never disagree about whether an address is listed.
+pub use oxygenrouter_core::net::ip_listed;
+// The special-purpose-range table below and the tests use these directly.
+use oxygenrouter_core::net::cidr_contains;
 
 /// True for private, loopback, link-local, multicast, broadcast and reserved
 /// addresses, following the IANA special-purpose registries.
@@ -375,6 +342,7 @@ fn is_private_v4(v4: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxygenrouter_core::net::parse_cidr;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("valid ip")
