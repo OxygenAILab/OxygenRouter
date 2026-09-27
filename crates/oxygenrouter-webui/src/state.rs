@@ -38,12 +38,6 @@ pub struct AppState {
     pub concurrency: Arc<ConcurrencyGuard>,
     /// Rate limit applied to relay endpoints per client IP. `0` disables it.
     pub relay_rate_limit: RateLimit,
-    /// Policy for server-side fetches of a stored URL (channel model sync).
-    ///
-    /// The relay path is deliberately not gated by this: provider base URLs are
-    /// operator-managed deployment targets, matching NewAPI's decision to keep
-    /// its SSRF-protected client off the provider path.
-    pub fetch_policy: SsrfPolicy,
 }
 
 impl AppState {
@@ -77,16 +71,20 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::new()),
             concurrency: Arc::new(ConcurrencyGuard::new(0)),
             relay_rate_limit: RateLimit::disabled(),
-            fetch_policy: SsrfPolicy::default(),
         }
     }
 
     /// Build the fetch policy from the `FetchSetting.*` options.
     ///
-    /// Called at startup and after an admin edits them, so a change takes effect
-    /// without a restart. Parsing failures keep the previous policy rather than
-    /// silently widening it.
-    pub fn reload_fetch_policy(&mut self) {
+    /// Derived on demand rather than cached on the struct. A cached copy has to
+    /// be invalidated by whoever writes the option, and one forgotten call site
+    /// silently reverts to the old policy — the same class of defect this
+    /// project has now hit repeatedly. Channel model sync is not a hot path, so
+    /// there is nothing to gain by caching it.
+    ///
+    /// Parsing failures fall back to the default rather than silently widening
+    /// the policy.
+    pub fn fetch_policy(&self) -> SsrfPolicy {
         use oxygenrouter_proxy::ssrf::FilterMode;
 
         let read_bool = |key: &str, fallback: bool| -> bool {
@@ -107,8 +105,7 @@ impl AppState {
         if !enabled {
             // Protection off means the operator has accepted the risk; keep the
             // scheme check but drop the address and port rules.
-            self.fetch_policy = SsrfPolicy::scheme_only();
-            return;
+            return SsrfPolicy::scheme_only();
         }
         policy.allow_private_ip = read_bool("FetchSetting.AllowPrivateIp", false);
         // An empty or unparsable port list falls back to the shipped default
@@ -122,7 +119,7 @@ impl AppState {
         // Both filters stay in denylist mode with empty lists, as upstream ships.
         policy.domain_mode = FilterMode::Denylist;
         policy.ip_mode = FilterMode::Denylist;
-        self.fetch_policy = policy;
+        policy
     }
 
     /// Configure the global in-flight ceiling and the per-IP relay rate limit.
@@ -135,6 +132,38 @@ impl AppState {
         } else {
             RateLimit::new(requests_per_minute, 60)
         };
+    }
+
+    /// Minutes a login lock lasts once it trips.
+    ///
+    /// Not exposed as an option: NewAPI's own lock is a fixed window, and adding
+    /// a second knob nobody asked for would be inventing policy rather than
+    /// matching it.
+    pub const LOGIN_LOCK_WINDOW_SECS: u64 = 900;
+
+    /// The login-failure limit, from `MaxLoginAttempts`.
+    ///
+    /// Without this the option was *advertised and inert*: the console labelled it
+    /// "Failed sign-ins before a temporary lock" while no code path ever read it,
+    /// so brute-force protection did not exist at all. `0` or a negative value
+    /// disables the lock, matching the convention every other `*Enabled`-style
+    /// option follows.
+    ///
+    /// Derived per sign-in attempt rather than cached: login is not a hot path,
+    /// and a cache would need invalidating whenever the option is written.
+    pub fn login_rate_limit(&self) -> RateLimit {
+        let attempts = self
+            .db
+            .get_setting("MaxLoginAttempts")
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .unwrap_or(5);
+        if attempts <= 0 {
+            RateLimit::disabled()
+        } else {
+            RateLimit::new(attempts.min(u32::MAX as i64) as u32, Self::LOGIN_LOCK_WINDOW_SECS)
+        }
     }
 
     pub async fn reload_scheduler_maps(&self) {

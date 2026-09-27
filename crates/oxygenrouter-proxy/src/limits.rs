@@ -142,6 +142,43 @@ impl RateLimiter {
         Ok(())
     }
 
+    /// How many seconds remain before `scope`'s window resets.
+    ///
+    /// Answers "how long must this caller wait before retrying", so it reports a
+    /// duration **only when the caller is currently refused**. A scope that has
+    /// accumulated failures but still has budget is not waiting for anything,
+    /// and reporting the window there would lock a caller out one attempt early
+    /// — which is exactly what a first draft of this did.
+    ///
+    /// Read-only by design: asking how much longer a lock has to run must not
+    /// itself extend it, so this cannot be expressed through `check`.
+    pub fn retry_after_secs(&self, scope: &str, limit: RateLimit, now: Instant) -> Option<u64> {
+        if !limit.is_enabled() {
+            return None;
+        }
+        let windows = self.windows.lock();
+        let entry = windows.get(scope)?;
+        if entry.count < limit.max_requests {
+            // Under the limit: this caller may retry now.
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(entry.started);
+        if elapsed >= limit.window {
+            // The window has already lapsed; nothing to wait for.
+            return None;
+        }
+        Some(limit.window.saturating_sub(elapsed).as_secs().max(1))
+    }
+
+    /// Forget a scope's window.
+    ///
+    /// Used to clear a failure count once the caller proves it is legitimate;
+    /// without it a user who mistyped a few times would stay one attempt away
+    /// from a lock for the rest of the window.
+    pub fn reset(&self, scope: &str) {
+        self.windows.lock().remove(scope);
+    }
+
     /// Drop windows that have elapsed, so the map does not grow without bound
     /// when scopes are high-cardinality (e.g. one per client IP).
     pub fn prune(&self, now: Instant, longest: Duration) -> usize {
@@ -273,6 +310,87 @@ mod tests {
         assert!(limiter.check_at("ip-b", limit, now).is_ok());
         // But the first is exhausted.
         assert!(limiter.check_at("ip-a", limit, now).is_err());
+    }
+
+    #[test]
+    fn the_remaining_window_is_reported_without_extending_it() {
+        let limiter = RateLimiter::new();
+        let limit = RateLimit::new(1, 60);
+        let start = Instant::now();
+
+        // Nothing has failed yet, so there is no window to wait out.
+        assert_eq!(limiter.retry_after_secs("s", limit, start), None);
+
+        assert!(limiter.check_at("s", limit, start).is_ok());
+        assert_eq!(
+            limiter.retry_after_secs("s", limit, start),
+            Some(60),
+            "a fresh window reports the full window"
+        );
+
+        // Reading the remaining time must not itself consume budget: were the
+        // query implemented as a `check`, this call would trip the limit.
+        let midway = start + Duration::from_secs(20);
+        assert_eq!(limiter.retry_after_secs("s", limit, midway), Some(40));
+        assert!(limiter.check_at("s", limit, midway).is_err());
+        assert_eq!(
+            limiter.retry_after_secs("s", limit, midway),
+            Some(40),
+            "the window start did not move"
+        );
+
+        // Once it elapses there is nothing left to wait for.
+        let after = start + Duration::from_secs(61);
+        assert_eq!(limiter.retry_after_secs("s", limit, after), None);
+
+        // A disabled limit never reports a wait, because it never refuses.
+        assert_eq!(
+            limiter.retry_after_secs("s", RateLimit::disabled(), start),
+            None
+        );
+    }
+
+    #[test]
+    fn failures_below_the_ceiling_are_not_reported_as_a_lock() {
+        // The distinction that a first draft of this guard got wrong: a caller
+        // who has *failed* is not the same as a caller who is *refused*. The
+        // three-failure limit must still accept the second and third attempt.
+        let limiter = RateLimiter::new();
+        let limit = RateLimit::new(3, 900);
+        let now = Instant::now();
+        for attempt in 1..=2 {
+            assert!(
+                limiter.check_at("caller", limit, now).is_ok(),
+                "attempt {attempt} of 3 must be admitted"
+            );
+            assert_eq!(
+                limiter.retry_after_secs("caller", limit, now),
+                None,
+                "attempt {attempt} of 3 is not yet a lock"
+            );
+        }
+        // The third exhausts the budget, and only now is there a wait to report.
+        assert!(limiter.check_at("caller", limit, now).is_ok());
+        assert_eq!(limiter.retry_after_secs("caller", limit, now), Some(900));
+    }
+
+    #[test]
+    fn resetting_a_scope_gives_it_a_clean_window() {
+        let limiter = RateLimiter::new();
+        let limit = RateLimit::new(1, 60);
+        let now = Instant::now();
+        assert!(limiter.check_at("s", limit, now).is_ok());
+        assert!(limiter.check_at("s", limit, now).is_err());
+        assert_eq!(limiter.retry_after_secs("s", limit, now), Some(60));
+
+        limiter.reset("s");
+        assert_eq!(limiter.retry_after_secs("s", limit, now), None);
+        assert!(
+            limiter.check_at("s", limit, now).is_ok(),
+            "a reset scope must accept again"
+        );
+        // Resetting an unknown scope is a no-op, not a panic.
+        limiter.reset("never-seen");
     }
 
     #[test]

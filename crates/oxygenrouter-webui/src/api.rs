@@ -400,6 +400,44 @@ struct LoginResponse {
     session_token: String,
     expires_at: chrono::DateTime<Utc>,
 }
+
+/// Refuse a login while the caller's failure window has not reset.
+///
+/// The scope is the caller's address, not the username: keying on the username
+/// would let an attacker lock a known account out on purpose, which turns a
+/// protection into the denial of service it is meant to prevent.
+///
+/// Returns `Some(response)` when the attempt must be refused.
+fn login_lock_response(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let scope = login_lock_scope(headers);
+    let now = std::time::Instant::now();
+    let limit = state.login_rate_limit();
+    if let Some(retry_after) = state.rate_limiter.retry_after_secs(&scope, limit, now) {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse::<LoginResponse>::err(format!(
+                "too many failed sign-in attempts; try again in {retry_after}s"
+            ))),
+        )
+            .into_response();
+        if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert("retry-after", value);
+        }
+        return Some(response);
+    }
+    None
+}
+
+/// One failure window per caller address.
+///
+/// A request with no resolvable address (no socket peer, no forwarding header)
+/// shares a single window. That over-limits the unnamed caller rather than
+/// under-limiting it, which is the correct direction for an authentication
+/// guard: failing closed must not become "unlimited attempts".
+fn login_lock_scope(headers: &HeaderMap) -> String {
+    format!("login:{}", crate::proxy::caller_address(headers))
+}
+
 async fn register(State(s): State<Arc<AppState>>, Json(input): Json<RegisterInput>) -> Response {
     match s.db.create_user(
         &input.username,
@@ -411,7 +449,14 @@ async fn register(State(s): State<Arc<AppState>>, Json(input): Json<RegisterInpu
         Err(e) => db_error::<User>(e),
     }
 }
-async fn login(State(s): State<Arc<AppState>>, Json(input): Json<LoginInput>) -> Response {
+async fn login(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<LoginInput>,
+) -> Response {
+    if let Some(locked) = login_lock_response(&s, &headers) {
+        return locked;
+    }
     match s.db.authenticate(&input.username, &input.password) {
         Ok(Some(user)) => {
             // Two-factor gate. When a user has 2FA on, a correct password is only
@@ -438,22 +483,44 @@ async fn login(State(s): State<Arc<AppState>>, Json(input): Json<LoginInput>) ->
                 }
             }
             match s.db.create_session(&user.id, chrono::Duration::days(7)) {
-                Ok(session) => Json(ApiResponse::ok(LoginResponse {
-                    user,
-                    session_token: session.token,
-                    expires_at: session.expires_at,
-                }))
-                .into_response(),
+                Ok(session) => {
+                    // A completed sign-in clears the caller's failure count, so a
+                    // legitimate user who mistyped a few times is not left one
+                    // attempt away from a lock.
+                    s.rate_limiter.reset(&login_lock_scope(&headers));
+                    Json(ApiResponse::ok(LoginResponse {
+                        user,
+                        session_token: session.token,
+                        expires_at: session.expires_at,
+                    }))
+                    .into_response()
+                }
                 Err(e) => db_error::<LoginResponse>(e),
             }
         }
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::<LoginResponse>::err(
-                "invalid username or password",
-            )),
-        )
-            .into_response(),
+        Ok(None) => {
+            let outcome = s
+                .rate_limiter
+                .check(&login_lock_scope(&headers), s.login_rate_limit());
+            let mut response = (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::<LoginResponse>::err(
+                    "invalid username or password",
+                )),
+            )
+                .into_response();
+            // Report how long the lock now runs, so a client can back off instead
+            // of hammering. Advisory only: the delay is never applied here, which
+            // is what keeps the counter accurate and the test fast.
+            if let Err(error) = outcome {
+                if let Some(retry_after) = error.retry_after_secs() {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+                        response.headers_mut().insert("retry-after", value);
+                    }
+                }
+            }
+            response
+        }
         Err(e) => db_error::<LoginResponse>(e),
     }
 }
@@ -1816,7 +1883,7 @@ async fn fetch_channel_models(
     // they are operator-managed deployment targets that may legitimately be
     // private (a LAN vLLM or Ollama host), whereas this endpoint tells the
     // server to dereference a URL on demand.
-    if let Err(error) = s.fetch_policy.validate_url(&url) {
+    if let Err(error) = s.fetch_policy().validate_url(&url) {
         return (
             StatusCode::FORBIDDEN,
             Json(ApiResponse::<Channel>::err(format!(
@@ -3194,10 +3261,14 @@ async fn update_option(
     if schema.secret && input.value.ends_with('\u{2026}') {
         return Json(ApiResponse::ok("unchanged"));
     }
-    Json(match s.db.set_setting(schema.key, &input.value) {
-        Ok(()) => ApiResponse::ok("updated"),
-        Err(error) => ApiResponse::err(error.to_string()),
-    })
+    // No invalidation needed here: `MaxLoginAttempts` and the `FetchSetting.*`
+    // options are re-derived from the store by the request paths that use them,
+    // so a write is live immediately. Only the options that must be *validated
+    // as a set* keep a reload hook.
+    match s.db.set_setting(schema.key, &input.value) {
+        Ok(()) => Json(ApiResponse::ok("updated")),
+        Err(error) => Json(ApiResponse::err(error.to_string())),
+    }
 }
 
 async fn update_settings(

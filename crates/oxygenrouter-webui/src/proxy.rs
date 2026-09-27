@@ -969,6 +969,21 @@ fn client_scope(headers: &axum::http::HeaderMap) -> String {
     }
 }
 
+/// The caller's address, for scoping guards that are keyed on origin rather
+/// than on a credential.
+///
+/// Exposed so the console's login lock and the relay's rate limit derive the
+/// address the same way — two implementations of "where did this come from"
+/// would eventually disagree, and the disagreement would be a bypass.
+pub fn caller_address(headers: &axum::http::HeaderMap) -> String {
+    let ip = remote_ip(headers);
+    if ip.is_empty() {
+        "anonymous".to_string()
+    } else {
+        ip
+    }
+}
+
 /// Render a limit rejection in the OpenAI error shape.
 fn limit_error_response(error: oxygenrouter_proxy::limits::LimitError) -> Response {
     let message = match error {
