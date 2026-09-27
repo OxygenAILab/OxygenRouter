@@ -3106,7 +3106,6 @@ impl Database {
                 .lock()
                 .query_row("SELECT COUNT(*) FROM request_logs", [], |r| r.get(0))?;
 
-        let cfg = super::APP_CONFIG.read();
         Ok(SystemStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: start_time.elapsed().as_secs(),
@@ -3114,9 +3113,9 @@ impl Database {
             enabled_channels,
             total_requests,
             active_requests: 0,
-            local_api_token: cfg.local_api_token.clone(),
-            listen_host: cfg.listen_host.clone(),
-            listen_port: cfg.listen_port,
+            // Filled by the handler for an authenticated caller only.
+            listen_host: None,
+            listen_port: None,
         })
     }
 }

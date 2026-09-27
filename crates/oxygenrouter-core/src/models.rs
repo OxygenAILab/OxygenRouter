@@ -472,15 +472,29 @@ pub struct ChannelTestResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStatus {
+    /// Public: the WebUI landing page shows this before anyone signs in, and
+    /// `/api/status` is a public route.
+    ///
+    /// Deliberately **not** here: the local API token and the bind address. Those
+    /// were part of this payload and were served to anonymous callers, which made
+    /// `GET /api/status` — the readiness probe, reachable by anyone who can open
+    /// the port — a credential disclosure for the whole gateway. An operator who
+    /// needs them signs in; `GET /api/system/info` is root-only and returns them.
     pub version: String,
     pub uptime_seconds: u64,
     pub total_channels: i64,
     pub enabled_channels: i64,
     pub total_requests: i64,
     pub active_requests: i64,
-    pub local_api_token: String,
-    pub listen_host: String,
-    pub listen_port: u16,
+    /// The bind address, filled in only for an authenticated caller.
+    ///
+    /// Absent from the anonymous payload because it describes the instance's
+    /// deployment, which is not a signed-out visitor's business; `None` means
+    /// "not disclosed to you" rather than "not configured".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

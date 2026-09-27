@@ -269,9 +269,13 @@ export interface SystemStatus {
   enabled_channels: number;
   total_requests: number;
   active_requests: number;
-  local_api_token: string;
-  listen_host: string;
-  listen_port: number;
+  /**
+   * Present only for an authenticated caller: /status is public, so the bind
+   * address is withheld from the anonymous payload. The local API token is not
+   * part of this shape at all -- it arrives from the root-only /system/info.
+   */
+  listen_host?: string;
+  listen_port?: number;
 }
 
 export interface DashboardBreakdown {

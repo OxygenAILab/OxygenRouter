@@ -3390,11 +3390,24 @@ async fn stream_logs(State(s): State<Arc<AppState>>) -> Response {
 
 async fn get_status(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Json<ApiResponse<oxygenrouter_core::SystemStatus>> {
-    Json(match s.db.get_system_status(s.start_time) {
-        Ok(st) => ApiResponse::ok(st),
-        Err(e) => ApiResponse::err(e.to_string()),
-    })
+    let mut status = match s.db.get_system_status(s.start_time) {
+        Ok(st) => st,
+        Err(e) => return Json(ApiResponse::err(e.to_string())),
+    };
+    // This route is public, so it can only ever carry what a signed-out visitor
+    // may see. An authenticated caller additionally gets the bind address, which
+    // the console shows next to its own endpoint. The local API token is *not*
+    // here for anyone: it is a credential, and a credential belongs on the
+    // root-only `/api/system/info` rather than in a payload fetched by every page
+    // load.
+    if auth_user(&s, &headers).is_ok() {
+        let cfg = oxygenrouter_core::APP_CONFIG.read();
+        status.listen_host = Some(cfg.listen_host.clone());
+        status.listen_port = Some(cfg.listen_port);
+    }
+    Json(ApiResponse::ok(status))
 }
 
 async fn get_dashboard(
@@ -4152,6 +4165,63 @@ mod log_scoping_tests {
         assert_ne!(required_access("/api/audit-logs"), Access::Admin);
         // And not public, in any spelling.
         assert_ne!(required_access("/api/audit-logs"), Access::Public);
+    }
+
+    /// The public readiness probe must not carry a credential.
+    ///
+    /// Verified live before the fix: `GET /api/status`, which is in
+    /// `PUBLIC_ROUTES`, returned the instance's local API token and its bind
+    /// address to a completely anonymous caller — every client using
+    /// `Authorization: Bearer <that token>` is then impersonable by anyone who
+    /// can open the port. The struct is the gate here: a field cannot be
+    /// serialised out of a payload it is not part of.
+    #[test]
+    fn the_public_status_payload_carries_no_credential() {
+        use oxygenrouter_core::SystemStatus;
+
+        // Enumerate the payload by serialising a value and inspecting every key,
+        // so a newly added field is covered without editing this test.
+        let status = SystemStatus {
+            version: "0".into(),
+            uptime_seconds: 0,
+            total_channels: 0,
+            enabled_channels: 0,
+            total_requests: 0,
+            active_requests: 0,
+            listen_host: None,
+            listen_port: None,
+        };
+        let json = serde_json::to_value(&status).expect("system status serialises");
+        let keys: Vec<&str> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        for forbidden in [
+            "local_api_token",
+            "api_token",
+            "token",
+            "secret",
+            "password",
+            "key",
+        ] {
+            assert!(
+                !keys.contains(&forbidden),
+                "the public status payload must not carry {forbidden:?}; keys: {keys:?}"
+            );
+        }
+        // And nothing whose *name* merely suggests one.
+        assert!(
+            !keys.iter().any(|k| k.contains("token") || k.contains("secret")),
+            "a credential-shaped field reached the public payload: {keys:?}"
+        );
+        // The anonymous shape omits the bind address entirely rather than
+        // sending it as null, so a client cannot mistake absence for a value.
+        assert!(!keys.contains(&"listen_host"), "{keys:?}");
+        assert!(!keys.contains(&"listen_port"), "{keys:?}");
+        assert_eq!(required_access("/api/status"), Access::Public);
     }
 }
 

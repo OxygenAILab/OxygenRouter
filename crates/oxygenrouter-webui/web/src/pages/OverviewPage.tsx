@@ -85,7 +85,16 @@ export default function OverviewPage() {
     refetchInterval: 30_000,
   });
 
-  const baseUrl = status ? `http://${status.listen_host}:${status.listen_port}` : "http://127.0.0.1:3001";
+  // The bind address only arrives for a signed-in caller, and the public
+  // catalogue page renders before that. Falling back to the page's own origin
+  // is both correct and more useful than the shipped default: it is the address
+  // the visitor actually reached the gateway on.
+  const baseUrl =
+    status?.listen_host && status.listen_port
+      ? `http://${status.listen_host}:${status.listen_port}`
+      : typeof window !== "undefined"
+        ? window.location.origin
+        : "http://127.0.0.1:3001";
   const enabledChannels = channels?.filter((c) => c.enabled).length ?? 0;
   const totalChannels = channels?.length ?? 0;
   const hasChannels = totalChannels > 0;
