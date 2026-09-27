@@ -3670,3 +3670,179 @@ mod role_hierarchy_tests {
         assert!(!UserRole::can_assign(&Admin, &Admin));
     }
 }
+
+
+/// Guards over the classification itself, read from this file at test time.
+///
+/// The point is that the *source* is the input, not a hand-maintained list: if
+/// someone adds a user-class route whose handler forgets to resolve the caller, or
+/// marks a sensitive prefix as public, this fails. That is the failure mode behind
+/// the earlier anonymous-access defect — a route that was simply never classified
+/// — so it is worth a test that reads the code rather than trusting review.
+#[cfg(test)]
+mod classification_audit_tests {
+    use super::*;
+
+    /// Every route in the router, paired with its handler name, scraped from the
+    /// `router()` source.
+    fn routes_from_source() -> Vec<(String, String)> {
+        let source = include_str!("api.rs");
+        let mut out = Vec::new();
+        let mut rest = source;
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + 7..];
+            let Some(quote) = rest.find('"') else { break };
+            let after = &rest[quote + 1..];
+            let Some(end) = after.find('"') else { break };
+            let path = after[..end].to_string();
+            let tail = &after[end..];
+            // Bound the route expression by paren depth rather than a fixed window:
+            // a window walks past the end of a short route and attributes the *next*
+            // route's handler to this path, which produced a list of phantom
+            // offenders when this was first written.
+            //
+            // The `.route(` opening paren is already consumed, so depth starts at
+            // zero and the expression ends at the `)` that takes it negative.
+            let mut depth = 0i32;
+            let mut end_at = tail.len();
+            for (i, ch) in tail.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            end_at = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let window = &tail[..end_at];
+            // Handler names are identifiers immediately followed by `(`.
+            let bytes = window.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+                    let start = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                    // A handler is passed by name, so it is *not* followed by `(` —
+                    // it appears as a bare argument, e.g. `get(list_channels)`.
+                    // Being defined as `async fn` in this file is the real filter.
+                    let name = &window[start..i];
+                    if source.contains(&format!("async fn {name}(")) {
+                        out.push((path.clone(), name.to_string()));
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            rest = tail;
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn the_router_is_scrapable_so_this_audit_is_real() {
+        // If this ever returns nothing the test below is vacuous rather than
+        // passing, so assert the scrape actually found the router.
+        let routes = routes_from_source();
+        assert!(
+            routes.len() > 50,
+            "expected the router to be scraped, found {} routes",
+            routes.len()
+        );
+        assert!(routes.iter().any(|(p, _)| p == "/api/channels"));
+        assert!(routes.iter().any(|(p, _)| p == "/api/logs/self"));
+    }
+
+    #[test]
+    fn a_user_class_route_resolves_the_caller() {
+        // User-class handlers must derive identity from the credential, not from a
+        // body field, or one user could act as another. `logout` is the deliberate
+        // exception: it only needs the token to revoke it, and authenticates by
+        // looking the session up directly.
+        let source = include_str!("api.rs");
+        let mut offenders = Vec::new();
+        for (path, handler) in routes_from_source() {
+            if required_access(&path) != Access::User || path.starts_with("/api/auth/") {
+                continue;
+            }
+            let Some(start) = source.find(&format!("async fn {handler}(")) else {
+                continue;
+            };
+            // Slice on a char boundary: the source contains multi-byte box-drawing
+            // characters in comments, and a byte offset can land inside one.
+            let end = source
+                .char_indices()
+                .map(|(i, _)| i)
+                .filter(|i| *i > start && *i <= start + 4000)
+                .last()
+                .unwrap_or(start);
+            let window = &source[start..end];
+            if !window.contains("auth_user") {
+                offenders.push(format!("{path} -> {handler}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "user-class handlers that do not resolve the caller: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn sensitive_prefixes_are_never_public() {
+        // A public classification on any of these would re-open the original
+        // defect: `channels` returns upstream credentials, `options`/`settings`
+        // return instance configuration, and `admin` writes other accounts.
+        for path in [
+            "/api/channels",
+            "/api/channels/abc/keys",
+            "/api/keys",
+            "/api/keys/abc",
+            "/api/options",
+            "/api/settings",
+            "/api/system/info",
+            "/api/logs",
+            "/api/dashboard",
+            "/api/admin/users",
+            "/api/models-metadata",
+            "/api/vendors",
+        ] {
+            assert_ne!(
+                required_access(path),
+                Access::Public,
+                "{path} must never be public"
+            );
+        }
+    }
+
+    #[test]
+    fn every_public_route_is_one_we_chose() {
+        // The public set is an allow-list; this pins its contents so widening it
+        // is a deliberate, reviewable act rather than a side effect.
+        let allowed = [
+            "/api/auth/login",
+            "/api/auth/register",
+            "/api/plans",
+            "/api/status",
+        ];
+        for path in allowed {
+            assert_eq!(required_access(path), Access::Public, "{path}");
+        }
+        // Anything else must not be public, even if it looks related.
+        for path in [
+            "/api/auth/logout",
+            "/api/auth/me",
+            "/api/plans/admin",
+            "/api/status/test",
+            "/api/statusx",
+        ] {
+            assert_ne!(required_access(path), Access::Public, "{path}");
+        }
+    }
+}
