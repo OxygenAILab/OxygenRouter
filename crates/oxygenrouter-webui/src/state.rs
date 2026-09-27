@@ -30,6 +30,11 @@ pub struct AuthPolicy {
     pub password_login_enabled: bool,
     /// `MinPasswordLength`, in characters.
     pub min_password_len: usize,
+    /// `SessionTtlDays` — how long a successful sign-in lasts.
+    ///
+    /// The console has always offered this; the login handler hard-coded seven
+    /// days, so the field did nothing.
+    pub session_ttl: chrono::Duration,
 }
 
 impl Default for AuthPolicy {
@@ -40,6 +45,7 @@ impl Default for AuthPolicy {
             registration_enabled: true,
             password_login_enabled: true,
             min_password_len: oxygenrouter_core::DEFAULT_MIN_PASSWORD_LEN,
+            session_ttl: chrono::Duration::days(7),
         }
     }
 }
@@ -298,6 +304,18 @@ impl AppState {
             registration_enabled: read_bool("RegistrationEnabled", true),
             password_login_enabled: read_bool("PasswordLoginEnabled", true),
             min_password_len,
+            // A nonsensical value (zero or negative) would issue sessions that are
+            // already expired, locking every user out, so it falls back.
+            session_ttl: chrono::Duration::days(
+                self.db
+                    .get_setting("SessionTtlDays")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| raw.trim().parse::<i64>().ok())
+                    .filter(|days| *days >= 1)
+                    .map(|days| days.min(3650))
+                    .unwrap_or(7),
+            ),
         }
     }
 

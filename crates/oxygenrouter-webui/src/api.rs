@@ -693,11 +693,14 @@ async fn login(
     if let Some(locked) = login_lock_response(&s, &headers) {
         return locked;
     }
+    // Read once: the same policy decides whether password sign-in is allowed and
+    // how long the session it produces will last.
+    let policy = s.auth_policy();
     // `PasswordLoginEnabled` off means the password form is not a valid way in,
     // even with correct credentials. Checked after the lock so a disabled
     // instance still reports the lock state rather than leaking that the policy
     // differs; the reference refuses here too (`controller/user.go:54`).
-    if !s.auth_policy().password_login_enabled {
+    if !policy.password_login_enabled {
         return (
             StatusCode::FORBIDDEN,
             Json(ApiResponse::<LoginResponse>::err(
@@ -731,7 +734,9 @@ async fn login(
                         .into_response();
                 }
             }
-            match s.db.create_session(&user.id, chrono::Duration::days(7)) {
+            // `SessionTtlDays` was advertised and ignored: the lifetime was
+            // hard-coded here, so the field could not change it.
+            match s.db.create_session(&user.id, policy.session_ttl) {
                 Ok(session) => {
                     // A completed sign-in clears the caller's failure count, so a
                     // legitimate user who mistyped a few times is not left one
@@ -3407,6 +3412,15 @@ async fn get_status(
         status.listen_host = Some(cfg.listen_host.clone());
         status.listen_port = Some(cfg.listen_port);
     }
+    // A display preference, safe for the signed-out catalogue page too. An empty
+    // or absent value keeps the shipped default rather than rendering a blank
+    // currency, which `Intl.NumberFormat` would reject.
+    if let Ok(Some(currency)) = s.db.get_setting("Currency") {
+        let currency = currency.trim();
+        if !currency.is_empty() {
+            status.currency = currency.to_string();
+        }
+    }
     Json(ApiResponse::ok(status))
 }
 
@@ -4190,6 +4204,7 @@ mod log_scoping_tests {
             active_requests: 0,
             listen_host: None,
             listen_port: None,
+            currency: "USD".into(),
         };
         let json = serde_json::to_value(&status).expect("system status serialises");
         let keys: Vec<&str> = json

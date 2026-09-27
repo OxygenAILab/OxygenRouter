@@ -495,6 +495,12 @@ pub struct SystemStatus {
     pub listen_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_port: Option<u16>,
+    /// The configured display currency, so a signed-out pricing page formats
+    /// amounts the way the operator set them rather than assuming USD.
+    ///
+    /// Public on purpose: it is a display preference, not a credential, and the
+    /// plan catalogue is served before sign-in.
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

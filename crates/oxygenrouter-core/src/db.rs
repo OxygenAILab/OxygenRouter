@@ -3116,6 +3116,9 @@ impl Database {
             // Filled by the handler for an authenticated caller only.
             listen_host: None,
             listen_port: None,
+            // Defaults here; the handler overlays the configured value so the
+            // storage layer does not have to read the option table.
+            currency: "USD".to_string(),
         })
     }
 }

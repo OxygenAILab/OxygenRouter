@@ -276,6 +276,8 @@ export interface SystemStatus {
    */
   listen_host?: string;
   listen_port?: number;
+  /** The configured display currency; a public display preference. */
+  currency: string;
 }
 
 export interface DashboardBreakdown {
