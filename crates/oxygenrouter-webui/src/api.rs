@@ -3123,6 +3123,18 @@ async fn get_settings() -> Json<ApiResponse<oxygenrouter_core::AppSettings>> {
 
 // ── Option system (typed key-value settings, NewAPI parity) ───────────────
 
+/// Take at most `n` **characters** from the front of `value`.
+///
+/// `&value[..n]` slices *bytes*, so it panics whenever byte `n` lands inside a
+/// multi-byte character. Values reach `get_options` from the database, and an
+/// operator may legitimately store a non-ASCII secret — a Chinese passphrase, a
+/// token with a CJK prefix. A panic here is inside an `axum` handler, so the
+/// whole console settings page returns 500 for every root caller until the
+/// value is changed by hand. Counting characters removes the failure mode.
+fn chars_prefix(value: &str, n: usize) -> String {
+    value.chars().take(n).collect()
+}
+
 #[derive(Serialize)]
 struct OptionEntry {
     key: &'static str,
@@ -3146,7 +3158,7 @@ async fn get_options(State(s): State<Arc<AppState>>) -> Json<ApiResponse<Vec<Opt
                 kind: schema.kind,
                 value: if schema.secret && !value.is_empty() {
                     // Never echo secrets in full; expose a masked preview.
-                    format!("{}…", &value[..value.len().min(6)])
+                    format!("{}…", chars_prefix(&value, 6))
                 } else {
                     value
                 },
@@ -3589,6 +3601,54 @@ mod credential_tests {
     }
 }
 
+#[cfg(test)]
+mod multibyte_safety_tests {
+    use super::*;
+
+    /// Regression for a panic, not a cosmetic bug. The option list slices its
+    /// secret preview by **byte** offset (`&value[..6]`). Byte 6 lands inside a
+    /// multi-byte character for any value whose 3rd character is non-ASCII, and
+    /// the slice panics — inside the handler, so `GET /api/options` answers 500
+    /// for every root caller, permanently, until the row is edited by hand.
+    /// `chars_prefix` counts characters and cannot split one.
+    #[test]
+    fn a_multibyte_secret_preview_does_not_split_a_character() {
+        // 密=[0,1,2] x=[3] 碼=[4,5,6]: byte 6 is the *third byte of 碼*, so
+        // `&v[..6]` lands mid-character and panics. Two adjacent wide characters
+        // would not reproduce it — their 6-byte prefix is an exact boundary — so
+        // the ASCII byte in the middle is what makes this fixture a regression.
+        let value = "密x碼abcdefghij";
+        let preview = chars_prefix(value, 6);
+        assert_eq!(preview, "密x碼abc");
+        assert!(preview.ends_with('c'));
+
+        // Every cut point of a mixed-width string must be safe.
+        for n in 0..=value.chars().count() {
+            let cut = chars_prefix(value, n);
+            assert_eq!(cut.chars().count(), n.min(value.chars().count()));
+            assert!(value.starts_with(&cut), "{cut:?} is not a prefix of {value:?}");
+        }
+
+        // The old expression, spelled out, asserts the defect rather than
+        // trusting the comment above. `is_char_boundary` is what the byte slice
+        // required and did not check.
+        let byte_cut = value.len().min(6);
+        assert!(
+            !value.is_char_boundary(byte_cut),
+            "byte {byte_cut} was expected to be mid-character for this fixture"
+        );
+    }
+
+    #[test]
+    fn a_short_multibyte_value_is_returned_whole_by_character_count() {
+        assert_eq!(chars_prefix("密钥", 6), "密钥");
+        assert_eq!(chars_prefix("", 6), "");
+        // Longer than the budget: exactly six characters, still valid UTF-8.
+        let long = "一".repeat(20);
+        assert_eq!(chars_prefix(&long, 6).chars().count(), 6);
+    }
+}
+
 
 #[cfg(test)]
 mod key_masking_tests {
@@ -3668,8 +3728,9 @@ mod key_masking_tests {
     /// round-trip footgun that destroyed channel credentials.
     #[test]
     fn a_masked_secret_is_recognised_as_unchanged() {
-        // What `get_options` returns for a set secret.
-        let preview = format!("{}…", &"sk-live-token-value"[..6]);
+        // What `get_options` returns for a set secret — built with the same
+        // helper the handler uses, so the two cannot drift apart.
+        let preview = format!("{}…", chars_prefix("sk-live-token-value", 6));
         assert!(preview.ends_with('\u{2026}'), "{preview}");
         // A genuine value is not mistaken for one.
         assert!(!("sk-a-brand-new-token").ends_with('\u{2026}'));

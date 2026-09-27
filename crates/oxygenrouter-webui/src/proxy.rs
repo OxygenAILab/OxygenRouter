@@ -949,7 +949,17 @@ fn client_scope(headers: &axum::http::HeaderMap) -> String {
     {
         // Truncated: the scope must distinguish callers without storing the
         // credential itself.
-        return format!("token:{}", &token[..token.len().min(16)]);
+        //
+        // Counted in characters, not bytes. `HeaderValue::to_str` only yields
+        // visible ASCII, so today byte 16 can never land mid-character and this
+        // is not a reachable panic — it is the same trap written up in
+        // `api::chars_prefix`, removed here so a later change to how the header
+        // is read cannot turn it into one. A token that does not parse as ASCII
+        // still falls through to address scoping below.
+        return format!(
+            "token:{}",
+            token.chars().take(16).collect::<String>()
+        );
     }
     let ip = remote_ip(headers);
     if ip.is_empty() {
