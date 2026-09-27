@@ -153,6 +153,16 @@ async fn main() {
                     ),
                     Err(error) => eprintln!("[OxygenRouter] retention prune failed: {error}"),
                 }
+                // The audit trail shares the window. A trail that outlived the
+                // retention its operator configured would be the opposite of
+                // auditable.
+                match state.db.prune_audit_logs(days) {
+                    Ok(0) => {}
+                    Ok(removed) => println!(
+                        "[OxygenRouter] retention: removed {removed} audit rows older than {days}d"
+                    ),
+                    Err(error) => eprintln!("[OxygenRouter] audit prune failed: {error}"),
+                }
             }
         });
     }

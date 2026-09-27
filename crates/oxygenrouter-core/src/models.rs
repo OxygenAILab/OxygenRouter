@@ -310,6 +310,37 @@ pub struct RequestLog {
     pub client_ip: Option<String>,
 }
 
+/// One administrative action, recorded for accountability.
+///
+/// The console has always offered `AuditLogEnabled` with the description
+/// "Record administrative operations", and nothing implemented it — there was
+/// no table at all. The reference keeps these in the same table as traffic,
+/// distinguished by a type column (`model/log.go:88`); a separate table is used
+/// here so traffic retention can be decided independently of the audit trail,
+/// which is the point of an audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLog {
+    pub id: String,
+    /// The acting account, when the action was authenticated.
+    pub actor_id: Option<String>,
+    /// The acting account's name, denormalised: an audit row must stay readable
+    /// after the account it names is deleted.
+    pub actor_name: String,
+    /// The actor's role at the time, for the same reason.
+    pub actor_role: String,
+    /// `POST` / `PUT` / `DELETE` / `PATCH`.
+    pub method: String,
+    /// The console path that was called.
+    pub path: String,
+    /// HTTP status of the response.
+    pub status_code: Option<u16>,
+    /// The request body, with credential-bearing fields replaced. `None` when
+    /// the action had no body.
+    pub detail: Option<String>,
+    pub client_ip: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_listen_host")]

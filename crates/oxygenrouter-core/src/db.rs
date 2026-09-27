@@ -288,6 +288,20 @@ impl Database {
                 updated_at  TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id          TEXT PRIMARY KEY,
+                actor_id    TEXT,
+                actor_name  TEXT NOT NULL DEFAULT '',
+                actor_role  TEXT NOT NULL DEFAULT '',
+                method      TEXT NOT NULL,
+                path        TEXT NOT NULL,
+                status_code INTEGER,
+                detail      TEXT,
+                client_ip   TEXT,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
+
             CREATE INDEX IF NOT EXISTS idx_channels_priority ON channels(priority DESC);
             CREATE INDEX IF NOT EXISTS idx_model_maps_channel ON model_maps(channel_id);
             CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at DESC);
@@ -1081,6 +1095,72 @@ impl Database {
         let conn = self.conn.lock();
         let removed = conn.execute("DELETE FROM request_logs WHERE created_at < ?1", params![cutoff])?;
         Ok(removed)
+    }
+
+    // ── Audit Logs ────────────────────────────────────────────────────────────
+
+    pub fn insert_audit_log(&self, log: &crate::AuditLog) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            r#"INSERT INTO audit_logs (id,actor_id,actor_name,actor_role,method,path,status_code,detail,client_ip,created_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"#,
+            params![
+                log.id, log.actor_id, log.actor_name, log.actor_role, log.method, log.path,
+                log.status_code, log.detail, log.client_ip, log.created_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_audit_logs(&self, limit: i64) -> SqliteResult<Vec<crate::AuditLog>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,actor_id,actor_name,actor_role,method,path,status_code,detail,client_ip,created_at \
+             FROM audit_logs ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], Self::audit_log_from_row)?;
+        rows.collect()
+    }
+
+    fn audit_log_from_row(r: &rusqlite::Row<'_>) -> SqliteResult<crate::AuditLog> {
+        Ok(crate::AuditLog {
+            id: r.get(0)?,
+            actor_id: r.get(1)?,
+            actor_name: r.get(2)?,
+            actor_role: r.get(3)?,
+            method: r.get(4)?,
+            path: r.get(5)?,
+            status_code: r.get(6)?,
+            detail: r.get(7)?,
+            client_ip: r.get(8)?,
+            created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(9)?)
+                .map(|v| v.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    }
+
+    pub fn count_audit_logs(&self) -> SqliteResult<i64> {
+        let conn = self.conn.lock();
+        conn.query_row("SELECT COUNT(*) FROM audit_logs", [], |r| r.get(0))
+    }
+
+    pub fn clear_audit_logs(&self) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute("DELETE FROM audit_logs", [])?)
+    }
+
+    /// Delete audit rows older than `days`; `0` keeps them.
+    ///
+    /// Shares `LogRetentionDays` with traffic logs. That is a deliberate choice
+    /// rather than a second knob: the option is presented as "how long do we keep
+    /// logs", and an audit trail that silently outlived the setting its operator
+    /// configured would be the opposite of auditable.
+    pub fn prune_audit_logs(&self, days: i64) -> SqliteResult<usize> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let conn = self.conn.lock();
+        Ok(conn.execute("DELETE FROM audit_logs WHERE created_at < ?1", params![cutoff])?)
     }
 
     // ── Count helpers (for system info) ─────────────────────────────────────
@@ -3311,6 +3391,52 @@ mod tests {
         assert_eq!(by_id("blank-ip"), None);
         assert_eq!(by_id("anon-ip"), None);
         assert_eq!(by_id("no-ip"), None);
+    }
+
+    /// The audit trail must be durable, readable, and prunable on the same
+    /// window as traffic. `AuditLogEnabled` had no table at all, so none of this
+    /// existed to test.
+    #[test]
+    fn audit_rows_round_trip_and_age_out_with_the_retention_window() {
+        let db = database();
+        let row = |id: &str, age_days: i64| crate::AuditLog {
+            id: id.to_string(),
+            actor_id: Some("u1".into()),
+            actor_name: "owner".into(),
+            actor_role: "root".into(),
+            method: "PUT".into(),
+            path: "/api/options".into(),
+            status_code: Some(200),
+            detail: Some(r#"{"key":"SiteName"}"#.into()),
+            client_ip: None,
+            created_at: Utc::now() - chrono::Duration::days(age_days),
+        };
+
+        db.insert_audit_log(&row("recent", 1)).unwrap();
+        db.insert_audit_log(&row("old", 40)).unwrap();
+        assert_eq!(db.count_audit_logs().unwrap(), 2);
+
+        // Every field survives the round trip; an audit row that lost its actor
+        // would be worthless.
+        let stored = db.list_audit_logs(10).unwrap();
+        let recent = stored.iter().find(|l| l.id == "recent").unwrap();
+        assert_eq!(recent.actor_name, "owner");
+        assert_eq!(recent.actor_role, "root");
+        assert_eq!(recent.method, "PUT");
+        assert_eq!(recent.path, "/api/options");
+        assert_eq!(recent.status_code, Some(200));
+        assert_eq!(recent.detail.as_deref(), Some(r#"{"key":"SiteName"}"#));
+
+        // `0` keeps everything, like the traffic window.
+        assert_eq!(db.prune_audit_logs(0).unwrap(), 0);
+        assert_eq!(db.count_audit_logs().unwrap(), 2);
+        // A 30-day window removes only what is past it.
+        assert_eq!(db.prune_audit_logs(30).unwrap(), 1);
+        assert_eq!(db.count_audit_logs().unwrap(), 1);
+        assert_eq!(db.list_audit_logs(10).unwrap()[0].id, "recent");
+        // Clearing is explicit and complete.
+        assert_eq!(db.clear_audit_logs().unwrap(), 1);
+        assert_eq!(db.count_audit_logs().unwrap(), 0);
     }
 }
 

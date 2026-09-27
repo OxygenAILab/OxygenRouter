@@ -77,6 +77,11 @@ pub struct AppState {
     /// Cached for the same reason, and because it is a privacy decision that
     /// should not vary between rows written in the same millisecond.
     record_ip_log: AtomicBool,
+    /// `AuditLogEnabled` — whether administrative operations are recorded.
+    ///
+    /// Cached with the two above: it is read on every console request that could
+    /// be audited, and refreshed by the same two places.
+    audit_log_enabled: AtomicBool,
 }
 
 impl AppState {
@@ -114,6 +119,7 @@ impl AppState {
             // writer; the shipped defaults match the schema.
             request_log_enabled: AtomicBool::new(true),
             record_ip_log: AtomicBool::new(false),
+            audit_log_enabled: AtomicBool::new(true),
         }
     }
 
@@ -199,6 +205,8 @@ impl AppState {
             .store(read_bool("RequestLogEnabled", true), Ordering::Relaxed);
         self.record_ip_log
             .store(read_bool("RecordIpLog", false), Ordering::Relaxed);
+        self.audit_log_enabled
+            .store(read_bool("AuditLogEnabled", true), Ordering::Relaxed);
     }
 
     /// Whether request rows are persisted (`RequestLogEnabled`).
@@ -209,6 +217,11 @@ impl AppState {
     /// Whether the caller's address is stored with a row (`RecordIpLog`).
     pub fn record_ip_log(&self) -> bool {
         self.record_ip_log.load(Ordering::Relaxed)
+    }
+
+    /// Whether administrative operations are recorded (`AuditLogEnabled`).
+    pub fn audit_log_enabled(&self) -> bool {
+        self.audit_log_enabled.load(Ordering::Relaxed)
     }
 
     /// Minutes a login lock lasts once it trips.

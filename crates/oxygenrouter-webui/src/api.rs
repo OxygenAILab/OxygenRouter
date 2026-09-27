@@ -70,6 +70,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // `/log/self` (`router/api-router.go:319`).
         .route("/api/logs/self", get(list_my_logs))
         .route("/api/logs/stream", get(stream_logs))
+        // The management trail. Root-only: it records who changed what, which is
+        // itself sensitive, and the reference likewise gates its log endpoints on
+        // admin (`router/api-router.go:314`).
+        .route("/api/audit-logs", get(list_audit_logs).delete(clear_audit_logs))
         .route("/api/status", get(get_status))
         .route("/api/dashboard", get(get_dashboard))
         .route("/api/analytics/flow", get(get_analytics_flow))
@@ -300,6 +304,9 @@ const ROOT_PREFIXES: &[&str] = &[
     "/api/performance",
     "/api/system-task",
     "/api/custom-oauth-provider",
+    // Who changed what. Sensitive precisely because it is complete, and it names
+    // the accounts that hold power.
+    "/api/audit-logs",
 ];
 
 /// Prefixes that need an admin (or root).
@@ -366,9 +373,186 @@ async fn access_guard(
         Access::Root => root_user(&state, &headers).map(|_| ()),
     };
     match outcome {
-        Ok(()) => next.run(request).await,
+        Ok(()) => {
+            // An audited action is a *changing* one by a *privileged* actor. A
+            // user renaming their own key is excluded on purpose: `AuditLogEnabled`
+            // is described as "record administrative operations", and flooding the
+            // trail with every user's own edits would bury exactly the events it
+            // exists to surface.
+            let method = request.method().as_str().to_string();
+            let auditable = method != "GET"
+                && matches!(required, Access::Admin | Access::Root);
+            if auditable && state.audit_log_enabled() {
+                let actor = match required {
+                    Access::Root => root_user(&state, &headers).ok(),
+                    _ => admin_user(&state, &headers).ok(),
+                };
+                // Buffer the body so the trail can say *what* was changed, not
+                // just which path was called. Only audited requests pay for this,
+                // which is a handful of admin actions rather than the hot path.
+                let (parts, body) = request.into_parts();
+                let body_bytes = axum::body::to_bytes(body, AUDIT_BODY_LIMIT)
+                    .await
+                    .unwrap_or_default()
+                    .to_vec();
+                let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(body_bytes.clone()));
+                // Rejections are worth as much as successes to an investigator:
+                // a refused elevation attempt is frequently the interesting row.
+                let response = next.run(request).await;
+                let status = response.status().as_u16();
+                record_audit(
+                    &state,
+                    actor.as_ref(),
+                    &method,
+                    &path,
+                    Some(status),
+                    redact_body(&body_bytes, &path),
+                    &headers,
+                );
+                response
+            } else {
+                next.run(request).await
+            }
+        }
         // `auth_user` already produced the right response shape and status.
         Err(response) => response,
+    }
+}
+
+/// Largest request body the audit trail will capture.
+///
+/// An administrative action is a settings change or an account edit, all of
+/// which are small; anything larger is not something the trail needs verbatim.
+const AUDIT_BODY_LIMIT: usize = 64 * 1024;
+
+/// Field names that are a credential in their own right.
+///
+/// Matched exactly, so `monkey` is not mistaken for `key`. A credential copied
+/// into the audit trail in the clear would be the same disclosure the masking
+/// work closed, arriving through a new door.
+const AUDIT_REDACT_EXACT: &[&str] = &[
+    "key",
+    "apikey",
+    "api_key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "code",
+    "credential",
+    "authorization",
+    "signature",
+];
+
+/// Fragments that mark a field as credential-bearing.
+///
+/// Matched as substrings because these spell out what the value is, so a name
+/// like `github_client_secret` or `smtp_token` is covered without enumerating
+/// every vendor's spelling.
+const AUDIT_REDACT_CONTAINS: &[&str] = &[
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "private_key",
+    "credential",
+    "authorization",
+    "signature",
+];
+
+/// True when this field's value must not be stored verbatim.
+///
+/// `key_is_a_name` is set for the options route, where `key` is the *name* of a
+/// setting rather than a credential — redacting it there would leave the trail
+/// unable to say which setting was changed, which is the one thing it is for.
+fn is_credential_field(name: &str, key_is_a_name: bool) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == "key" && key_is_a_name {
+        return false;
+    }
+    AUDIT_REDACT_EXACT.contains(&lower.as_str())
+        || AUDIT_REDACT_CONTAINS.iter().any(|fragment| lower.contains(fragment))
+}
+
+/// Render a request body for the trail with credential-bearing values replaced.
+///
+/// Anything that is not a JSON object is dropped rather than stored: a body that
+/// cannot be inspected for secrets must not be assumed to be safe.
+fn redact_body(bytes: &[u8], path: &str) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let serde_json::Value::Object(mut map) = parsed else {
+        return None;
+    };
+    let options_route = path.starts_with("/api/options");
+
+    // `/api/options` is the one route where a value is a credential only when the
+    // option it names is marked secret in the schema (`LocalApiToken` and
+    // friends). Reading the schema is what makes this exact instead of a guess:
+    // the alternative is either disclosing the token or redacting every setting.
+    if options_route {
+        let names_a_secret = matches!(
+            map.get("key"),
+            Some(serde_json::Value::String(name))
+                if oxygenrouter_core::find_schema(name).is_some_and(|s| s.secret)
+        );
+        if names_a_secret {
+            map.insert(
+                "value".to_string(),
+                serde_json::Value::String("[redacted]".to_string()),
+            );
+        }
+    }
+
+    for (name, value) in map.iter_mut() {
+        if is_credential_field(name, options_route) {
+            *value = serde_json::Value::String("[redacted]".to_string());
+        } else if let serde_json::Value::Object(inner) = value {
+            // Nested objects are uncommon here, but a serialised settings blob
+            // could carry one, so a wrapped secret must not slip through under a
+            // harmless outer key.
+            for (n2, v2) in inner.iter_mut() {
+                if is_credential_field(n2, false) {
+                    *v2 = serde_json::Value::String("[redacted]".to_string());
+                }
+            }
+        }
+    }
+    serde_json::to_string(&map).ok()
+}
+
+/// Persist one administrative operation.
+///
+/// Best-effort on purpose: a failure to write the trail must not fail the action
+/// the operator asked for. The error is surfaced on stderr rather than dropped.
+fn record_audit(
+    state: &AppState,
+    actor: Option<&User>,
+    method: &str,
+    path: &str,
+    status_code: Option<u16>,
+    detail: Option<String>,
+    headers: &HeaderMap,
+) {
+    let log = oxygenrouter_core::AuditLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        actor_id: actor.map(|u| u.id.clone()),
+        actor_name: actor.map(|u| u.username.clone()).unwrap_or_default(),
+        actor_role: actor.map(|u| u.role.as_str().to_string()).unwrap_or_default(),
+        method: method.to_string(),
+        path: path.to_string(),
+        status_code,
+        detail,
+        client_ip: state
+            .record_ip_log()
+            .then(|| crate::proxy::caller_address(headers)),
+        created_at: Utc::now(),
+    };
+    if let Err(error) = state.db.insert_audit_log(&log) {
+        eprintln!("[OxygenRouter] audit write failed: {error}");
     }
 }
 fn db_error<T: Serialize>(error: rusqlite::Error) -> Response {
@@ -3103,6 +3287,28 @@ async fn clear_logs(State(s): State<Arc<AppState>>) -> Json<ApiResponse<usize>> 
     })
 }
 
+/// The administrative trail, newest first.
+///
+/// Root-only, enforced by the `ROOT_PREFIXES` entry: the trail names who holds
+/// power and what they changed, so it is not an ordinary admin's to read.
+async fn list_audit_logs(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<LogsQuery>,
+) -> Json<ApiResponse<Vec<oxygenrouter_core::AuditLog>>> {
+    let limit = q.page_size.unwrap_or(100).clamp(1, 1000);
+    Json(match s.db.list_audit_logs(limit) {
+        Ok(rows) => ApiResponse::ok(rows),
+        Err(e) => ApiResponse::err(e.to_string()),
+    })
+}
+
+async fn clear_audit_logs(State(s): State<Arc<AppState>>) -> Json<ApiResponse<usize>> {
+    Json(match s.db.clear_audit_logs() {
+        Ok(n) => ApiResponse::ok(n),
+        Err(e) => ApiResponse::err(e.to_string()),
+    })
+}
+
 /// SSE endpoint that streams new request log rows as they're added.
 ///
 /// Each `insert_request_log` call from the proxy broadcasts the new log via
@@ -3352,7 +3558,10 @@ async fn update_option(
             // exception that needs an explicit refresh — and the refresh lives
             // here, next to the write, rather than in a hook someone must
             // remember to call.
-            if matches!(schema.key, "RequestLogEnabled" | "RecordIpLog") {
+            if matches!(
+                schema.key,
+                "RequestLogEnabled" | "RecordIpLog" | "AuditLogEnabled"
+            ) {
                 s.reload_log_policy();
             }
             Json(ApiResponse::ok("updated"))
@@ -3931,6 +4140,19 @@ mod log_scoping_tests {
         assert_eq!(required_access("/api/logs"), Access::Admin);
         assert_eq!(required_access("/api/logs/anything-else"), Access::Admin);
     }
+
+    /// The management trail names who holds power and what they changed. It is
+    /// root-only, not admin-only, so a compromised ordinary admin cannot read
+    /// back the history of the owner's actions and learn the instance's shape.
+    #[test]
+    fn the_audit_trail_is_root_only() {
+        assert_eq!(required_access("/api/audit-logs"), Access::Root);
+        assert_eq!(required_access("/api/audit-logs/"), Access::Root);
+        // Not the traffic-log gate, which is admin.
+        assert_ne!(required_access("/api/audit-logs"), Access::Admin);
+        // And not public, in any spelling.
+        assert_ne!(required_access("/api/audit-logs"), Access::Public);
+    }
 }
 
 
@@ -4261,6 +4483,69 @@ mod key_update_tests {
 
 #[cfg(test)]
 mod i18n_integrity_tests {
+    /// The audit trail copies request bodies, and a body is a new place a
+    /// credential could be disclosed in the clear — the same door the API-key
+    /// masking work closed. These pin the two halves of the rule: a credential
+    /// must never be stored, and the *name* of a setting must be.
+    #[test]
+    fn audit_bodies_never_carry_a_credential() {
+        use super::redact_body;
+
+        // A channel create carries its upstream key.
+        let body = br#"{"name":"c","base_url":"https://x","api_key":"sk-live-abc123"}"#;
+        let detail = redact_body(body, "/api/channels").expect("object body");
+        assert!(!detail.contains("sk-live-abc123"), "{detail}");
+        assert!(detail.contains("[redacted]"), "{detail}");
+        // The rest of the row stays useful.
+        assert!(detail.contains("https://x"), "{detail}");
+
+        // Names that merely contain a redacted fragment must survive, or the
+        // trail cannot say what was touched. `monkey` contains `key`.
+        let body = br#"{"monkey":"banana","api_key":"sk-x"}"#;
+        let detail = redact_body(body, "/api/channels").unwrap();
+        assert!(detail.contains("banana"), "{detail}");
+        assert!(!detail.contains("sk-x"), "{detail}");
+
+        // Vendor-spelled secrets are covered without enumerating them.
+        for name in ["github_client_secret", "SMTPServerToken", "private_key_pem"] {
+            let body = format!(r#"{{"{name}":"leak-me"}}"#);
+            let detail = redact_body(body.as_bytes(), "/api/settings").unwrap();
+            assert!(!detail.contains("leak-me"), "{name} => {detail}");
+        }
+    }
+
+    /// `/api/options` is the case that a substring rule gets wrong in both
+    /// directions: its `key` field is the option's *name*, while its `value`
+    /// field is the setting's content and may itself be a token. The schema is
+    /// the authority on which is which.
+    #[test]
+    fn the_options_route_redacts_only_a_secret_settings_value() {
+        use super::redact_body;
+
+        // A secret option: the value must go, the name must stay.
+        let body = br#"{"key":"LocalApiToken","value":"sk-live-token-value"}"#;
+        let detail = redact_body(body, "/api/options").unwrap();
+        assert!(!detail.contains("sk-live-token-value"), "{detail}");
+        assert!(detail.contains("LocalApiToken"), "{detail}");
+
+        // A non-secret option: the value is the useful part of the audit row.
+        let body = br#"{"key":"SiteName","value":"My Router"}"#;
+        let detail = redact_body(body, "/api/options").unwrap();
+        assert!(detail.contains("My Router"), "{detail}");
+        assert!(detail.contains("SiteName"), "{detail}");
+    }
+
+    /// A body that cannot be parsed is dropped: a blob whose fields cannot be
+    /// inspected must not be assumed free of secrets.
+    #[test]
+    fn audit_bodies_that_cannot_be_inspected_are_dropped() {
+        use super::redact_body;
+        assert_eq!(redact_body(b"", "/api/x"), None);
+        assert_eq!(redact_body(b"not json at all", "/api/x"), None);
+        assert_eq!(redact_body(br#"["a","b"]"#, "/api/x"), None);
+        assert_eq!(redact_body(br#""just a string""#, "/api/x"), None);
+    }
+
     /// The Chinese string table shipped with three corrupted values — the label
     /// for 状态 had become a Hebrew cantillation mark plus a combining dot in
     /// three separate keys, and one other label was mangled the same way. They
