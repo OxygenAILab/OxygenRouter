@@ -120,11 +120,42 @@ async fn main() {
         config_path.clone(),
     );
     state_inner.configure_limits(max_concurrent, 0);
+    // Two logging options are cached because the proxy reads them per request;
+    // everything else is derived from the store on demand.
+    state_inner.reload_log_policy();
     let state: Arc<AppState> = Arc::new(state_inner);
 
     state.reload_scheduler_maps().await;
     // Apply this instance's own pricing overrides on top of the shipped pack.
     state.reload_pricing();
+
+    // Retention. `LogRetentionDays` shipped documented as "0 keeps logs forever"
+    // and nothing ever pruned, so the table grew without bound. Hourly is often
+    // enough for a day-granularity rule and cheap when there is nothing to
+    // delete; the first pass runs shortly after start so a restart tidies up.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                ticker.tick().await;
+                let days = state
+                    .db
+                    .get_setting("LogRetentionDays")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| raw.trim().parse::<i64>().ok())
+                    .unwrap_or(30);
+                match state.db.prune_request_logs(days) {
+                    Ok(0) => {}
+                    Ok(removed) => println!(
+                        "[OxygenRouter] retention: removed {removed} request logs older than {days}d"
+                    ),
+                    Err(error) => eprintln!("[OxygenRouter] retention prune failed: {error}"),
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/", get(index_handler))

@@ -301,6 +301,13 @@ pub struct RequestLog {
     pub tokens_used: Option<i64>,
     pub duration_ms: i64,
     pub created_at: DateTime<Utc>,
+    /// The calling address, when the instance is configured to keep it.
+    ///
+    /// `None` unless `RecordIpLog` is on. Captured per request so a later change
+    /// to that option does not retroactively relabel old rows: a row either
+    /// recorded an address at the time, or it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

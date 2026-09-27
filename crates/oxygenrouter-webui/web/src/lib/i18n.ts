@@ -286,6 +286,7 @@ export const STRINGS = {
       model: "Model",
       channel: "Channel",
       status: "Status",
+      clientIp: "Client IP",
       duration: "Duration",
       ago: "just now",
       filterAll: "All",
@@ -817,7 +818,7 @@ export const STRINGS = {
       copyKey: "复制密钥",
       reveal: "显示密钥",
       colName: "名称",
-      colStatus: "״̬",
+      colStatus: "状态",
       colKey: "密钥",
       colQuota: "额度",
       colUsage: "用量",
@@ -871,7 +872,8 @@ export const STRINGS = {
       path: "路径",
       model: "模型",
       channel: "渠道",
-      status: "״̬",
+      status: "状态",
+      clientIp: "客户端 IP",
       duration: "耗时",
       ago: "刚刚",
       filterAll: "全部",
@@ -1045,7 +1047,7 @@ export const STRINGS = {
       routeRules: "路由规则",
       runtime: "运行时",
       version: "版本",
-      platform: "ƽ̨",
+      platform: "平台",
       architecture: "架构",
       rustc: "Rust 编译器",
       buildProfile: "构建模式",
@@ -1461,6 +1463,7 @@ export type Strings = {
     model: string;
     channel: string;
     status: string;
+    clientIp: string;
     duration: string;
     ago: string;
     filterAll: string;

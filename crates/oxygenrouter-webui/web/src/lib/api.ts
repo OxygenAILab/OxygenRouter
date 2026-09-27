@@ -258,6 +258,8 @@ export interface RequestLog {
   tokens_used: number | null;
   duration_ms: number;
   created_at: string;
+  /** The calling address; only populated when the instance records IPs. */
+  client_ip?: string | null;
 }
 
 export interface SystemStatus {

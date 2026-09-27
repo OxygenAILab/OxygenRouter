@@ -264,7 +264,8 @@ impl Database {
                 error        TEXT,
                 tokens_used  INTEGER,
                 duration_ms  INTEGER NOT NULL,
-                created_at   TEXT NOT NULL
+                created_at   TEXT NOT NULL,
+                client_ip    TEXT
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -342,6 +343,9 @@ impl Database {
             [],
         );
         let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN api_key_id TEXT", []);
+        // `RecordIpLog`, off by default: the column exists for every instance,
+        // but is only filled for requests that arrived while the option was on.
+        let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN client_ip TEXT", []);
         for sql in [
             "ALTER TABLE api_keys ADD COLUMN expires_at TEXT",
             "ALTER TABLE api_keys ADD COLUMN quota_micros INTEGER NOT NULL DEFAULT 0",
@@ -887,12 +891,28 @@ impl Database {
     // ── Request Logs ──────────────────────────────────────────────────────────
 
     pub fn insert_request_log(&self, log: &RequestLog) -> SqliteResult<()> {
+        self.insert_request_log_with_ip(log, None)
+    }
+
+    /// Insert a log row, optionally recording the caller's address.
+    ///
+    /// The address is a parameter rather than a field on `RequestLog` so that a
+    /// caller cannot forget the `RecordIpLog` decision: the only way to store an
+    /// address is to pass one, and the only thing that passes one is the proxy,
+    /// which has just read the option.
+    pub fn insert_request_log_with_ip(
+        &self,
+        log: &RequestLog,
+        client_ip: Option<&str>,
+    ) -> SqliteResult<()> {
+        let client_ip = client_ip.filter(|ip| !ip.is_empty() && *ip != "anonymous");
         self.conn.lock().execute(
-            r#"INSERT INTO request_logs (id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"#,
+            r#"INSERT INTO request_logs (id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at,client_ip)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
             params![
                 log.id, log.method, log.path, log.model, log.channel_id, log.api_key_id,
-                log.status_code, log.error, log.tokens_used, log.duration_ms, log.created_at.to_rfc3339()
+                log.status_code, log.error, log.tokens_used, log.duration_ms, log.created_at.to_rfc3339(),
+                client_ip
             ],
         )?;
         Ok(())
@@ -901,7 +921,7 @@ impl Database {
     pub fn list_request_logs(&self, limit: i64) -> SqliteResult<Vec<RequestLog>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
-            "SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at
+            "SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at,client_ip
              FROM request_logs ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = s.query_map(params![limit], |r| {
@@ -919,6 +939,7 @@ impl Database {
                 created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(10)?)
                     .unwrap()
                     .with_timezone(&Utc),
+                client_ip: r.get(11)?,
             })
         })?;
         rows.collect()
@@ -981,7 +1002,7 @@ impl Database {
         )?;
         let offset = (page.max(1) - 1) * page_size.max(1);
         let mut stmt = conn.prepare(&format!(
-            "SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at \
+            "SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at,client_ip \
              FROM request_logs {where_clause} ORDER BY created_at DESC LIMIT ?9 OFFSET ?10"
         ))?;
         let rows = stmt.query_map(
@@ -1001,6 +1022,7 @@ impl Database {
                     created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(10)?)
                         .unwrap()
                         .with_timezone(&Utc),
+                    client_ip: r.get(11)?,
                 })
             },
         )?;
@@ -1015,7 +1037,7 @@ impl Database {
     ) -> SqliteResult<Vec<RequestLog>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
-            "SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at
+            "SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at,client_ip
              FROM request_logs WHERE created_at > ?1 ORDER BY created_at ASC LIMIT ?2",
         )?;
         let rows = s.query_map(params![since.to_rfc3339(), limit], |r| {
@@ -1033,6 +1055,7 @@ impl Database {
                 created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(10)?)
                     .unwrap()
                     .with_timezone(&Utc),
+                client_ip: r.get(11)?,
             })
         })?;
         rows.collect()
@@ -1042,6 +1065,22 @@ impl Database {
         let conn = self.conn.lock();
         let n = conn.execute("DELETE FROM request_logs", [])?;
         Ok(n)
+    }
+
+    /// Delete request logs older than `days`.
+    ///
+    /// `LogRetentionDays` was advertised with "0 keeps logs forever" and nothing
+    /// ever pruned, so every instance kept every row regardless. `0` (and any
+    /// negative value) is therefore a no-op here, matching what the console
+    /// promised. Returns how many rows were removed so the caller can log it.
+    pub fn prune_request_logs(&self, days: i64) -> SqliteResult<usize> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let conn = self.conn.lock();
+        let removed = conn.execute("DELETE FROM request_logs WHERE created_at < ?1", params![cutoff])?;
+        Ok(removed)
     }
 
     // ── Count helpers (for system info) ─────────────────────────────────────
@@ -1340,7 +1379,7 @@ impl Database {
         )?;
 
         let recent_requests = {
-            let sql = format!("SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at FROM request_logs WHERE {common} ORDER BY created_at DESC LIMIT 8");
+            let sql = format!("SELECT id,method,path,model,channel_id,api_key_id,status_code,error,tokens_used,duration_ms,created_at,client_ip FROM request_logs WHERE {common} ORDER BY created_at DESC LIMIT 8");
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 params![
@@ -1366,6 +1405,7 @@ impl Database {
                         created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(10)?)
                             .unwrap()
                             .with_timezone(&Utc),
+                        client_ip: r.get(11)?,
                     })
                 },
             )?;
@@ -3179,6 +3219,98 @@ mod tests {
         assert_eq!(db.get_user(&first.id).unwrap().unwrap().balance_micros, 100);
         assert!(db.redeem(&first.id, "ONEUSE").is_err());
         assert!(db.redeem(&second.id, "ONEUSE").is_err());
+    }
+
+    /// `LogRetentionDays` was documented as "0 keeps logs forever" while nothing
+    /// ever pruned, so the table grew without bound on every instance. The rule
+    /// now runs: rows older than the window go, newer rows stay, and `0` really
+    /// does keep everything.
+    #[test]
+    fn retention_prunes_only_rows_past_the_window() {
+        let db = database();
+        let log = |id: &str, age_days: i64| crate::RequestLog {
+            id: id.to_string(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            model: Some("gpt-4o".into()),
+            channel_id: None,
+            api_key_id: None,
+            status_code: Some(200),
+            error: None,
+            tokens_used: Some(10),
+            duration_ms: 5,
+            created_at: Utc::now() - chrono::Duration::days(age_days),
+            client_ip: None,
+        };
+
+        db.insert_request_log(&log("old-40d", 40)).unwrap();
+        db.insert_request_log(&log("old-31d", 31)).unwrap();
+        db.insert_request_log(&log("fresh-1d", 1)).unwrap();
+        db.insert_request_log(&log("fresh-today", 0)).unwrap();
+        assert_eq!(db.count_logs().unwrap(), 4);
+
+        // `0` is "keep forever", not "delete everything".
+        assert_eq!(db.prune_request_logs(0).unwrap(), 0);
+        assert_eq!(db.count_logs().unwrap(), 4);
+        assert_eq!(db.prune_request_logs(-5).unwrap(), 0);
+        assert_eq!(db.count_logs().unwrap(), 4);
+
+        // A 30-day window removes the two past it and nothing else.
+        assert_eq!(db.prune_request_logs(30).unwrap(), 2);
+        assert_eq!(db.count_logs().unwrap(), 2);
+        let remaining: Vec<String> = db
+            .list_request_logs(10)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert!(remaining.contains(&"fresh-1d".to_string()), "{remaining:?}");
+        assert!(remaining.contains(&"fresh-today".to_string()), "{remaining:?}");
+
+        // Idempotent: a second pass finds nothing left to remove.
+        assert_eq!(db.prune_request_logs(30).unwrap(), 0);
+    }
+
+    /// The address is stored only when a caller passes one, and an unnamed
+    /// caller is never stored as the literal "anonymous".
+    #[test]
+    fn a_client_ip_is_stored_only_when_supplied() {
+        let db = database();
+        let base = |id: &str| crate::RequestLog {
+            id: id.to_string(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            model: None,
+            channel_id: None,
+            api_key_id: None,
+            status_code: Some(200),
+            error: None,
+            tokens_used: None,
+            duration_ms: 1,
+            created_at: Utc::now(),
+            client_ip: None,
+        };
+        db.insert_request_log_with_ip(&base("with-ip"), Some("203.0.113.7"))
+            .unwrap();
+        db.insert_request_log_with_ip(&base("blank-ip"), Some(""))
+            .unwrap();
+        db.insert_request_log_with_ip(&base("anon-ip"), Some("anonymous"))
+            .unwrap();
+        db.insert_request_log_with_ip(&base("no-ip"), None).unwrap();
+
+        let by_id = |id: &str| {
+            db.list_request_logs(10)
+                .unwrap()
+                .into_iter()
+                .find(|l| l.id == id)
+                .unwrap()
+                .client_ip
+        };
+        assert_eq!(by_id("with-ip"), Some("203.0.113.7".to_string()));
+        // An address we do not actually have must not be recorded as one.
+        assert_eq!(by_id("blank-ip"), None);
+        assert_eq!(by_id("anon-ip"), None);
+        assert_eq!(by_id("no-ip"), None);
     }
 }
 

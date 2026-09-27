@@ -265,6 +265,7 @@ fn authorize(
                 let (status, code, message) = policy_error(error);
                 log_request(
                     state,
+                    &headers,
                     "POST",
                     path,
                     Some(model.to_string()),
@@ -281,6 +282,7 @@ fn authorize(
             let (status, code, message) = policy_error(error);
             log_request(
                 state,
+                &headers,
                 "POST",
                 path,
                 Some(model.to_string()),
@@ -309,6 +311,7 @@ async fn read_body(req: Request) -> (axum::http::HeaderMap, Vec<u8>) {
 
 fn log_request(
     state: &AppState,
+    headers: &axum::http::HeaderMap,
     method: &str,
     path: &str,
     model: Option<String>,
@@ -320,6 +323,7 @@ fn log_request(
 ) {
     log_request_with_usage(
         state,
+        &headers,
         method,
         path,
         model,
@@ -339,6 +343,7 @@ fn log_request(
 #[allow(clippy::too_many_arguments)]
 fn log_request_with_usage(
     state: &AppState,
+    headers: &axum::http::HeaderMap,
     method: &str,
     path: &str,
     model: Option<String>,
@@ -361,8 +366,21 @@ fn log_request_with_usage(
         tokens_used,
         duration_ms,
         created_at: Utc::now(),
+        client_ip: None,
     };
-    let _ = state.db.insert_request_log(&log);
+    // `RecordIpLog` (off by default) decides whether the address is captured at
+    // all; the row is still broadcast so the live console view keeps working, but
+    // a row that was never permitted to hold an address never has one to leak.
+    let client_ip = state.record_ip_log().then(|| remote_ip(headers));
+    // `RequestLogEnabled` (on by default) is the master switch for persistence.
+    // Analytics and the log tables are built from `request_logs`, so turning this
+    // off stops history — which is what the option says it does. The broadcast
+    // still fires either way, so the live view degrades instead of breaking.
+    if state.request_log_enabled() {
+        let _ = state
+            .db
+            .insert_request_log_with_ip(&log, client_ip.as_deref());
+    }
     let _ = state.log_broadcast.send(log);
 }
 
@@ -699,6 +717,7 @@ async fn dispatch(
         if let Err(error) = state.rate_limiter.check(&scope, state.relay_rate_limit) {
             log_request(
                 &state,
+                &_headers,
                 "POST",
                 path,
                 Some(model.clone()),
@@ -716,6 +735,7 @@ async fn dispatch(
         Err(error) => {
             log_request(
                 &state,
+                &_headers,
                 "POST",
                 path,
                 Some(model.clone()),
@@ -798,6 +818,7 @@ async fn dispatch(
                     let status = StatusCode::FORBIDDEN;
                     log_request(
                         &state,
+                        &_headers,
                         "POST",
                         path,
                         Some(model.clone()),
@@ -887,6 +908,7 @@ async fn dispatch(
             };
             log_request_with_usage(
                 &state,
+                &_headers,
                 "POST",
                 path,
                 Some(model),
@@ -917,6 +939,7 @@ async fn dispatch(
             }
             log_request(
                 &state,
+                &_headers,
                 "POST",
                 path,
                 Some(model),
@@ -1143,6 +1166,7 @@ async fn relay_passthrough(
         Ok(r) => {
             log_request_with_usage(
                 &state,
+                &headers,
                 method,
                 client_path,
                 Some(model),
@@ -1167,6 +1191,7 @@ async fn relay_passthrough(
             let status = e.status();
             log_request(
                 &state,
+                &headers,
                 method,
                 client_path,
                 Some(model),

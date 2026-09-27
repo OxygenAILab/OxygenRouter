@@ -3344,12 +3344,19 @@ async fn update_option(
     if schema.secret && input.value.ends_with('\u{2026}') {
         return Json(ApiResponse::ok("unchanged"));
     }
-    // No invalidation needed here: `MaxLoginAttempts` and the `FetchSetting.*`
-    // options are re-derived from the store by the request paths that use them,
-    // so a write is live immediately. Only the options that must be *validated
-    // as a set* keep a reload hook.
     match s.db.set_setting(schema.key, &input.value) {
-        Ok(()) => Json(ApiResponse::ok("updated")),
+        Ok(()) => {
+            // Most options are derived from the store by the request paths that
+            // use them, so a write is live immediately. These two are cached
+            // because the proxy consults them on every request, so they are the
+            // exception that needs an explicit refresh — and the refresh lives
+            // here, next to the write, rather than in a hook someone must
+            // remember to call.
+            if matches!(schema.key, "RequestLogEnabled" | "RecordIpLog") {
+                s.reload_log_policy();
+            }
+            Json(ApiResponse::ok("updated"))
+        }
         Err(error) => Json(ApiResponse::err(error.to_string())),
     }
 }
@@ -4249,5 +4256,47 @@ mod key_update_tests {
         assert_eq!(input.name, "renamed");
         // Omitting the name is a parse error rather than a silent no-op.
         assert!(serde_json::from_str::<KeyUpdateInput>(r#"{"enabled": true}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod i18n_integrity_tests {
+    /// The Chinese string table shipped with three corrupted values — the label
+    /// for 状态 had become a Hebrew cantillation mark plus a combining dot in
+    /// three separate keys, and one other label was mangled the same way. They
+    /// are invisible in a terminal that renders CJK, and the UI just showed a
+    /// stray mark where a word should be.
+    ///
+    /// This pins the property rather than the three instances: a user-facing
+    /// translation should never contain Hebrew, Arabic, Syriac, Thaana,
+    /// combining marks, private-use code points, or the replacement character.
+    /// Those have no business in a zh/en table, so their presence means an
+    /// encoding accident, not a translation choice.
+    #[test]
+    fn no_translation_contains_an_encoding_accident() {
+        let source = include_str!("../web/src/lib/i18n.ts");
+        let mut offenders = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let Some(quote) = line.find('"') else { continue };
+            for ch in line[quote..].chars() {
+                let cp = ch as u32;
+                let suspicious = (0x0590..=0x08FF).contains(&cp)     // Hebrew..Arabic..
+                    || (0x0300..=0x036F).contains(&cp)               // combining diacritics
+                    || (0xE000..=0xF8FF).contains(&cp)               // private use
+                    || cp == 0xFFFD;                                 // replacement char
+                if suspicious {
+                    offenders.push(format!(
+                        "line {}: {} (U+{cp:04X})",
+                        index + 1,
+                        line.trim()
+                    ));
+                    break;
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "translations with mangled characters: {offenders:#?}"
+        );
     }
 }

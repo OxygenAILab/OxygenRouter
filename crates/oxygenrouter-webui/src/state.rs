@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, RwLock};
@@ -63,6 +64,19 @@ pub struct AppState {
     pub concurrency: Arc<ConcurrencyGuard>,
     /// Rate limit applied to relay endpoints per client IP. `0` disables it.
     pub relay_rate_limit: RateLimit,
+    /// `RequestLogEnabled` — whether request rows are persisted.
+    ///
+    /// Cached, unlike the other policies, because the write happens on the
+    /// hottest path in the product. `configure_limits` (already the startup
+    /// hook) and the option writer both refresh it, so it cannot go stale
+    /// unnoticed; a per-request `SELECT` here would be a real cost for a value
+    /// that changes approximately never.
+    request_log_enabled: AtomicBool,
+    /// `RecordIpLog` — whether the caller's address is stored with the row.
+    ///
+    /// Cached for the same reason, and because it is a privacy decision that
+    /// should not vary between rows written in the same millisecond.
+    record_ip_log: AtomicBool,
 }
 
 impl AppState {
@@ -96,6 +110,10 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::new()),
             concurrency: Arc::new(ConcurrencyGuard::new(0)),
             relay_rate_limit: RateLimit::disabled(),
+            // Refreshed by `configure_limits` during startup and by the option
+            // writer; the shipped defaults match the schema.
+            request_log_enabled: AtomicBool::new(true),
+            record_ip_log: AtomicBool::new(false),
         }
     }
 
@@ -157,6 +175,40 @@ impl AppState {
         } else {
             RateLimit::new(requests_per_minute, 60)
         };
+    }
+
+    /// Re-read the two cached logging options.
+    ///
+    /// Called during startup and whenever an admin writes one of them, because
+    /// these two are consulted on the proxy's hot path where a per-request
+    /// `SELECT` would be a real cost. Every other option is derived per call.
+    pub fn reload_log_policy(&self) {
+        let read_bool = |key: &str, fallback: bool| -> bool {
+            self.db
+                .get_setting(key)
+                .ok()
+                .flatten()
+                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(fallback)
+        };
+        self.request_log_enabled
+            .store(read_bool("RequestLogEnabled", true), Ordering::Relaxed);
+        self.record_ip_log
+            .store(read_bool("RecordIpLog", false), Ordering::Relaxed);
+    }
+
+    /// Whether request rows are persisted (`RequestLogEnabled`).
+    pub fn request_log_enabled(&self) -> bool {
+        self.request_log_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Whether the caller's address is stored with a row (`RecordIpLog`).
+    pub fn record_ip_log(&self) -> bool {
+        self.record_ip_log.load(Ordering::Relaxed)
     }
 
     /// Minutes a login lock lasts once it trips.

@@ -199,6 +199,13 @@ export default function LogsPage() {
     { key: "tokens", header: t.keys.tokens, render: (row) => <span className="font-mono text-xs">{row.tokens_used ?? "—"}</span> },
     { key: "status", header: t.logs.status, render: (row) => <StatusBadge code={row.status_code} /> },
     {
+      key: "clientIp",
+      header: t.logs.clientIp,
+      // Blank until the instance is configured to store addresses; "—" keeps the
+      // column readable rather than shifting the row.
+      render: (row) => <span className="font-mono text-xs">{row.client_ip ?? "—"}</span>,
+    },
+    {
       key: "detail",
       header: "",
       align: "right",
