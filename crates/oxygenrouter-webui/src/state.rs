@@ -187,6 +187,12 @@ pub struct AppState {
     audit_log_enabled: AtomicBool,
     /// Hourly usage counters awaiting the periodic flush into `quota_data`.
     pub usage: UsageAccumulator,
+    /// The JavaScript plugin runtime.
+    ///
+    /// One host per process; uploads are validated against it and the console
+    /// reports what it currently holds. The host keeps its own engine thread, so
+    /// a plugin cannot stall the gateway.
+    pub plugins: oxygenrouter_plugin::PluginHost,
     /// `DataExportEnabled` — whether usage is aggregated at all.
     ///
     /// Cached with the logging flags, and refreshed by the same two places,
@@ -231,6 +237,7 @@ impl AppState {
             record_ip_log: AtomicBool::new(false),
             audit_log_enabled: AtomicBool::new(true),
             usage: UsageAccumulator::new(),
+            plugins: oxygenrouter_plugin::PluginHost::start(),
             data_export_enabled: AtomicBool::new(true),
         }
     }

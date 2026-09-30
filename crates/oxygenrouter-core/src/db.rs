@@ -341,6 +341,26 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_quota_data_bucket ON quota_data(bucket_at DESC);
 
+            -- Uploaded plugins. A plugin may have several versions and one of
+            -- them active, which is why the source lives beside the version
+            -- rather than in the plugin's own row: activating a different build
+            -- must not require a re-upload, and a bad version must be removable
+            -- while another keeps serving.
+            CREATE TABLE IF NOT EXISTS plugin_versions (
+                key         TEXT NOT NULL,
+                version     TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                manifest    TEXT NOT NULL DEFAULT '{}',
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (key, version)
+            );
+            CREATE TABLE IF NOT EXISTS plugin_state (
+                key            TEXT PRIMARY KEY,
+                active_version TEXT,
+                enabled        INTEGER NOT NULL DEFAULT 0,
+                updated_at     TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_channels_priority ON channels(priority DESC);
             CREATE INDEX IF NOT EXISTS idx_model_maps_channel ON model_maps(channel_id);
             CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at DESC);
@@ -1134,6 +1154,196 @@ impl Database {
         let conn = self.conn.lock();
         let removed = conn.execute("DELETE FROM request_logs WHERE created_at < ?1", params![cutoff])?;
         Ok(removed)
+    }
+
+    // ── Plugins ──────────────────────────────────────────────────────────────
+
+    /// Store one build of a plugin, replacing a build with the same version.
+    ///
+    /// Re-uploading a version replaces it rather than accumulating: the reference
+    /// names versions explicitly and lets an operator delete one, so `(key,
+    /// version)` is the identity and a second upload of it is a correction.
+    pub fn upsert_plugin_version(&self, version: &crate::PluginVersion) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            r#"INSERT INTO plugin_versions (key,version,source,manifest,created_at)
+               VALUES (?1,?2,?3,?4,?5)
+               ON CONFLICT(key,version) DO UPDATE SET
+                 source = excluded.source,
+                 manifest = excluded.manifest,
+                 created_at = excluded.created_at"#,
+            params![
+                version.key,
+                version.version,
+                version.source,
+                serde_json::to_string(&version.manifest).unwrap_or_else(|_| "{}".to_string()),
+                version.created_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_plugin_versions(&self, key: &str) -> SqliteResult<Vec<crate::PluginVersion>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key,version,source,manifest,created_at FROM plugin_versions WHERE key=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![key], Self::plugin_version_from_row)?;
+        rows.collect()
+    }
+
+    pub fn delete_plugin_version(&self, key: &str, version: &str) -> SqliteResult<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM plugin_versions WHERE key=?1 AND version=?2",
+            params![key, version],
+        )?;
+        // If the deleted build was the active one, drop the activation so the
+        // plugin cannot point at source that no longer exists.
+        tx.execute(
+            "UPDATE plugin_state SET active_version=NULL WHERE key=?1 AND active_version=?2",
+            params![key, version],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    fn plugin_version_from_row(r: &rusqlite::Row<'_>) -> SqliteResult<crate::PluginVersion> {
+        let manifest: String = r.get(3)?;
+        Ok(crate::PluginVersion {
+            key: r.get(0)?,
+            version: r.get(1)?,
+            source: r.get(2)?,
+            manifest: serde_json::from_str(&manifest).unwrap_or(serde_json::Value::Null),
+            created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(4)?)
+                .map(|v| v.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    }
+
+    /// Set a plugin's activation and enabled flag.
+    ///
+    /// An `active_version` of `None` deactivates without deleting anything, so an
+    /// operator can stop a plugin while keeping its builds on file.
+    pub fn set_plugin_state(
+        &self,
+        key: &str,
+        active_version: Option<&str>,
+        enabled: bool,
+    ) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            r#"INSERT INTO plugin_state (key,active_version,enabled,updated_at)
+               VALUES (?1,?2,?3,?4)
+               ON CONFLICT(key) DO UPDATE SET
+                 active_version = excluded.active_version,
+                 enabled = excluded.enabled,
+                 updated_at = excluded.updated_at"#,
+            params![key, active_version, enabled as i32, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_plugin_state(&self, key: &str) -> SqliteResult<Option<crate::PluginState>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT key,active_version,enabled,updated_at FROM plugin_state WHERE key=?1",
+            params![key],
+            |r| {
+                Ok(crate::PluginState {
+                    key: r.get(0)?,
+                    active_version: r.get(1)?,
+                    enabled: r.get::<_, i32>(2)? != 0,
+                    updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(3)?)
+                        .map(|v| v.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// Every plugin the instance knows about, for the console listing.
+    ///
+    /// The keys come from the union of versions and state, so a plugin uploaded
+    /// but never activated appears, and one whose last version was deleted while
+    /// it still had state does not silently vanish from the page.
+    pub fn list_plugins(&self) -> SqliteResult<Vec<crate::PluginSummary>> {
+        let conn = self.conn.lock();
+        let keys: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT key FROM plugin_versions UNION SELECT key FROM plugin_state ORDER BY key",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<SqliteResult<Vec<_>>>()?
+        };
+        let mut out = Vec::new();
+        for key in keys {
+            let versions: Vec<crate::PluginVersion> = {
+                let mut stmt = conn.prepare(
+                    "SELECT key,version,source,manifest,created_at FROM plugin_versions WHERE key=?1 ORDER BY created_at DESC",
+                )?;
+                let rows = stmt.query_map(params![key], Self::plugin_version_from_row)?;
+                rows.collect::<SqliteResult<Vec<_>>>()?
+            };
+            let state = conn
+                .query_row(
+                    "SELECT key,active_version,enabled,updated_at FROM plugin_state WHERE key=?1",
+                    params![key],
+                    |r| {
+                        Ok(crate::PluginState {
+                            key: r.get(0)?,
+                            active_version: r.get(1)?,
+                            enabled: r.get::<_, i32>(2)? != 0,
+                            updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(3)?)
+                                .map(|v| v.with_timezone(&Utc))
+                                .unwrap_or_else(|_| Utc::now()),
+                        })
+                    },
+                )
+                .optional()?;
+            let active_version = state.as_ref().and_then(|s| s.active_version.clone());
+            // Describe the active build; the manifest was stored at upload time so
+            // a listing never has to execute the plugin to say what it does.
+            // Owned, not borrowed: `versions` is consumed below to build the
+            // version list, so anything still referring into it would trap the
+            // borrow across the move.
+            let manifest = active_version
+                .as_ref()
+                .and_then(|v| versions.iter().find(|p| &p.version == v))
+                .map(|p| p.manifest.clone());
+            out.push(crate::PluginSummary {
+                key: key.clone(),
+                name: manifest
+                    .as_ref()
+                    .and_then(|m| m.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&key)
+                    .to_string(),
+                version: active_version.clone(),
+                description: manifest
+                    .as_ref()
+                    .and_then(|m| m.get("description"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                enabled: state.as_ref().map(|s| s.enabled).unwrap_or(false),
+                active_version,
+                versions: versions.into_iter().map(|p| p.version).collect(),
+                hooks: manifest
+                    .as_ref()
+                    .and_then(|m| m.get("modes"))
+                    .and_then(|v| v.as_array())
+                    .map(|modes| {
+                        modes
+                            .iter()
+                            .filter_map(|m| m.get("hook").and_then(|h| h.as_str()).map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                updated_at: state.map(|s| s.updated_at).unwrap_or_else(Utc::now),
+            });
+        }
+        Ok(out)
     }
 
     // ── Audit Logs ────────────────────────────────────────────────────────────
@@ -3466,6 +3676,74 @@ mod tests {
         assert_eq!(db.get_user(&first.id).unwrap().unwrap().balance_micros, 100);
         assert!(db.redeem(&first.id, "ONEUSE").is_err());
         assert!(db.redeem(&second.id, "ONEUSE").is_err());
+    }
+
+    /// A plugin may hold several builds with one active. The invariant that
+    /// matters is that deleting the active one must not leave the plugin
+    /// pointing at source that is gone.
+    #[test]
+    fn plugin_versions_and_activation_round_trip() {
+        let db = database();
+        let build = |version: &str, name: &str| crate::PluginVersion {
+            key: "demo".to_string(),
+            version: version.to_string(),
+            source: "register({apiVersion:1,key:'demo',modes:[{name:'m',hook:'convertRequest'}]});"
+                .to_string(),
+            manifest: serde_json::json!({
+                "apiVersion": 1,
+                "key": "demo",
+                "name": name,
+                "description": "d",
+                "modes": [{ "name": "m", "hook": "convertRequest" }]
+            }),
+            created_at: Utc::now(),
+        };
+
+        db.upsert_plugin_version(&build("1.0.0", "Demo One")).unwrap();
+        db.upsert_plugin_version(&build("1.1.0", "Demo Two")).unwrap();
+        assert_eq!(db.list_plugin_versions("demo").unwrap().len(), 2);
+
+        // Re-uploading a version corrects it rather than adding a third.
+        db.upsert_plugin_version(&build("1.0.0", "Demo One Fixed")).unwrap();
+        let versions = db.list_plugin_versions("demo").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(
+            versions.iter().find(|v| v.version == "1.0.0").unwrap().manifest["name"],
+            "Demo One Fixed"
+        );
+
+        // An upload with no state yet shows as present but off, so the console
+        // can offer to activate it.
+        let listed = db.list_plugins().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "demo");
+        assert!(!listed[0].enabled);
+        assert_eq!(listed[0].active_version, None);
+        assert_eq!(listed[0].versions.len(), 2);
+
+        // Activating one build describes that build, not another.
+        db.set_plugin_state("demo", Some("1.1.0"), true).unwrap();
+        let listed = db.list_plugins().unwrap();
+        assert!(listed[0].enabled);
+        assert_eq!(listed[0].active_version.as_deref(), Some("1.1.0"));
+        assert_eq!(listed[0].name, "Demo Two");
+        assert_eq!(listed[0].version.as_deref(), Some("1.1.0"));
+        assert_eq!(listed[0].hooks, vec!["convertRequest".to_string()]);
+        assert_eq!(db.get_plugin_state("demo").unwrap().unwrap().enabled, true);
+
+        // Deleting the active build clears the activation rather than leaving a
+        // dangling pointer, and the other build survives.
+        assert_eq!(db.delete_plugin_version("demo", "1.1.0").unwrap(), 1);
+        let listed = db.list_plugins().unwrap();
+        assert_eq!(listed[0].active_version, None);
+        assert_eq!(listed[0].versions, vec!["1.0.0".to_string()]);
+
+        // Deleting the last version leaves the key in the listing only if it had
+        // state; here it had state, so it stays and shows nothing active.
+        db.delete_plugin_version("demo", "1.0.0").unwrap();
+        let listed = db.list_plugins().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].versions.is_empty());
     }
 
     /// `LogRetentionDays` was documented as "0 keeps logs forever" while nothing

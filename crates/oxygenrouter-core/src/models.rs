@@ -310,6 +310,46 @@ pub struct RequestLog {
     pub client_ip: Option<String>,
 }
 
+/// One stored build of a plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginVersion {
+    pub key: String,
+    pub version: String,
+    /// The plugin's JavaScript, as uploaded.
+    pub source: String,
+    /// The manifest the source declared, serialised. Stored rather than
+    /// re-derived so a listing does not have to run untrusted code to describe
+    /// itself.
+    pub manifest: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Which build of a plugin is active, and whether it runs at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginState {
+    pub key: String,
+    pub active_version: Option<String>,
+    pub enabled: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A plugin as the console sees it: its state plus the manifest of the active
+/// build, with every version it has on file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSummary {
+    pub key: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub description: String,
+    pub enabled: bool,
+    pub active_version: Option<String>,
+    pub versions: Vec<String>,
+    /// Hooks the active build implements, so a page can show what it will do
+    /// without running it.
+    pub hooks: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// One administrative action, recorded for accountability.
 ///
 /// The console has always offered `AuditLogEnabled` with the description

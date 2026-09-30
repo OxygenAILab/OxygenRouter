@@ -74,6 +74,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         // itself sensitive, and the reference likewise gates its log endpoints on
         // admin (`router/api-router.go:314`).
         .route("/api/audit-logs", get(list_audit_logs).delete(clear_audit_logs))
+        // Plugin management, matching the reference's `/plugin/task` group
+        // (`router/api-router.go:253`). Root-only by the `/api/plugin` prefix:
+        // uploading code the gateway will execute is an owner action.
+        .route("/api/plugin/task", get(list_task_plugins).post(upload_task_plugin))
+        .route("/api/plugin/task/:key", get(get_task_plugin))
+        .route("/api/plugin/task/:key/activate", post(activate_task_plugin))
+        .route("/api/plugin/task/:key/status", post(set_task_plugin_status))
+        .route("/api/plugin/task/:key/dryrun", post(dry_run_task_plugin))
+        .route(
+            "/api/plugin/task/:key/versions/:version",
+            axum::routing::delete(delete_task_plugin_version),
+        )
         .route("/api/status", get(get_status))
         .route("/api/dashboard", get(get_dashboard))
         .route("/api/analytics/flow", get(get_analytics_flow))
@@ -3316,6 +3328,338 @@ async fn clear_logs(State(s): State<Arc<AppState>>) -> Json<ApiResponse<usize>> 
         Err(e) => ApiResponse::err(e.to_string()),
     })
 }
+
+/// Every plugin the instance knows about.
+async fn list_task_plugins(
+    State(s): State<Arc<AppState>>,
+) -> Json<ApiResponse<Vec<oxygenrouter_core::PluginSummary>>> {
+    Json(match s.db.list_plugins() {
+        Ok(list) => ApiResponse::ok(list),
+        Err(e) => ApiResponse::err(e.to_string()),
+    })
+}
+
+async fn get_task_plugin(
+    State(s): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    match s.db.list_plugins() {
+        Ok(list) => match list.into_iter().find(|p| p.key == key) {
+            Some(plugin) => Json(ApiResponse::ok(plugin)).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<oxygenrouter_core::PluginSummary>::err("plugin not found")),
+            )
+                .into_response(),
+        },
+        Err(e) => db_error::<oxygenrouter_core::PluginSummary>(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PluginUploadInput {
+    key: String,
+    version: String,
+    source: String,
+}
+
+/// Store a plugin build, refusing anything the runtime cannot load.
+///
+/// The source is executed once here, in the host's own engine, before it is
+/// written: accepting code that the gateway will run on every request without
+/// ever having run it once would make a syntax error or a missing hook surface
+/// as a routing failure later instead of as an upload refusal now.
+async fn upload_task_plugin(
+    State(s): State<Arc<AppState>>,
+    Json(input): Json<PluginUploadInput>,
+) -> Response {
+    if let Err(reason) = validate_plugin_upload(&input) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<oxygenrouter_core::PluginSummary>::err(reason)),
+        )
+            .into_response();
+    }
+    let manifest = match s
+        .plugins
+        .load(input.source.clone(), PLUGIN_CALL_TIMEOUT)
+        .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<oxygenrouter_core::PluginSummary>::err(error.to_string())),
+            )
+                .into_response()
+        }
+    };
+    // The manifest is the plugin's own claim about itself; a key that disagrees
+    // with the path it is being stored under would make the console and the
+    // hooks refer to different plugins.
+    if manifest.key != input.key {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<oxygenrouter_core::PluginSummary>::err(format!(
+                "manifest declares key {:?} but the upload names {:?}",
+                manifest.key, input.key
+            ))),
+        )
+            .into_response();
+    }
+    let version = oxygenrouter_core::PluginVersion {
+        key: input.key.clone(),
+        version: input.version.clone(),
+        source: input.source.clone(),
+        manifest: serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        created_at: Utc::now(),
+    };
+    if let Err(e) = s.db.upsert_plugin_version(&version) {
+        return db_error::<oxygenrouter_core::PluginSummary>(e);
+    }
+    // A first upload becomes active but stays off, so installing is not the same
+    // act as enabling: an operator can inspect it before it runs on traffic.
+    let existing = s.db.get_plugin_state(&input.key).ok().flatten();
+    let active = existing
+        .as_ref()
+        .and_then(|state| state.active_version.clone())
+        .or_else(|| Some(input.version.clone()));
+    let enabled = existing.as_ref().map(|state| state.enabled).unwrap_or(false);
+    if let Err(e) = s
+        .db
+        .set_plugin_state(&input.key, active.as_deref(), enabled)
+    {
+        return db_error::<oxygenrouter_core::PluginSummary>(e);
+    }
+    let _ = version; // stored above; the listing below is the canonical view
+    match s.db.list_plugins() {
+        Ok(list) => {
+            let found = list
+                .into_iter()
+                .find(|p| p.key == input.key)
+                .unwrap_or_else(|| oxygenrouter_core::PluginSummary {
+                    key: input.key.clone(),
+                    name: input.key.clone(),
+                    version: Some(input.version.clone()),
+                    description: String::new(),
+                    enabled: false,
+                    active_version: Some(input.version.clone()),
+                    versions: vec![input.version.clone()],
+                    hooks: Vec::new(),
+                    updated_at: Utc::now(),
+                });
+            Json(ApiResponse::ok(found)).into_response()
+        }
+        Err(e) => db_error::<oxygenrouter_core::PluginSummary>(e),
+    }
+}
+
+/// Refuse an upload that cannot possibly be usable, before running it.
+fn validate_plugin_upload(input: &PluginUploadInput) -> Result<(), String> {
+    if !oxygenrouter_plugin::valid_key(&input.key) {
+        return Err(format!(
+            "{:?} is not a valid plugin key: lowercase letters, digits, underscore and dash, starting alphanumeric, at most 30 characters",
+            input.key
+        ));
+    }
+    if input.version.trim().is_empty() {
+        return Err("a version is required".to_string());
+    }
+    if input.source.trim().is_empty() {
+        return Err("source is required".to_string());
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct PluginActivateInput {
+    version: String,
+}
+
+/// Choose which stored build is active.
+async fn activate_task_plugin(
+    State(s): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Json(input): Json<PluginActivateInput>,
+) -> Response {
+    let versions = match s.db.list_plugin_versions(&key) {
+        Ok(v) => v,
+        Err(e) => return db_error::<oxygenrouter_core::PluginSummary>(e),
+    };
+    if !versions.iter().any(|v| v.version == input.version) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<oxygenrouter_core::PluginSummary>::err(format!(
+                "version {:?} is not stored for plugin {:?}",
+                input.version, key
+            ))),
+        )
+            .into_response();
+    }
+    let enabled = s
+        .db
+        .get_plugin_state(&key)
+        .ok()
+        .flatten()
+        .map(|state| state.enabled)
+        .unwrap_or(false);
+    // The build is loaded before it is activated, so a version that cannot even
+    // be parsed cannot become the one the gateway would call.
+    let source = versions
+        .iter()
+        .find(|v| v.version == input.version)
+        .map(|v| v.source.clone())
+        .unwrap_or_default();
+    if let Err(error) = s.plugins.load(source, PLUGIN_CALL_TIMEOUT).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<oxygenrouter_core::PluginSummary>::err(error.to_string())),
+        )
+            .into_response();
+    }
+    match s
+        .db
+        .set_plugin_state(&key, Some(&input.version), enabled)
+    {
+        Ok(()) => Json(ApiResponse::ok("activated")).into_response(),
+        Err(e) => db_error::<&str>(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PluginStatusInput {
+    enabled: bool,
+}
+
+async fn set_task_plugin_status(
+    State(s): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Json(input): Json<PluginStatusInput>,
+) -> Response {
+    let state = match s.db.get_plugin_state(&key) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<&str>::err("plugin not found")),
+            )
+                .into_response()
+        }
+        Err(e) => return db_error::<&str>(e),
+    };
+    // Enabling a plugin with no active build would leave it on and doing nothing,
+    // which reads as a broken plugin rather than an unset one.
+    if input.enabled && state.active_version.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<&str>::err(
+                "activate a version before enabling this plugin",
+            )),
+        )
+            .into_response();
+    }
+    match s
+        .db
+        .set_plugin_state(&key, state.active_version.as_deref(), input.enabled)
+    {
+        Ok(()) => Json(ApiResponse::ok("updated")).into_response(),
+        Err(e) => db_error::<&str>(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PluginDryRunInput {
+    /// The hook to call.
+    hook: String,
+    /// Its input, as JSON.
+    input: serde_json::Value,
+}
+
+/// Call one hook without touching live traffic.
+///
+/// This is the only way to answer "what does this plugin actually do" without
+/// routing a real request through it, so it is the safety valve for the whole
+/// feature: an operator can see the transformation before enabling it.
+async fn dry_run_task_plugin(
+    State(s): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Json(input): Json<PluginDryRunInput>,
+) -> Response {
+    let state = match s.db.get_plugin_state(&key) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<serde_json::Value>::err("plugin not found")),
+            )
+                .into_response()
+        }
+        Err(e) => return db_error::<serde_json::Value>(e),
+    };
+    let Some(version) = state.active_version else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::err(
+                "no active version to dry-run",
+            )),
+        )
+            .into_response();
+    };
+    let source = match s.db.list_plugin_versions(&key) {
+        Ok(versions) => versions
+            .into_iter()
+            .find(|v| v.version == version)
+            .map(|v| v.source),
+        Err(e) => return db_error::<serde_json::Value>(e),
+    };
+    let Some(source) = source else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<serde_json::Value>::err("active version is not stored")),
+        )
+            .into_response();
+    };
+    // Load a copy so the dry run reflects the stored build even if a newer one
+    // was loaded into the host for something else.
+    if let Err(error) = s.plugins.load(source, PLUGIN_CALL_TIMEOUT).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::err(error.to_string())),
+        )
+            .into_response();
+    }
+    match s
+        .plugins
+        .call_hook(&key, &input.hook, input.input, PLUGIN_CALL_TIMEOUT)
+        .await
+    {
+        Ok(value) => Json(ApiResponse::ok(value)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::err(error.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_task_plugin_version(
+    State(s): State<Arc<AppState>>,
+    Path((key, version)): Path<(String, String)>,
+) -> Response {
+    match s.db.delete_plugin_version(&key, &version) {
+        Ok(0) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<usize>::err("no such version")),
+        )
+            .into_response(),
+        Ok(n) => Json(ApiResponse::ok(n)).into_response(),
+        Err(e) => db_error::<usize>(e),
+    }
+}
+
+/// How long a plugin may take to load or answer, matching the reference's
+/// `DefaultCallTimeout` (`pkg/jsplugin/engine.go:18`).
+const PLUGIN_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The administrative trail, newest first.
 ///
