@@ -2139,6 +2139,72 @@ async fn test_channel(
     Json(ApiResponse::ok(result))
 }
 
+/// Ask one channel's upstream for its model list and persist it.
+///
+/// Extracted from the HTTP handler so the background refresh can reuse it
+/// verbatim: a second implementation of "fetch and store a channel's models"
+/// would drift, and the operator-visible behaviour of the button and the timer
+/// must be the same or the timer becomes untrustworthy.
+///
+/// Returns the refreshed list, or the reason the refresh did not happen.
+pub async fn refresh_channel_models(
+    state: &AppState,
+    ch: &Channel,
+) -> Result<Vec<String>, String> {
+    let base = ch.base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1") { format!("{}/models", base) } else { format!("{}/v1/models", base) };
+    // This is a server-side fetch of a stored URL, so it is SSRF-checked. The
+    // relay path deliberately is not: NewAPI exempts provider base URLs because
+    // they are operator-managed deployment targets that may legitimately be
+    // private (a LAN vLLM or Ollama host), whereas this endpoint tells the
+    // server to dereference a URL on demand.
+    state
+        .fetch_policy()
+        .validate_url(&url)
+        .map_err(|error| format!("ssrf protection refused this target: {error}"))?;
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        // Redirects are not followed: a permitted host could otherwise bounce
+        // the request to an internal one and defeat the check above.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(e.to_string()),
+    };
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", ch.api_key.lines().next().unwrap_or_default()))
+        .send()
+        .await
+        .map_err(|e| format!("upstream request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("reading response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "upstream HTTP {status}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    let models: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("data").and_then(|d| d.as_array()).map(|arr| {
+            arr.iter().filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from)).collect::<Vec<_>>()
+        }))
+        .unwrap_or_default();
+    if models.is_empty() {
+        return Err("no models returned from upstream".to_string());
+    }
+    state
+        .db
+        .update_channel_models(&ch.id, &models)
+        .map_err(|e| e.to_string())?;
+    Ok(models)
+}
+
 async fn fetch_channel_models(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2148,65 +2214,24 @@ async fn fetch_channel_models(
         Ok(None) => return (StatusCode::NOT_FOUND, Json(ApiResponse::<Channel>::err("channel not found"))).into_response(),
         Err(e) => return db_error::<Channel>(e),
     };
-    let base = ch.base_url.trim_end_matches('/');
-    let url = if base.ends_with("/v1") { format!("{}/models", base) } else { format!("{}/v1/models", base) };
-    // This is a server-side fetch of a stored URL, so it is SSRF-checked. The
-    // relay path deliberately is not: NewAPI exempts provider base URLs because
-    // they are operator-managed deployment targets that may legitimately be
-    // private (a LAN vLLM or Ollama host), whereas this endpoint tells the
-    // server to dereference a URL on demand.
-    if let Err(error) = s.fetch_policy().validate_url(&url) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<Channel>::err(format!(
-                "ssrf protection refused this target: {error}"
-            ))),
-        )
-            .into_response();
-    }
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        // Redirects are not followed: a permitted host could otherwise bounce
-        // the request to an internal one and defeat the check above.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let resp = match client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", ch.api_key.lines().next().unwrap_or_default()))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_GATEWAY, Json(ApiResponse::<Channel>::err(format!("upstream request failed: {e}")))).into_response(),
-    };
-    let status = resp.status();
-    let body = match resp.text().await {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_GATEWAY, Json(ApiResponse::<Channel>::err(format!("reading response: {e}")))).into_response(),
-    };
-    if !status.is_success() {
-        return (StatusCode::BAD_GATEWAY, Json(ApiResponse::<Channel>::err(format!("upstream HTTP {status}: {}", body.chars().take(200).collect::<String>())))).into_response();
-    }
-    let models: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("data").and_then(|d| d.as_array()).map(|arr| {
-            arr.iter().filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from)).collect::<Vec<_>>()
-        }))
-        .unwrap_or_default();
-    if models.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Channel>::err("no models returned from upstream"))).into_response();
-    }
-    match s.db.update_channel_models(&id, &models) {
-        Ok(()) => {
+    match refresh_channel_models(&s, &ch).await {
+        Ok(models) => {
             let mut updated = ch;
             updated.model_list = models;
             Json(ApiResponse::ok(updated)).into_response()
         }
-        Err(e) => db_error::<Channel>(e),
+        // The message already distinguishes a policy refusal from an upstream
+        // failure, so the status is chosen from it rather than re-derived.
+        Err(message) => {
+            let status = if message.starts_with("ssrf protection refused") {
+                StatusCode::FORBIDDEN
+            } else if message.starts_with("no models returned") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (status, Json(ApiResponse::<Channel>::err(message))).into_response()
+        }
     }
 }
 

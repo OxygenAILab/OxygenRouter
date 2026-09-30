@@ -167,6 +167,80 @@ async fn main() {
         });
     }
 
+    // Channel model refresh. `UpstreamModelSyncEnabled` and
+    // `ModelSyncIntervalMinutes` were advertised and read by nothing, so a
+    // channel's model list only ever changed when an operator pressed the button.
+    //
+    // The wait is sliced rather than taken in one sleep. A single
+    // `sleep(minutes * 60)` reads the interval *before* sleeping, so shortening
+    // it while the task is asleep would not take effect until the old, longer
+    // sleep finished — with the shipped default that is an hour of the console
+    // saying one thing and the task doing another. Re-evaluating on a short tick
+    // costs two tiny reads every five seconds and makes a change visible promptly.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            // When the last sweep ran. Cleared while sync is off so that turning
+            // it on sweeps promptly instead of waiting out a stale interval.
+            let mut last_sweep: Option<std::time::Instant> = None;
+            loop {
+                ticker.tick().await;
+                let minutes = state
+                    .db
+                    .get_setting("ModelSyncIntervalMinutes")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                    .filter(|m| *m >= 1)
+                    .unwrap_or(60);
+                let enabled = state
+                    .db
+                    .get_setting("UpstreamModelSyncEnabled")
+                    .ok()
+                    .flatten()
+                    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+                    .unwrap_or(false);
+                if !enabled {
+                    last_sweep = None;
+                    continue;
+                }
+                let due = last_sweep
+                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(minutes * 60))
+                    .unwrap_or(true);
+                if !due {
+                    continue;
+                }
+                last_sweep = Some(std::time::Instant::now());
+                let channels = state.db.get_enabled_channels().unwrap_or_default();
+                // Sequential rather than concurrent: this is a background chore,
+                // and a burst of simultaneous requests to every upstream at once
+                // is exactly the load spike an upstream may throttle.
+                for channel in channels {
+                    match api::refresh_channel_models(&state, &channel).await {
+                        Ok(models) => {
+                            // Only announce a real change; an unchanged list every
+                            // interval would bury the log line that matters.
+                            if models != channel.model_list {
+                                println!(
+                                    "[OxygenRouter] model sync: {} now exposes {} models",
+                                    channel.name,
+                                    models.len()
+                                );
+                            }
+                        }
+                        // A failure is expected for a disabled or unreachable
+                        // upstream and must not stop the sweep or the task.
+                        Err(reason) => eprintln!(
+                            "[OxygenRouter] model sync: {} skipped: {reason}",
+                            channel.name
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
