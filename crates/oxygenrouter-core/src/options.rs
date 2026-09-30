@@ -27,6 +27,10 @@ pub enum OptionSection {
     Operations,
     Security,
     Models,
+    /// Values read once at startup, which therefore need a restart to take
+    /// effect. Kept in their own group so the console can say so plainly instead
+    /// of presenting them beside settings that apply immediately.
+    Bootstrap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,12 +80,15 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("SessionTtlDays", Auth, Int, "7", "Session lifetime in days"),
     schema!("MinPasswordLength", Auth, Int, "8", "Minimum accepted password length"),
     // Routing
-    schema!("RetryTimes", Routing, Int, "3", "How many times a failed channel is retried"),
-    schema!("RetryIntervalMs", Routing, Int, "500", "Base delay between retries"),
-    schema!("RetryBackoff", Routing, String, "exponential", "fixed | linear | exponential"),
-    schema!("ChannelDisableThreshold", Routing, Int, "3", "Consecutive failures before auto-disabling a channel"),
-    schema!("ChannelAffinityEnabled", Routing, Bool, "false", "Prefer the last healthy channel for a token"),
+    // Read once when the scheduler is built, so they belong with the other
+    // startup values rather than beside the routing rules that apply live.
+    schema!("RetryTimes", Bootstrap, Int, "3", "How many times a failed channel is retried"),
+    schema!("RetryIntervalMs", Bootstrap, Int, "500", "Base delay between retries"),
+    schema!("RetryBackoff", Bootstrap, String, "exponential", "fixed | linear | exponential"),
+    schema!("ChannelDisableThreshold", Bootstrap, Int, "3", "Consecutive failures before auto-disabling a channel"),
+    // Consulted per request, so it lives with the routing rules.
     schema!("DefaultGroup", Routing, String, "default", "Group used when no token group is set"),
+    schema!("ChannelAffinityEnabled", Routing, Bool, "false", "Prefer the last healthy channel for a token"),
     // Billing
     schema!("QuotaPerUnit", Billing, Float, "500000", "Micros charged per quota unit"),
     schema!("PreConsumedQuota", Billing, Int, "500", "Reserved quota before a request settles"),
@@ -97,19 +104,24 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("FetchSetting.EnableSSRFProtection", Security, Bool, "true", "Validate URLs before fetching them server-side"),
     schema!("FetchSetting.AllowPrivateIp", Security, Bool, "false", "Permit fetching private/loopback/link-local addresses (needed for a LAN upstream)"),
     schema!("FetchSetting.AllowedPorts", Security, String, "80,443,8080,8443", "Comma-separated ports, or ranges like 8000-9000; empty allows any"),
-    schema!("ListenHost", Operations, String, "127.0.0.1", "Bind address for the HTTP server"),
-    schema!("ListenPort", Operations, Int, "3001", "HTTP port for WebUI and proxy"),
-    schema!("UpstreamTimeoutMs", Operations, Int, "120000", "Maximum duration of one upstream call"),
-    schema!("MaxConcurrentRequests", Operations, Int, "64", "In-flight upstream request limit"),
+    schema!("ListenHost", Bootstrap, String, "127.0.0.1", "Bind address for the HTTP server"),
+    schema!("ListenPort", Bootstrap, Int, "3001", "HTTP port for WebUI and proxy"),
+    schema!("UpstreamTimeoutMs", Bootstrap, Int, "120000", "Maximum duration of one upstream call"),
+    schema!("MaxConcurrentRequests", Bootstrap, Int, "64", "In-flight upstream request limit"),
     schema!("LogRetentionDays", Operations, Int, "30", "0 keeps logs forever"),
-    schema!("LogLevel", Operations, String, "info", "trace | debug | info | warn | error"),
+    schema!("LogLevel", Bootstrap, String, "info", "trace | debug | info | warn | error"),
+    // Display preferences. They used to live only in `config.json`; the settings
+    // table is now the authority, so they are declared here like every other
+    // setting an operator can change from the console.
+    schema!("Theme", Bootstrap, String, "dark", "Console theme"),
+    schema!("Language", Bootstrap, String, "auto", "Console language"),
     schema!("RequestLogEnabled", Operations, Bool, "true", "Persist request logs"),
     schema!("RecordIpLog", Operations, Bool, "false", "Store client IP addresses on requests"),
     schema!("DataExportEnabled", Operations, Bool, "true", "Aggregate usage into quota_data for analytics"),
     // The reference pairs the switch with an interval (`model/usedata.go:47`),
     // because the counters are held in memory and only written out periodically.
     schema!("DataExportInterval", Operations, Int, "5", "Minutes between usage-summary flushes"),
-    schema!("UserAgent", Operations, String, "OxygenRouter/0.1.0", "User-Agent sent upstream"),
+    schema!("UserAgent", Bootstrap, String, "OxygenRouter/0.1.0", "User-Agent sent upstream"),
     // Security
     schema!("LocalApiToken", Security, String, "", "Bearer token required from local clients", secret),
     // No `IpAllowlistEnabled`. The reference has no such switch: a token's own

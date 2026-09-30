@@ -762,10 +762,14 @@ async fn dispatch(
                 .as_deref()
                 .and_then(|b| serde_json::from_slice(b).ok())
                 .unwrap_or_else(|| serde_json::json!({}));
+            // A key with no group falls back to the configured `DefaultGroup`
+            // rather than the literal, which is what that option says it does.
+            let fallback_group = state.default_group();
             let group = api_key
                 .as_ref()
                 .map(|k| k.group_name.as_str())
-                .unwrap_or("default");
+                .filter(|g| !g.trim().is_empty())
+                .unwrap_or(fallback_group.as_str());
             let amount = state
                 .billing
                 .reservation(&model, group, &body, path);

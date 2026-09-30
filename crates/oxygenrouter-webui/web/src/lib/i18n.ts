@@ -346,6 +346,7 @@ export const STRINGS = {
         operations: "Operations",
         security: "Security",
         models: "Models",
+        bootstrap: "Startup (restart required)",
       },
     },
     modelsMeta: {
@@ -933,6 +934,7 @@ export const STRINGS = {
         operations: "运维",
         security: "安全",
         models: "模型",
+        bootstrap: "启动项（需重启）",
       },
     },
     modelsMeta: {
@@ -1523,6 +1525,7 @@ export type Strings = {
       operations: string;
       security: string;
       models: string;
+      bootstrap: string;
     };
   };
   modelsMeta: {

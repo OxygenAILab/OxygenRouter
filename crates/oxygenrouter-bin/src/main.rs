@@ -66,39 +66,81 @@ async fn main() {
         Err(e) => eprintln!("[OxygenRouter] Bootstrap admin initialization failed: {e}"),
     }
 
-    if let Ok(Some(saved_token)) = db.get_setting("local_api_token") {
-        if !saved_token.is_empty() {
-            APP_CONFIG.write().local_api_token = saved_token;
+    // One-time migration into the single authority.
+    //
+    // The instance's token and the two display preferences used to live in
+    // `config.json`, under the same names but in a different store, and were
+    // copied into `settings` at every start. `settings` is now the authority, so
+    // the copy runs once: if the table has nothing yet, the config file's value
+    // is carried over and then never consulted again. Later edits go through the
+    // console and cannot be overwritten by a stale file.
+    let bootstrap = {
+        let cfg = APP_CONFIG.read();
+        vec![
+            ("LocalApiToken", cfg.local_api_token.clone()),
+            ("Theme", cfg.theme.clone()),
+            ("Language", cfg.language.clone()),
+            // These were previously read straight from the config file at
+            // startup, so an instance that has been running since before this
+            // change has its real values there and nowhere else. Seeding them is
+            // what stops the switch to the table from silently binding a
+            // different port than the operator configured.
+            ("ListenHost", cfg.listen_host.clone()),
+            ("ListenPort", cfg.listen_port.to_string()),
+            (
+                "MaxConcurrentRequests",
+                cfg.max_concurrent_requests.to_string(),
+            ),
+            ("UpstreamTimeoutMs", cfg.upstream_timeout_ms.to_string()),
+            ("UserAgent", cfg.user_agent.clone()),
+            ("LogLevel", cfg.log_level.clone()),
+            ("RetryTimes", cfg.max_retries.to_string()),
+            ("RetryIntervalMs", cfg.retry_delay_ms.to_string()),
+            ("RetryBackoff", cfg.retry_backoff.clone()),
+            (
+                "LogRetentionDays",
+                cfg.request_log_retention_days.to_string(),
+            ),
+        ]
+    };
+    for (key, value) in bootstrap {
+        let stored = db
+            .get_setting(key)
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty());
+        if let Some(_existing) = stored {
+            continue;
         }
-    } else {
-        let token = APP_CONFIG.read().local_api_token.clone();
-        let _ = db.set_setting("local_api_token", &token);
-    }
-    if let Ok(Some(saved_theme)) = db.get_setting("theme") {
-        if !saved_theme.is_empty() {
-            APP_CONFIG.write().theme = saved_theme;
-        }
-    }
-    if let Ok(Some(saved_language)) = db.get_setting("language") {
-        if !saved_language.is_empty() {
-            APP_CONFIG.write().language = saved_language;
+        if !value.trim().is_empty() {
+            let _ = db.set_setting(key, &value);
         }
     }
 
     let selector = ChannelSelector::new(db.clone());
+    // Read from the settings table, which is now the single authority. Each key
+    // falls back to its schema default, so an unset table behaves like a fresh
+    // install rather than an empty configuration.
     let (max_retries, user_agent, timeout_ms, backoff_base_ms, immediate_retry) = {
-        let cfg = APP_CONFIG.read();
+        let max_retries = db.typed_setting("RetryTimes", 3_i64).max(0) as u32;
+        let configured_agent: String = db.typed_setting("UserAgent", String::new());
+        let user_agent = if configured_agent.trim().is_empty() {
+            format!("OxygenRouter/{}", env!("CARGO_PKG_VERSION"))
+        } else {
+            configured_agent
+        };
+        let timeout_ms = db.typed_setting("UpstreamTimeoutMs", 120_000_u64);
+        let backoff_base_ms = db.typed_setting("RetryIntervalMs", 500_i64).max(0) as u64;
+        // "none" reproduces NewAPI's immediate retry; anything else backs off.
+        let immediate_retry = db
+            .typed_setting("RetryBackoff", "exponential".to_string())
+            .eq_ignore_ascii_case("none");
         (
-            cfg.max_retries.max(0) as u32,
-            if cfg.user_agent.trim().is_empty() {
-                format!("OxygenRouter/{}", env!("CARGO_PKG_VERSION"))
-            } else {
-                cfg.user_agent.clone()
-            },
-            cfg.upstream_timeout_ms,
-            cfg.retry_delay_ms.max(0) as u64,
-            // "none" reproduces NewAPI's immediate retry; anything else backs off.
-            cfg.retry_backoff.eq_ignore_ascii_case("none"),
+            max_retries,
+            user_agent,
+            timeout_ms,
+            backoff_base_ms,
+            immediate_retry,
         )
     };
     let relay = RelayClient::new(user_agent, timeout_ms);
@@ -107,11 +149,18 @@ async fn main() {
         .with_backoff(
             if immediate_retry { 0 } else { backoff_base_ms },
             backoff_base_ms.saturating_mul(60).max(30_000),
-        );
+        )
+        // `ChannelDisableThreshold` was advertised and read by nothing: the
+        // scheduler carried a builder for it and always ran on the hard-coded
+        // default, so an operator could not make a flaky channel stand down
+        // sooner or later than the shipped five.
+        .with_disable_threshold(db.typed_setting("ChannelDisableThreshold", 5_i64).max(0) as u32);
 
-    let local_token = APP_CONFIG.read().local_api_token.clone();
+    // The local token is now read from the table; the seeded value above is what
+    // carries an existing instance's token across.
+    let local_token: String = db.typed_setting("LocalApiToken", String::new());
     // The concurrency ceiling is enforced globally; NewAPI does not enforce one.
-    let max_concurrent = APP_CONFIG.read().max_concurrent_requests;
+    let max_concurrent = db.typed_setting("MaxConcurrentRequests", 64_i32);
     let mut state_inner = AppState::new(
         db.clone(),
         db_path.clone(),

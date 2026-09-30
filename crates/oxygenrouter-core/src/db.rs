@@ -1917,6 +1917,33 @@ impl Database {
 
     // ── Settings ────────────────────────────────────────────────────────────────
 
+    /// A setting's typed value, falling back to the option schema's declared
+    /// default when nothing was stored or the value does not parse.
+    ///
+    /// This is the single read path for configuration. Before it existed there
+    /// were two: the `settings` table and `config.json`, holding the same fields
+    /// under different spellings, with the console editing one and the process
+    /// reading the other depending on the field. An option that is not in the
+    /// schema yields the caller's fallback rather than panicking, so a key that is
+    /// only ever written still reads back the last value.
+    pub fn typed_setting<T: std::str::FromStr>(&self, key: &str, fallback: T) -> T {
+        let schema_default = || {
+            crate::options::find_schema(key).and_then(|schema| schema.default.parse::<T>().ok())
+        };
+        let stored = self
+            .get_setting(key)
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.trim().parse::<T>().ok());
+        stored.or_else(schema_default).unwrap_or(fallback)
+    }
+
+    /// The schema default for a key, parsed — useful when a caller wants the
+    /// shipped value rather than whatever the instance has.
+    pub fn setting_default<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
+        crate::options::find_schema(key).and_then(|schema| schema.default.parse::<T>().ok())
+    }
+
     pub fn get_setting(&self, key: &str) -> SqliteResult<Option<String>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare("SELECT value FROM settings WHERE key=?1")?;

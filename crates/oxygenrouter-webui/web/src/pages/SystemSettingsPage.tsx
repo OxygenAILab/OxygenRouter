@@ -17,6 +17,7 @@ const SECTION_ORDER: OptionEntry["section"][] = [
   "operations",
   "security",
   "models",
+  "bootstrap",
 ];
 
 function OptionRow({

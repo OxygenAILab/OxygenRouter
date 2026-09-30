@@ -343,6 +343,16 @@ impl AppState {
         self.data_export_enabled.load(Ordering::Relaxed)
     }
 
+    /// The group a request belongs to when its key names none.
+    ///
+    /// `DefaultGroup` was advertised as exactly this and was read by nothing; the
+    /// proxy substituted the literal `"default"` at each site. Read live rather
+    /// than cached, because it is a routing decision an operator may be changing
+    /// while traffic flows.
+    pub fn default_group(&self) -> String {
+        self.db.typed_setting("DefaultGroup", "default".to_string())
+    }
+
     /// Minutes a login lock lasts once it trips.
     ///
     /// Not exposed as an option: NewAPI's own lock is a fixed window, and adding

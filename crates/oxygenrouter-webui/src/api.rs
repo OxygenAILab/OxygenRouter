@@ -3645,6 +3645,39 @@ async fn update_settings(
     State(s): State<Arc<AppState>>,
     Json(input): Json<UpdateSettingsInput>,
 ) -> Json<ApiResponse<oxygenrouter_core::AppSettings>> {
+    // Snapshot the table-form of every field the settings table also holds,
+    // before the block below consumes `input` by value. The table is the
+    // authority, so a change here has to reach it and not only the in-memory
+    // copy; capturing first keeps the mirroring a single, obvious list.
+    let mirrors: Vec<(&'static str, String)> = [
+        ("ListenHost", input.listen_host.clone()),
+        ("ListenPort", input.listen_port.map(|v| v.to_string())),
+        (
+            "MaxConcurrentRequests",
+            input.max_concurrent_requests.map(|v| v.to_string()),
+        ),
+        (
+            "UpstreamTimeoutMs",
+            input.upstream_timeout_ms.map(|v| v.to_string()),
+        ),
+        ("UserAgent", input.user_agent.clone()),
+        ("LogLevel", input.log_level.clone()),
+        ("RetryTimes", input.max_retries.map(|v| v.to_string())),
+        ("RetryIntervalMs", input.retry_delay_ms.map(|v| v.to_string())),
+        ("RetryBackoff", input.retry_backoff.clone()),
+        (
+            "LogRetentionDays",
+            input.request_log_retention_days.map(|v| v.to_string()),
+        ),
+        ("Theme", input.theme.clone()),
+        ("Language", input.language.clone()),
+        // Stored under its option key so the console's masked read and this write
+        // agree on one name.
+        ("LocalApiToken", input.local_api_token.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|v| (key, v)))
+    .collect();
     {
         let mut cfg = oxygenrouter_core::APP_CONFIG.write();
         if let Some(v) = input.listen_host {
@@ -3690,16 +3723,15 @@ async fn update_settings(
             cfg.language = v;
         }
     }
+    // The settings table is the authority, so every value that appears in both
+    // stores is written to both from here on: the in-memory copy serves reads
+    // during this process's lifetime, and the table is what a restart and the
+    // option list see. Keeping them written together is what stops the drift this
+    // whole change exists to remove.
+    for (key, value) in mirrors {
+        let _ = s.db.set_setting(key, &value);
+    }
     let cfg = oxygenrouter_core::APP_CONFIG.read();
-    if let Some(v) = input.local_api_token.as_ref() {
-        let _ = s.db.set_setting("local_api_token", v);
-    }
-    if let Some(v) = input.theme.as_ref() {
-        let _ = s.db.set_setting("theme", v);
-    }
-    if let Some(v) = input.language.as_ref() {
-        let _ = s.db.set_setting("language", v);
-    }
     let _ = oxygenrouter_core::save_config(s.config_path.as_path());
     Json(ApiResponse::ok((*cfg).clone()))
 }

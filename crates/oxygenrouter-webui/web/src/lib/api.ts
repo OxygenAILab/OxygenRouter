@@ -210,7 +210,16 @@ export interface ApiKey {
 
 export interface OptionEntry {
   key: string;
-  section: "site" | "auth" | "routing" | "billing" | "operations" | "security" | "models";
+  section:
+    | "site"
+    | "auth"
+    | "routing"
+    | "billing"
+    | "operations"
+    | "security"
+    | "models"
+    /** Read once at startup, so a change needs a restart. */
+    | "bootstrap";
   kind: "string" | "int" | "bool" | "float";
   value: string;
   default: string;
