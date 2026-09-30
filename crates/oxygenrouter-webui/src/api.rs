@@ -3616,6 +3616,16 @@ async fn update_option(
             ) {
                 s.reload_log_policy();
             }
+            // The billing thresholds sit behind the service's policy lock, so a
+            // change must be pushed rather than derived per request. `reload_pricing`
+            // carries the policy with the expressions, which is why one call covers
+            // both.
+            if matches!(
+                schema.key,
+                "TrustQuota" | "PreConsumedQuota" | "FreeModelPreConsumeEnabled"
+            ) {
+                s.reload_pricing();
+            }
             Json(ApiResponse::ok("updated"))
         }
         Err(error) => Json(ApiResponse::err(error.to_string())),

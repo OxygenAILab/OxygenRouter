@@ -324,11 +324,62 @@ impl AppState {
         self.scheduler.write().await.set_model_maps(maps);
     }
 
+    /// Apply the three billing thresholds the console offers.
+    ///
+    /// `TrustQuota`, `PreConsumedQuota` and `FreeModelPreConsumeEnabled` were
+    /// advertised and read by nothing, so the engine always ran on its shipped
+    /// defaults: an operator could not raise the reserve for expensive models,
+    /// could not lower the balance above which reservation is skipped, and could
+    /// not make a zero-price model reserve anything.
+    ///
+    /// `PreConsumedQuota` is an absolute floor, not the multiplier: our engine
+    /// reserves the computed estimate, whereas the reference's constant is the
+    /// amount it holds back for a request whose price is not yet known. Taking it
+    /// as a minimum keeps the field meaningful without making every reservation
+    /// 500 micros for a model that costs less. A value of `0` disables the floor,
+    /// matching how every other numeric option treats zero.
+    fn reload_billing_policy(&self) {
+        let mut policy = oxygenrouter_billing::BillingPolicy::default();
+
+        let read_int = |key: &str| -> Option<i64> {
+            self.db
+                .get_setting(key)
+                .ok()
+                .flatten()
+                .and_then(|raw| raw.trim().parse::<i64>().ok())
+        };
+        let read_bool = |key: &str, fallback: bool| -> bool {
+            self.db
+                .get_setting(key)
+                .ok()
+                .flatten()
+                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(fallback)
+        };
+
+        // A negative threshold is meaningless; treat it as unset rather than
+        // letting it invert the comparison it feeds.
+        if let Some(trust) = read_int("TrustQuota").filter(|v| *v >= 0) {
+            policy.trust_quota = trust;
+        }
+        if let Some(floor) = read_int("PreConsumedQuota").filter(|v| *v >= 0) {
+            policy.min_pre_consume = floor;
+        }
+        policy.pre_consume_free_models = read_bool("FreeModelPreConsumeEnabled", false);
+
+        self.billing.set_policy(policy);
+    }
+
     /// Re-read pricing overrides from the option store.
     ///
     /// Called at startup and after an admin edits pricing, so a running instance
     /// picks up new expressions without a restart.
     pub fn reload_pricing(&self) {
+        self.reload_billing_policy();
         use oxygenrouter_billing::BillingMode;
         use std::collections::HashMap;
 

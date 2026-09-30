@@ -226,6 +226,13 @@ pub struct BillingPolicy {
     pub pre_consume_multiplier: f64,
     /// Reserve even when the model's price resolves to zero.
     pub pre_consume_free_models: bool,
+    /// Smallest reservation this instance will hold, in quota micros.
+    ///
+    /// `0` disables the floor. The console calls this `PreConsumedQuota`; the
+    /// reference's constant of the same name is the amount held for a request
+    /// whose price is not yet known, so taking it as a minimum keeps the field
+    /// meaningful without over-reserving a genuinely cheap model.
+    pub min_pre_consume: i64,
     /// Assumed completion length when the request does not cap it.
     pub assumed_completion_tokens: i64,
 }
@@ -236,6 +243,9 @@ impl Default for BillingPolicy {
             trust_quota: 10_000_000,
             pre_consume_multiplier: 1.0,
             pre_consume_free_models: false,
+            // Off by default: a floor changes what every request holds back, and
+            // the shipped defaults must keep behaving exactly as before.
+            min_pre_consume: 0,
             assumed_completion_tokens: 500,
         }
     }
@@ -244,14 +254,19 @@ impl Default for BillingPolicy {
 /// The billing service.
 pub struct BillingService {
     pricing: Arc<parking_lot::RwLock<Pricing>>,
-    policy: BillingPolicy,
+    /// Read on every charge and every reservation, so it lives behind the same
+    /// kind of lock `pricing` does rather than being copied into the struct at
+    /// construction. A plain field would make the thresholds frozen at startup:
+    /// the instance's configured reserve and trust values could not be applied to
+    /// a running process at all.
+    policy: Arc<parking_lot::RwLock<BillingPolicy>>,
 }
 
 impl BillingService {
     pub fn new(pricing: Pricing, policy: BillingPolicy) -> Self {
         Self {
             pricing: Arc::new(parking_lot::RwLock::new(pricing)),
-            policy,
+            policy: Arc::new(parking_lot::RwLock::new(policy)),
         }
     }
 
@@ -259,8 +274,9 @@ impl BillingService {
         Arc::clone(&self.pricing)
     }
 
-    pub fn policy(&self) -> &BillingPolicy {
-        &self.policy
+    /// Replace the policy in place, so a live instance picks up new thresholds.
+    pub fn set_policy(&self, policy: BillingPolicy) {
+        *self.policy.write() = policy;
     }
 
     /// Compute the charge for a completed request.
@@ -368,7 +384,7 @@ impl BillingService {
             .or_else(|| body.get("max_output_tokens"))
             .and_then(|v| v.as_i64())
             .filter(|v| *v > 0)
-            .unwrap_or(self.policy.assumed_completion_tokens);
+            .unwrap_or(self.policy.read().assumed_completion_tokens);
 
         let usage = BillingUsage {
             prompt_tokens: estimated_prompt,
@@ -381,14 +397,28 @@ impl BillingService {
         };
 
         let charge = self.charge(model, group, &usage, &EvalContext::default());
-        let scaled = (charge.quota as f64 * self.policy.pre_consume_multiplier).ceil();
+        // One read of the policy for the whole decision, so the multiplier and
+        // the free-model rule cannot be observed half-updated.
+        let policy = self.policy.read().clone();
+        let scaled = (charge.quota as f64 * policy.pre_consume_multiplier).ceil();
+        if charge.path == BillingPath::Unpriced {
+            // A model with no price has nothing to hold back, so the free-model
+            // switch is the only thing that can make it reserve — and its whole
+            // purpose is to hold the standard amount anyway. This branch used to
+            // be dead: an unpriced charge has `quota == 0`, which tripped an
+            // earlier `scaled <= 0.0` return, so the option could never do
+            // anything at all.
+            if !policy.pre_consume_free_models || policy.min_pre_consume <= 0 {
+                return 0;
+            }
+            return policy.min_pre_consume;
+        }
         if scaled <= 0.0 {
             return 0;
         }
-        if !self.policy.pre_consume_free_models && charge.path == BillingPath::Unpriced {
-            return 0;
-        }
-        scaled.min(crate::quota_math::MAX_QUOTA as f64) as i64
+        let amount = (scaled.min(crate::quota_math::MAX_QUOTA as f64) as i64)
+            .max(policy.min_pre_consume.max(0));
+        amount
     }
 
     /// Begin a billing session for one request.
@@ -415,7 +445,7 @@ impl BillingService {
         } else {
             store
                 .wallet_balance(user_id)
-                .map(|b| b > self.policy.trust_quota)
+                .map(|b| b > self.policy.read().trust_quota)
                 .unwrap_or(false)
         };
 
@@ -664,6 +694,14 @@ mod tests {
         )
     }
 
+    /// The same baseline `service()` uses, for tests that replace the policy.
+    fn service_policy() -> BillingPolicy {
+        BillingPolicy {
+            trust_quota: i64::MAX,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn expression_charge_matches_the_engine() {
         let service = service();
@@ -705,6 +743,80 @@ mod tests {
         });
         let r = service.reservation("Ling-1T", "default", &body, "/v1/chat/completions");
         assert!(r > 0, "reservation was {r}");
+    }
+
+    /// `PreConsumedQuota`, `FreeModelPreConsumeEnabled` and `TrustQuota` were
+    /// advertised and read by nothing, so the engine always ran on its shipped
+    /// defaults. These pin the three behaviours the options are supposed to buy.
+    #[test]
+    fn the_billing_policy_options_actually_move_the_thresholds() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hello world"}],
+            "max_tokens": 100
+        });
+
+        // The floor raises a small reservation to the configured minimum...
+        let with_floor = service();
+        with_floor.set_policy(BillingPolicy {
+            min_pre_consume: 5_000_000,
+            ..service_policy()
+        });
+        assert_eq!(
+            with_floor.reservation("Ling-1T", "default", &body, "/v1/chat/completions"),
+            5_000_000
+        );
+        // ...and is off by default, so nothing changes for an instance that never
+        // touched the option.
+        let plain = service();
+        plain.set_policy(service_policy());
+        assert!(
+            plain.reservation("Ling-1T", "default", &body, "/v1/chat/completions") < 5_000_000,
+            "the floor must not apply unless configured"
+        );
+
+        // The floor must not resurrect a free model: an unpriced model reserves
+        // nothing while the free-model switch is off, floor or no floor.
+        with_floor.set_policy(BillingPolicy {
+            min_pre_consume: 5_000_000,
+            pre_consume_free_models: false,
+            ..service_policy()
+        });
+        assert_eq!(
+            with_floor.reservation("definitely-not-a-real-model", "default", &body, "/v1/chat/completions"),
+            0
+        );
+        // And the switch is what makes it reserve.
+        with_floor.set_policy(BillingPolicy {
+            min_pre_consume: 5_000_000,
+            pre_consume_free_models: true,
+            ..service_policy()
+        });
+        assert_eq!(
+            with_floor.reservation("definitely-not-a-real-model", "default", &body, "/v1/chat/completions"),
+            5_000_000
+        );
+
+        // A policy change is visible immediately, which is what makes the option
+        // live rather than a restart-time setting: the same call returns a
+        // different amount once the floor moves.
+        with_floor.set_policy(BillingPolicy {
+            min_pre_consume: 42,
+            pre_consume_free_models: true,
+            ..service_policy()
+        });
+        assert_eq!(
+            with_floor.reservation("definitely-not-a-real-model", "default", &body, "/v1/chat/completions"),
+            42
+        );
+        with_floor.set_policy(BillingPolicy {
+            min_pre_consume: 7,
+            pre_consume_free_models: true,
+            ..service_policy()
+        });
+        assert_eq!(
+            with_floor.reservation("definitely-not-a-real-model", "default", &body, "/v1/chat/completions"),
+            7
+        );
     }
 
     #[test]
