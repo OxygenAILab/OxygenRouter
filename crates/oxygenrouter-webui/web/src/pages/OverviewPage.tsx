@@ -89,12 +89,18 @@ export default function OverviewPage() {
   // catalogue page renders before that. Falling back to the page's own origin
   // is both correct and more useful than the shipped default: it is the address
   // the visitor actually reached the gateway on.
+  // The instance's own copy. The notice is what an operator tells their users;
+  // the server address is the endpoint to advertise, falling back to the live
+  // origin when it has not been set.
+  const { data: site } = useQuery({ queryKey: ["site"], queryFn: api.site.get, staleTime: 60_000 });
+  const notice = site?.notice?.trim() ?? "";
   const baseUrl =
-    status?.listen_host && status.listen_port
+    site?.server_address?.trim() ||
+    (status?.listen_host && status.listen_port
       ? `http://${status.listen_host}:${status.listen_port}`
       : typeof window !== "undefined"
         ? window.location.origin
-        : "http://127.0.0.1:3001";
+        : "http://127.0.0.1:3001");
   const enabledChannels = channels?.filter((c) => c.enabled).length ?? 0;
   const totalChannels = channels?.length ?? 0;
   const hasChannels = totalChannels > 0;
@@ -129,6 +135,15 @@ export default function OverviewPage() {
   return (
     <div className="page-fade-enter space-y-6">
       <PageHeader title={t.nav.overview} description={t.dashboard.description} />
+
+      {/* The operator's own announcement, when they have set one. Rendered
+          above the setup prompts because it is the more urgent of the two. */}
+      {notice && (
+        <section className="notice-banner" role="status">
+          <span className="notice-banner-dot" aria-hidden />
+          <span className="notice-banner-text">{notice}</span>
+        </section>
+      )}
 
       {/* Setup Wizard Banner */}
       <section className="setup-banner">

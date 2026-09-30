@@ -271,6 +271,17 @@ export interface RequestLog {
   client_ip?: string | null;
 }
 
+/**
+ * The instance's own display copy, served publicly so the sign-in page and the
+ * sidebar can render a name before any credential exists.
+ */
+export interface SiteValues {
+  site_name: string;
+  notice: string;
+  footer: string;
+  server_address: string;
+}
+
 export interface SystemStatus {
   version: string;
   uptime_seconds: number;
@@ -536,6 +547,9 @@ export const api = {
         downloadBlob(blob, `oxygenrouter-logs-${Date.now()}.csv`);
       }
     },
+  },
+  site: {
+    get: () => apiFetch<SiteValues>('/site'),
   },
   status: {
     get: () => apiFetch<SystemStatus>('/status'),

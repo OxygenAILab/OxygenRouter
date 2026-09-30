@@ -58,6 +58,10 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
   const { data: keys } = useQuery({ queryKey: ["keys"], queryFn: api.keys.list, refetchInterval: 30_000 });
   const { data: maps } = useQuery({ queryKey: ["modelMaps"], queryFn: api.modelMaps.list, refetchInterval: 30_000 });
   const { user } = useAuth();
+  // The instance's own name and footer, so a deployment that renamed itself
+  // shows that name here too instead of the shipped default.
+  const { data: site } = useQuery({ queryKey: ["site"], queryFn: api.site.get, staleTime: 60_000 });
+  const brand = site?.site_name?.trim() || t.app.brand;
 
   const enabledChannels = channels?.filter((c) => c.enabled).length ?? 0;
   const totalChannels = channels?.length ?? 0;
@@ -90,7 +94,7 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
       <div className="sidebar-brand">
         <div className="brand-mark">O₂</div>
         <div className="brand-copy">
-          <div className="brand-name">{t.app.brand}</div>
+          <div className="brand-name">{brand}</div>
           <div className="brand-version">{t.app.version}</div>
         </div>
         <button
@@ -131,7 +135,7 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
       </nav>
       <div className="sidebar-footer">
         <span className="pulse-dot" />
-        <span className="sidebar-footer-copy">{t.app.localMode}</span>
+        <span className="sidebar-footer-copy">{site?.footer?.trim() || t.app.localMode}</span>
       </div>
     </aside>
   );

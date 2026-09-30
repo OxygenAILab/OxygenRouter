@@ -1302,6 +1302,19 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
 .hbar-detail { display: flex; justify-content: space-between; color: var(--md-on-surface-variant); font-size: 10px; }
 
 /* Setup banner (NewAPI-style top banner) */
+.notice-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  background: var(--md-info-container);
+  border: 1px solid var(--hairline);
+  border-radius: var(--md-radius);
+}
+.notice-banner-dot {
+  width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%;
+  background: var(--md-info);
+}
+.notice-banner-text { color: var(--md-on-info-container); font-size: 13px; }
+
 .setup-banner {
   display: flex;
   align-items: center;

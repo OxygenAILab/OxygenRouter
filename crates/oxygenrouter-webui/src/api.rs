@@ -97,6 +97,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(delete_task_plugin_version),
         )
         .route("/api/status", get(get_status))
+        .route("/api/site", get(get_site))
         .route("/api/dashboard", get(get_dashboard))
         .route("/api/analytics/flow", get(get_analytics_flow))
         .route("/api/settings", get(get_settings))
@@ -308,6 +309,11 @@ const PUBLIC_ROUTES: &[&str] = &[
     "/api/plans",
     // Readiness probe: reports only liveness, never configuration.
     "/api/status",
+    // The instance's own name and copy. Public because the sign-in page and the
+    // sidebar render them before any credential exists, and because none of it is
+    // configuration a reader should not see: the operator chose these strings to
+    // be displayed.
+    "/api/site",
 ];
 
 /// Prefixes that only the instance owner may reach.
@@ -1077,13 +1083,14 @@ async fn two_fa_setup(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Res
     if let Err(error) = s.db.set_pending_two_fa_secret(&user.id, &secret) {
         return Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response();
     }
-    let issuer = s
-        .db
-        .get_setting("SiteName")
-        .ok()
-        .flatten()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "OxygenRouter".to_string());
+    let issuer = {
+        let name = site_values(&s).site_name;
+        if name.trim().is_empty() {
+            "OxygenRouter".to_string()
+        } else {
+            name
+        }
+    };
     let uri = oxygenrouter_core::totp::provisioning_uri(&issuer, &user.username, &secret);
     Json(ApiResponse::ok(serde_json::json!({
         "secret": secret,
@@ -3886,6 +3893,37 @@ async fn get_status(
     Json(ApiResponse::ok(status))
 }
 
+/// The instance's own name and display copy.
+#[derive(Serialize)]
+struct SiteValues {
+    site_name: String,
+    notice: String,
+    footer: String,
+    server_address: String,
+}
+
+/// Read the four display values, each falling back to the schema's default.
+///
+/// `SiteName` and `Footer` also feed non-route code (the TOTP issuer, the
+/// sidebar), so the reader lives here as one function rather than being spelled
+/// out per caller — two spellings of "what is this instance called" would drift
+/// the moment one of them changed.
+fn site_values(s: &AppState) -> SiteValues {
+    SiteValues {
+        site_name: s.db.typed_setting("SiteName", "OxygenRouter".to_string()),
+        notice: s.db.typed_setting("Notice", String::new()),
+        footer: s.db.typed_setting(
+            "Footer",
+            "GitHub@OxygenAILab | OxygenAILab@StarsailsClover".to_string(),
+        ),
+        server_address: s.db.typed_setting("ServerAddress", String::new()),
+    }
+}
+
+async fn get_site(State(s): State<Arc<AppState>>) -> Json<ApiResponse<SiteValues>> {
+    Json(ApiResponse::ok(site_values(&s)))
+}
+
 async fn get_dashboard(
     State(s): State<Arc<AppState>>,
     Query(q): Query<DashboardQuery>,
@@ -4363,12 +4401,22 @@ mod access_tests {
     #[test]
     fn only_the_intended_routes_are_public() {
         // An allow-list, not a deny-list: a new route is closed unless listed.
-        for path in ["/api/auth/login", "/api/auth/register", "/api/plans", "/api/status"] {
+        for path in [
+            "/api/auth/login",
+            "/api/auth/register",
+            "/api/plans",
+            "/api/status",
+            // The instance's own display copy, which the sign-in page and the
+            // sidebar render before any credential exists. Listed here so opening
+            // it was a decision rather than a side effect.
+            "/api/site",
+        ] {
             assert_eq!(required_access(path), Access::Public, "{path}");
         }
         // A slightly different path must not inherit public status.
         assert_ne!(required_access("/api/plans/admin"), Access::Public);
         assert_ne!(required_access("/api/status/test"), Access::Public);
+        assert_ne!(required_access("/api/site/admin"), Access::Public);
     }
 
     #[test]
