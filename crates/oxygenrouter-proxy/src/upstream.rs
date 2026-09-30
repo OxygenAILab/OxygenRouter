@@ -11,7 +11,20 @@ pub use oxygenrouter_relay::Usage;
 pub struct ProxyRequest {
     pub method: String,
     pub path: String,
+    /// Headers to send upstream.
+    ///
+    /// Deliberately narrow: the caller's credential must not leak and the channel
+    /// supplies its own. Only the flags a provider needs are carried.
     pub headers: Vec<(String, String)>,
+    /// The caller's own headers, never sent anywhere.
+    ///
+    /// Kept apart from `headers` because the two answer different questions.
+    /// Policy that inspects the request — channel affinity reading a session id,
+    /// for one — needs what the *client* sent, and reading the upstream header
+    /// list for it is how the first version of that feature silently did nothing:
+    /// it looked for `X-Session-Id` in a list that only ever holds five
+    /// provider flags.
+    pub client_headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub model: String,
     pub stream: bool,

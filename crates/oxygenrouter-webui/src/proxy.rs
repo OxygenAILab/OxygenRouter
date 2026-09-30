@@ -675,6 +675,7 @@ async fn dispatch_openai(
             method: "POST".to_string(),
             path: path.to_string(),
             headers: vec![],
+            client_headers: client_headers(&headers),
             body: Some(body_bytes),
             model: fallback.clone(),
             stream,
@@ -689,6 +690,7 @@ async fn dispatch_openai(
         method: "POST".to_string(),
         path: path.to_string(),
         headers: vec![],
+        client_headers: client_headers(&headers),
         body: Some(body_bytes),
         model: model.clone(),
         stream,
@@ -1359,6 +1361,7 @@ async fn relay_passthrough(
         method: method.to_string(),
         path: upstream_path.to_string(),
         headers: forwarded_headers(&headers),
+        client_headers: client_headers(&headers),
         body: Some(body_bytes),
         model: model.clone(),
         stream,
@@ -1421,6 +1424,23 @@ async fn relay_passthrough(
             )
         }
     }
+}
+
+/// Every header the caller sent, for policy that inspects the request.
+///
+/// Not forwarded anywhere: `forwarded_headers` decides what the upstream sees,
+/// and this exists so a rule can read what the client actually said. Names are
+/// lower-cased so a rule does not have to guess the client's spelling.
+fn client_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect()
 }
 
 /// Headers worth passing upstream.

@@ -4110,6 +4110,12 @@ async fn update_option(
             ) {
                 s.reload_pricing();
             }
+            // Affinity lives in the scheduler, so a change is pushed rather than
+            // derived per request. `reload_scheduler_maps` carries it with the
+            // model maps, which is why one call covers both.
+            if schema.key == "ChannelAffinity" {
+                s.reload_affinity().await;
+            }
             Json(ApiResponse::ok("updated"))
         }
         Err(error) => Json(ApiResponse::err(error.to_string())),

@@ -3,6 +3,7 @@
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
 mod client;
+pub mod affinity;
 mod dispatch;
 pub mod limits;
 mod router;

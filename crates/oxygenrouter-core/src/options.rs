@@ -88,7 +88,19 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("ChannelDisableThreshold", Bootstrap, Int, "3", "Consecutive failures before auto-disabling a channel"),
     // Consulted per request, so it lives with the routing rules.
     schema!("DefaultGroup", Routing, String, "default", "Group used when no token group is set"),
-    schema!("ChannelAffinityEnabled", Routing, Bool, "false", "Prefer the last healthy channel for a token"),
+    // A structured setting, not the boolean this key used to be. The reference's
+    // feature is rule-driven session stickiness (`channel_affinity_setting.go`):
+    // rules match a request by model, path and user agent, derive an identity from
+    // its headers or body, and keep that identity on one channel for a TTL. A
+    // switch cannot express which requests are sticky or on what identity, which
+    // is how the old key came to be inert in the first place.
+    schema!(
+        "ChannelAffinity",
+        Routing,
+        String,
+        "{\"enabled\":false,\"max_entries\":4096,\"default_ttl_seconds\":900,\"rules\":[]}",
+        "Session stickiness: {enabled, session_mode, max_entries, default_ttl_seconds, rules[{name, model_patterns, path_patterns, user_agent_includes, key_sources[{type, name|path}], ttl_seconds, session_mode, include_model_name, include_rule_name, include_using_group}]}"
+    ),
     // Billing
     schema!("QuotaPerUnit", Billing, Float, "500000", "Micros charged per quota unit"),
     schema!("PreConsumedQuota", Billing, Int, "500", "Reserved quota before a request settles"),

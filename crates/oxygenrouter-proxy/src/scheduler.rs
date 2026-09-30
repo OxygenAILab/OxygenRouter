@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::affinity::{AffinityStore, SessionMode};
 use crate::dispatch::{relay_format_for_path, RelayClient};
 use crate::selection::{
     apply_model_map, select_tiered_excluding, tiers_exhausted_excluding, Selection,
@@ -24,6 +25,9 @@ pub struct ChannelScheduler {
     failures: parking_lot::Mutex<std::collections::HashMap<String, u32>>,
     /// Consecutive failures before a channel is disabled. `0` disables the rule.
     disable_threshold: u32,
+    /// Session stickiness, shared with the console so one edit reaches every
+    /// in-flight dispatch.
+    affinity: std::sync::Arc<AffinityStore>,
 }
 
 impl ChannelScheduler {
@@ -37,7 +41,13 @@ impl ChannelScheduler {
             backoff_cap_ms: 30_000,
             failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
             disable_threshold: 5,
+            affinity: std::sync::Arc::new(AffinityStore::new()),
         }
+    }
+
+    /// The affinity store, so the console can load a setting into it.
+    pub fn affinity(&self) -> std::sync::Arc<AffinityStore> {
+        std::sync::Arc::clone(&self.affinity)
     }
 
     /// Configure auto-disable. `threshold == 0` turns the rule off; NewAPI's
@@ -116,6 +126,11 @@ impl ChannelScheduler {
         let mut current_model = model.to_string();
         let limit = self.max_retries.max(1);
 
+        // Resolved once, before any attempt: the identity a rule derives must not
+        // change because a retry rewrote the model, or a failover would pin the
+        // wrong session.
+        let affinity = self.affinity.resolve(req, model, group_name);
+
         for attempt in 0..=limit {
             let candidates = self.candidates(&tried, group_name, cross_group_retry && attempt > 0);
             if candidates.is_empty() {
@@ -128,6 +143,43 @@ impl ChannelScheduler {
             // off to its backup instead of failing the request.
             if tiers_exhausted_excluding(&candidates, &tried, attempt) {
                 return Err(last_err.unwrap_or(ProxyError::NoChannel));
+            }
+
+            // On the first attempt only. A retry is the scheduler's reaction to
+            // a failure, so repeating a choice that just failed would burn an
+            // attempt; stickiness is a preference, not a policy that overrides
+            // failover.
+            let pinned = affinity.as_ref().and_then(|hit| {
+                if attempt > 0 {
+                    return None;
+                }
+                hit.pinned_channel
+                    .as_ref()
+                    .and_then(|id| candidates.iter().find(|c| &c.id == id).cloned())
+            });
+            if let Some(channel) = pinned {
+                let actual_model = self.rewrite_model(&channel, &current_model);
+                let format = relay_format_for_path(&req.path);
+                match self.relay.send(&channel, &actual_model, req, format).await {
+                    Ok(outcome) => {
+                        self.note_success(&channel.id);
+                        return Ok(outcome.result);
+                    }
+                    Err(error) if affinity.as_ref().map(|h| h.mode) == Some(SessionMode::Strict) => {
+                        // The session must not move, so the failure is final for
+                        // this request rather than a reason to pick another
+                        // channel. A caller that asked for a stable upstream
+                        // would rather see the error than be moved silently.
+                        self.note_failure(&channel.id);
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        // Prefer mode: fall through to ordinary selection, which
+                        // will also remember the channel it ultimately chooses.
+                        self.note_failure(&channel.id);
+                        tried.push(channel.id.clone());
+                    }
+                }
             }
 
             let channel = match select_tiered_excluding(&candidates, &tried, attempt, rand_i64()) {
@@ -146,6 +198,12 @@ impl ChannelScheduler {
             match self.relay.send(&channel, &actual_model, req, format).await {
                 Ok(outcome) => {
                     self.note_success(&channel.id);
+                    // Only now, once a channel has actually served the request:
+                    // remembering a choice that failed would pin the session to a
+                    // channel that cannot serve it.
+                    if let Some(hit) = &affinity {
+                        self.affinity.remember(&hit.key, &channel.id, hit.ttl);
+                    }
                     let mut result = outcome.result;
                     // `tried` ends with the winner; everything before it is the
                     // failover trail, recorded so a retried request is auditable.

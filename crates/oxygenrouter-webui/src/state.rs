@@ -452,6 +452,41 @@ impl AppState {
     pub async fn reload_scheduler_maps(&self) {
         let maps = self.db.list_model_maps().unwrap_or_default();
         self.scheduler.write().await.set_model_maps(maps);
+        self.reload_affinity().await;
+    }
+
+    /// Load the channel-affinity setting into the scheduler's store.
+    ///
+    /// A malformed document keeps the feature off rather than applying half of
+    /// it: sticky routing that silently drops some rules would send a session to
+    /// an upstream it has no cache on, which is the outcome the feature exists to
+    /// prevent.
+    pub async fn reload_affinity(&self) {
+        let raw = self
+            .db
+            .get_setting("ChannelAffinity")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let setting = if raw.trim().is_empty() {
+            oxygenrouter_proxy::affinity::AffinitySetting::default()
+        } else {
+            match serde_json::from_str::<oxygenrouter_proxy::affinity::AffinitySetting>(&raw) {
+                Ok(setting) => setting,
+                Err(error) => {
+                    eprintln!(
+                        "[OxygenRouter] ChannelAffinity ignored (feature stays off): {error}"
+                    );
+                    oxygenrouter_proxy::affinity::AffinitySetting::default()
+                }
+            }
+        };
+        let enabled = setting.enabled;
+        let rules = setting.rules.len();
+        self.scheduler.read().await.affinity().set_setting(setting);
+        if enabled {
+            println!("[OxygenRouter] channel affinity enabled with {rules} rule(s)");
+        }
     }
 
     /// Apply the three billing thresholds the console offers.
