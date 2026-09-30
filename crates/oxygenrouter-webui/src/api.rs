@@ -78,6 +78,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         // (`router/api-router.go:253`). Root-only by the `/api/plugin` prefix:
         // uploading code the gateway will execute is an owner action.
         .route("/api/plugin/task", get(list_task_plugins).post(upload_task_plugin))
+        // Instance diagnostics, matching the reference's `/performance` group
+        // (`router/api-router.go:239`). The reference reports Go runtime data
+        // (GC counters, a disk cache) that has no counterpart here; what it has
+        // in common with this instance -- how busy the gateway is, what it is
+        // holding, and which subsystems are switched on -- is what is reported.
+        .route("/api/performance/stats", get(get_performance_stats))
+        // Drops rate-limit windows. The reference offers the same reset
+        // (`controller/performance.go:159`) because a stale scope is otherwise
+        // invisible until it expires.
+        .route("/api/performance/reset_stats", post(reset_performance_stats))
         .route("/api/plugin/task/:key", get(get_task_plugin))
         .route("/api/plugin/task/:key/activate", post(activate_task_plugin))
         .route("/api/plugin/task/:key/status", post(set_task_plugin_status))
@@ -312,10 +322,21 @@ const ROOT_PREFIXES: &[&str] = &[
     "/api/system/info",
     "/api/backup",
     "/api/plugin",
-    "/api/ratio_sync",
+    // Diagnostics. This entry was dropped once while removing the empty prefixes
+    // below, and the effect was not a dead tree but a *downgrade*: the tree fell
+    // back to the default level and an ordinary user could read how the instance
+    // was running. Caught by a live probe, not by any source-level check, which is
+    // why there is now a test asserting this path is root.
     "/api/performance",
-    "/api/system-task",
-    "/api/custom-oauth-provider",
+    // The three this list used to carry -- `/api/ratio_sync`, `/api/system-task`
+    // and `/api/custom-oauth-provider` -- were removed rather than given empty
+    // endpoints. Each promised a subsystem the reference has and this instance
+    // does not: syncing upstream price tables, a scheduled-task runner, and
+    // operator-registered OAuth providers. Listing them here claimed those trees
+    // existed and were root-protected when there was nothing behind them at all,
+    // which is the exact shape of defect this project keeps finding: a promise in
+    // one place and nothing in the other. They belong here again when the
+    // subsystem does.
     // Who changed what. Sensitive precisely because it is complete, and it names
     // the accounts that hold power.
     "/api/audit-logs",
@@ -333,7 +354,9 @@ const ADMIN_PREFIXES: &[&str] = &[
     "/api/rules",
     "/api/admin",
     "/api/subscription/admin",
-    "/api/redemption/admin",
+    // Not "/api/redemption/admin": the admin redemption endpoints live under
+    // `/api/admin/redemption-codes`. The stale entry was another declaration with
+    // nothing behind it, found by the check below.
     "/api/authz",
     // Instance-wide observability. The reference gates its log listing on
     // `AdminAuth` (`router/api-router.go:314`) and serves a separate `/log/self`
@@ -3329,6 +3352,75 @@ async fn clear_logs(State(s): State<Arc<AppState>>) -> Json<ApiResponse<usize>> 
     })
 }
 
+/// What the gateway is currently doing, as counters rather than as a guess.
+#[derive(Serialize)]
+struct PerformanceStats {
+    uptime_seconds: u64,
+    /// Requests currently being served, against the configured ceiling.
+    in_flight_requests: usize,
+    concurrency_limit: usize,
+    /// Rate-limit scopes being tracked. A fixed-window limiter grows with the
+    /// number of distinct callers, so this is the figure that says whether its
+    /// memory is bounded in practice.
+    rate_limit_scopes: usize,
+    relay_rate_limit_enabled: bool,
+    /// Counters that make "is the instance healthy" answerable without reading
+    /// the tables by hand.
+    request_logs: i64,
+    audit_logs: i64,
+    usage_buckets: i64,
+    channels: i64,
+    enabled_channels: i64,
+    keys: i64,
+    model_maps: i64,
+    route_rules: i64,
+    /// Which subsystems an operator has switched off, so a surprising behaviour
+    /// can be traced to a setting rather than to a bug.
+    request_logging_enabled: bool,
+    record_ip_enabled: bool,
+    audit_enabled: bool,
+    data_export_enabled: bool,
+}
+
+async fn get_performance_stats(State(s): State<Arc<AppState>>) -> Json<ApiResponse<PerformanceStats>> {
+    let uptime_seconds = Utc::now()
+        .signed_duration_since(s.started_at)
+        .num_seconds()
+        .max(0) as u64;
+    Json(ApiResponse::ok(PerformanceStats {
+        uptime_seconds,
+        in_flight_requests: s.concurrency.in_flight(),
+        concurrency_limit: s.concurrency.limit(),
+        rate_limit_scopes: s.rate_limiter.tracked_scopes(),
+        relay_rate_limit_enabled: s.relay_rate_limit.is_enabled(),
+        request_logs: s.db.count_logs().unwrap_or(0),
+        audit_logs: s.db.count_audit_logs().unwrap_or(0),
+        usage_buckets: s.db.count_quota_data().unwrap_or(0),
+        channels: s.db.count_channels().unwrap_or(0),
+        enabled_channels: s.db.count_enabled_channels().unwrap_or(0),
+        keys: s.db.count_keys().unwrap_or(0),
+        model_maps: s.db.count_model_maps().unwrap_or(0),
+        route_rules: s.db.count_rules().unwrap_or(0),
+        request_logging_enabled: s.request_log_enabled(),
+        record_ip_enabled: s.record_ip_log(),
+        audit_enabled: s.audit_log_enabled(),
+        data_export_enabled: s.data_export_enabled(),
+    }))
+}
+
+/// Drop every tracked rate-limit window.
+///
+/// Deliberately does not touch the *configuration*: this clears accumulated
+/// state, not the limits themselves, so an operator who has just fixed a client
+/// can let it back in without also deciding to remove the ceiling.
+async fn reset_performance_stats(State(s): State<Arc<AppState>>) -> Json<ApiResponse<usize>> {
+    let before = s.rate_limiter.tracked_scopes();
+    // `prune` with no elapsed window removes every scope: a scope older than the
+    // whole window is exactly what "now" makes of every entry.
+    let removed = s.rate_limiter.prune(std::time::Instant::now(), std::time::Duration::ZERO);
+    Json(ApiResponse::ok(if removed == 0 { before } else { removed }))
+}
+
 /// Every plugin the instance knows about.
 async fn list_task_plugins(
     State(s): State<Arc<AppState>>,
@@ -4197,6 +4289,11 @@ mod access_tests {
     #[test]
     fn credential_bearing_routes_are_not_public() {
         for path in [
+            // Diagnostics describe how the instance is running, which is the
+            // owner's business. Pinned because dropping this prefix once did not
+            // kill the tree -- it silently downgraded it to the default level.
+            "/api/performance/stats",
+            "/api/performance/reset_stats",
             "/api/channels",
             "/api/channels/abc",
             "/api/channels/abc/keys",
@@ -4251,7 +4348,13 @@ mod access_tests {
             "/api/system/info",
             "/api/backup/create",
             "/api/plugin/task",
-            "/api/system-task",
+            // `/api/system-task` used to be listed here. It was never a route --
+            // the reference has a scheduled-task runner and this instance does
+            // not -- so the assertion was pinning the classification of a path
+            // that would fall back to the default level if anyone ever asked for
+            // it. Diagnostics take its place, because they exist.
+            "/api/performance/stats",
+            "/api/performance/reset_stats",
         ] {
             assert_eq!(required_access(path), Access::Root, "{path}");
         }
@@ -4853,6 +4956,32 @@ mod classification_audit_tests {
             offenders.is_empty(),
             "user-class handlers that do not resolve the caller: {offenders:?}"
         );
+    }
+
+    /// A prefix in the classification table must have routes behind it.
+    ///
+    /// The table is what the guard reads, so an entry with no routes is a claim
+    /// that a tree exists and is root-protected when in fact nothing does. Four
+    /// such entries accumulated over time -- `ratio_sync`, `percentage`-style
+    /// subsystems the reference has and this instance does not -- and each read as
+    /// "this is protected" to anyone auditing the list. This is the check that
+    /// makes the list mean what it says.
+    #[test]
+    fn every_declared_prefix_has_routes_behind_it() {
+        let routes: Vec<String> = routes_from_source().into_iter().map(|(p, _)| p).collect();
+        for prefix in ROOT_PREFIXES
+            .iter()
+            .chain(ADMIN_PREFIXES.iter())
+            .copied()
+        {
+            let behind = routes
+                .iter()
+                .any(|route| route == prefix || route.starts_with(&format!("{prefix}/")));
+            assert!(
+                behind,
+                "{prefix} is declared in the access table but no route serves it;                  remove the declaration or implement the tree"
+            );
+        }
     }
 
     #[test]
