@@ -155,6 +155,19 @@ impl Pricing {
         }
     }
 
+    /// Override one model's price ratio.
+    ///
+    /// Per-entry rather than a whole-table replacement, matching `set_group_ratio`:
+    /// an operator editing one model must not silently discard the table the
+    /// instance already had, which a `set_ratio_tables` call would do.
+    pub fn set_model_ratio(&mut self, model: &str, ratio: f64) {
+        if ratio.is_finite() {
+            self.ratio_overrides
+                .model_ratio
+                .insert(model.to_string(), ratio);
+        }
+    }
+
     /// Resolve the billing mode for a model: override, then default, then `ratio`.
     pub fn mode(&self, model: &str) -> BillingMode {
         if let Some(mode) = self.mode_overrides.get(model) {
@@ -300,6 +313,57 @@ pub enum PricingLoadError {
 
 #[cfg(test)]
 mod tests {
+
+    /// The console's "Per-model price ratios (JSON)" field had no effect: the
+    /// engine supported the table and the option existed, but nothing joined them.
+    /// These pin the join and, more importantly, that it layers rather than
+    /// replaces — a one-model edit must not wipe the shipped catalogue.
+    #[test]
+    fn a_model_ratio_override_layers_over_the_pack() {
+        let mut pricing = Pricing::from_embedded().expect("pack");
+        let model = "gpt-4o";
+
+        let baseline = pricing.price_data(model, "default").model_ratio;
+        assert!(baseline > 0.0, "the pack must price this model");
+
+        // The override wins.
+        pricing.set_model_ratio(model, 7.5);
+        assert_eq!(pricing.price_data(model, "default").model_ratio, 7.5);
+
+        // A different model is untouched, so the edit is per-entry.
+        let other = "gpt-4o-mini";
+        let other_before = pricing.price_data(other, "default").model_ratio;
+        assert_ne!(
+            pricing.price_data(other, "default").model_ratio,
+            7.5,
+            "only the named model may change"
+        );
+        pricing.set_model_ratio(other, 3.25);
+        assert_eq!(pricing.price_data(other, "default").model_ratio, 3.25);
+        assert_eq!(pricing.price_data(model, "default").model_ratio, 7.5);
+
+        // A non-finite ratio is refused rather than poisoning the table.
+        pricing.set_model_ratio(model, f64::NAN);
+        assert_eq!(pricing.price_data(model, "default").model_ratio, 7.5);
+        assert!(other_before.is_finite());
+    }
+
+    /// A group ratio override is the same shape of join, and it was equally
+    /// invisible: the loader read the key while the console showed a different one.
+    #[test]
+    fn a_group_ratio_override_layers_over_the_pack() {
+        let mut pricing = Pricing::from_embedded().expect("pack");
+        assert!(!pricing.has_group("vip"));
+        pricing.set_group_ratio("vip", 0.5);
+        assert!(pricing.has_group("vip"));
+        assert_eq!(pricing.group_ratio("vip"), 0.5);
+        // Unknown group still falls back to the default rather than 0.
+        assert!(pricing.group_ratio("no-such-group") > 0.0);
+        // Non-finite is refused.
+        pricing.set_group_ratio("vip", f64::INFINITY);
+        assert_eq!(pricing.group_ratio("vip"), 0.5);
+    }
+
     use super::*;
 
     fn embedded() -> Pricing {

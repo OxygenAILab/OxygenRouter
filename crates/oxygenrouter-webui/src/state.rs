@@ -528,6 +528,22 @@ impl AppState {
                 Err(e) => eprintln!("[OxygenRouter] GroupRatio override ignored: {e}"),
             }
         }
+        // Per-model price ratios. This is the field the console labels "Per-model
+        // price ratios (JSON)" and it previously read nothing: the engine's
+        // support for the table existed and the console exposed a control for it,
+        // but nothing joined the two. Values layer over the shipped pack entry by
+        // entry, so an operator can correct one model's price without losing the
+        // rest of the catalogue.
+        if let Ok(Some(raw)) = self.db.get_setting("ModelRatio") {
+            match serde_json::from_str::<HashMap<String, f64>>(&raw) {
+                Ok(map) => {
+                    for (model, ratio) in map {
+                        pricing.set_model_ratio(&model, ratio);
+                    }
+                }
+                Err(e) => eprintln!("[OxygenRouter] ModelRatio override ignored: {e}"),
+            }
+        }
     }
 }
 /// Parse `80,443,8000-9000` into a port list.

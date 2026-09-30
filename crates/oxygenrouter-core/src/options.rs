@@ -122,7 +122,23 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("AuditLogEnabled", Security, Bool, "true", "Record administrative operations"),
     // Models
     schema!("GlobalModelMapping", Models, String, "{}", "Requested -> upstream model mapping (JSON)"),
-    schema!("ModelRatioOverride", Models, String, "{}", "Per-model price ratios (JSON)"),
+    // The pricing tables the engine actually consumes. The previous pair here
+    // was named for what the *engine* calls its override layer
+    // (`ModelRatioOverride`) rather than for the option the reference stores,
+    // and the reference spells these `ModelRatio` and `GroupRatio`
+    // (`model/option.go:152,156`). More to the point, the write path read
+    // `billing_expr` and `GroupRatio` while the console showed
+    // `ModelRatioOverride`, so an operator editing the field they could see
+    // changed nothing, and the setting that did work was invisible.
+    schema!("ModelRatio", Models, String, "{}", "Per-model price ratio overrides (JSON)"),
+    schema!("GroupRatio", Models, String, "{}", "Per-group price multipliers (JSON)"),
+    // The key keeps its lowercase spelling because it *is* the storage key the
+    // pricing loader has always read; renaming it to match this file's convention
+    // would strand every value an existing instance has already stored here.
+    schema!("billing_expr", Models, String, "{}", "Per-model billing expressions (JSON)"),
+    // The billing-mode table has the same problem and is exposed for the same
+    // reason: it drives pricing and was previously not in the console at all.
+    schema!("billing_mode", Models, String, "{}", "Per-model billing mode override (JSON)"),
     schema!("UpstreamModelSyncEnabled", Models, Bool, "false", "Automatically refresh channel model lists"),
     schema!("ModelSyncIntervalMinutes", Models, Int, "60", "Minutes between automatic model syncs"),
 ];

@@ -3626,6 +3626,15 @@ async fn update_option(
             ) {
                 s.reload_pricing();
             }
+            // Everything the pricing engine reads lives in one reload, so the
+            // pricing tables are refreshed by the same predicate rather than a
+            // second list that could drift out of step with it.
+            if matches!(
+                schema.key,
+                "ModelRatio" | "GroupRatio" | "billing_expr" | "billing_mode" | "QuotaPerUnit"
+            ) {
+                s.reload_pricing();
+            }
             Json(ApiResponse::ok("updated"))
         }
         Err(error) => Json(ApiResponse::err(error.to_string())),
