@@ -3446,6 +3446,7 @@ async fn upload_task_plugin(
                     active_version: Some(input.version.clone()),
                     versions: vec![input.version.clone()],
                     hooks: Vec::new(),
+                    protocols: Vec::new(),
                     updated_at: Utc::now(),
                 });
             Json(ApiResponse::ok(found)).into_response()

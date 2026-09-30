@@ -1340,6 +1340,19 @@ impl Database {
                             .collect()
                     })
                     .unwrap_or_default(),
+                protocols: manifest
+                    .as_ref()
+                    .and_then(|m| m.get("protocols"))
+                    .and_then(|v| v.as_array())
+                    .map(|claims| {
+                        claims
+                            .iter()
+                            .filter_map(|c| {
+                                c.get("name").and_then(|n| n.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 updated_at: state.map(|s| s.updated_at).unwrap_or_else(Utc::now),
             });
         }

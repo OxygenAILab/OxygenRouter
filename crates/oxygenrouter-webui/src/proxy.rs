@@ -1025,6 +1025,202 @@ pub fn caller_address(headers: &axum::http::HeaderMap) -> String {
     }
 }
 
+/// How long a plugin may take to decode or render, matching the reference's
+/// `DefaultCallTimeout` (`pkg/jsplugin/engine.go:18`).
+const PLUGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// An enabled plugin serving this endpoint, if one is active.
+///
+/// The lookup is on the request path, so it reads the instance's plugin list
+/// rather than reaching into the engine: a plugin that is merely installed must
+/// not affect traffic, and only an enabled one with the protocol claimed counts.
+fn plugin_for_path(state: &AppState, client_path: &str) -> Option<String> {
+    let plugins = state.db.list_plugins().ok()?;
+    plugins
+        .iter()
+        .find(|p| p.enabled && p.protocols.iter().any(|name| protocol_serves(name, client_path)))
+        .map(|p| p.key.clone())
+}
+
+/// Whether a host protocol serves a client path.
+///
+/// Matched on the path shape the protocol table declares, with the `:param`
+/// segments treated as wildcards, because that table is the contract and a
+/// second hand-written mapping would drift from it.
+fn protocol_serves(protocol: &str, client_path: &str) -> bool {
+    let Some(definition) = oxygenrouter_plugin::host_protocol(protocol) else {
+        return false;
+    };
+    definition.operations.iter().any(|operation| {
+        let pattern: Vec<&str> = operation.path.split('/').collect();
+        let actual: Vec<&str> = client_path.split('/').collect();
+        pattern.len() == actual.len()
+            && pattern
+                .iter()
+                .zip(actual.iter())
+                .all(|(want, got)| want.starts_with(':') || want == got)
+    })
+}
+
+/// Run one plugin-backed request: decode, dispatch, render.
+///
+/// This is what makes a plugin a *bridge* rather than a filter. The plugin states
+/// the upstream request through `decodeRequest`; the host dispatches exactly that
+/// to the selected channel; the plugin renders the result back into the shape the
+/// client asked for through `renderFinal`. Nothing about the client's dialect is
+/// interpreted here, which is the point: it is how the Responses API can be served
+/// with its own streaming semantics instead of a fixed adapter's approximation.
+async fn plugin_bridge(
+    state: std::sync::Arc<AppState>,
+    plugin_key: &str,
+    protocol: &str,
+    headers: axum::http::HeaderMap,
+    body_bytes: Vec<u8>,
+    client_path: &str,
+) -> Response {
+    let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("plugin-bridged request must be JSON: {error}"),
+            )
+        }
+    };
+    // The context a plugin sees is the canonical request view the reference
+    // exposes (`RouteRequestContext`, `pkg/jsplugin/routing.go:283`): what the
+    // client sent, not an interpretation of it.
+    let ctx = serde_json::json!({
+        "path": client_path,
+        "method": "POST",
+        "query": {},
+        "params": {},
+        "body": parsed.clone(),
+    });
+    let client_model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let decoded = match state
+        .plugins
+        .decode_request(protocol, ctx.clone(), PLUGIN_TIMEOUT)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("plugin {plugin_key:?} could not decode the request: {error}"),
+            )
+        }
+    };
+
+    // Two refusals the reference makes and this host keeps, both because the
+    // decode step runs inside the plugin and the host must be able to trust what
+    // comes back. A decoder that changes the model would silently route the
+    // request to a different upstream than the caller asked for and was quoted
+    // for; a decoder that returns a renderer would choose the *response* shape
+    // from the request side, where the caller can influence it.
+    let decoded_model = decoded
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !client_model.is_empty() && decoded_model != client_model {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "plugin {plugin_key:?} decoded model {decoded_model:?}, but the request asked for {client_model:?}"
+            ),
+        );
+    }
+    if decoded.get("renderer").is_some() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("plugin {plugin_key:?} decodeRequest must not return a renderer"),
+        );
+    }
+
+    // `requestBody` is what the plugin states should go upstream; `action` names
+    // a sub-operation the plugin wants. Both are optional, and when no request
+    // body is given the client's own body is forwarded unchanged rather than an
+    // empty one, because "the plugin had nothing to add" is not "send nothing".
+    let upstream_body = decoded
+        .get("requestBody")
+        .map(|v| serde_json::to_vec(v).unwrap_or_else(|_| body_bytes.clone()))
+        .unwrap_or_else(|| body_bytes.clone());
+    let action = decoded.get("action").and_then(|v| v.as_str()).map(String::from);
+    let upstream_path = action
+        .as_deref()
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| format!("{client_path}/{a}"))
+        .unwrap_or_else(|| client_path.to_string());
+    let model = if decoded_model.is_empty() {
+        client_model
+    } else {
+        decoded_model.to_string()
+    };
+
+    // The plugin decided the request; the ordinary relay path performs it, so
+    // channel selection, retries, billing, limits and logging all still apply.
+    let response = relay_passthrough(
+        state.clone(),
+        "POST",
+        client_path,
+        &upstream_path,
+        upstream_body,
+        headers,
+        &model,
+    )
+    .await;
+
+    // A failure is passed through untouched: rendering a plugin-specific error
+    // shape over an upstream error would hide the reason the request failed, and
+    // the status the relay chose (429 for a limit, 502 for an upstream fault) is
+    // the one the client should act on.
+    if !response.status().is_success() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("reading the upstream response failed: {error}"),
+            )
+        }
+    };
+    let upstream_value: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+
+    match state
+        .plugins
+        .render_final(protocol, ctx, upstream_value, PLUGIN_TIMEOUT)
+        .await
+    {
+        Ok(rendered) => {
+            // Status and headers from the relay are kept; only the body is the
+            // plugin's, because the plugin renders a payload, not a transport
+            // outcome.
+            let mut builder = Response::builder().status(parts.status);
+            for (name, value) in parts.headers.iter() {
+                builder = builder.header(name, value);
+            }
+            builder
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&rendered).unwrap_or_else(|_| b"null".to_vec()),
+                ))
+                .unwrap_or_else(|_| error_500())
+        }
+        Err(error) => json_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("plugin {plugin_key:?} could not render the response: {error}"),
+        ),
+    }
+}
+
 /// Render a limit rejection in the OpenAI error shape.
 fn limit_error_response(error: oxygenrouter_proxy::limits::LimitError) -> Response {
     let message = match error {
@@ -1665,6 +1861,20 @@ async fn responses_endpoint(
     request: Request,
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
+    // A plugin claiming this protocol takes the request, because only a plugin
+    // can render the Responses API's own semantics; without one the ordinary
+    // OpenAI-compatible dispatch answers, so the endpoint works either way.
+    if let Some(key) = plugin_for_path(&state, "/v1/responses") {
+        return plugin_bridge(
+            state,
+            &key,
+            "openai_responses",
+            headers,
+            body_bytes,
+            "/v1/responses",
+        )
+        .await;
+    }
     dispatch_openai(
         state,
         "/v1/responses",
@@ -2152,6 +2362,22 @@ mod tests {
             &body,
             "/v1beta/models/gemini-2.5-flash:generateContent"
         ));
+    }
+
+    /// Which endpoint a plugin's protocol claim covers. Matched against the host
+    /// protocol table rather than a second hand-written list, so a `:param`
+    /// segment is a wildcard and the two cannot drift apart.
+    #[test]
+    fn a_protocol_claim_matches_the_paths_its_operations_declare() {
+        assert!(protocol_serves("openai_responses", "/v1/responses"));
+        // The retrieve operation's `:response_id` is a wildcard.
+        assert!(protocol_serves("openai_responses", "/v1/responses/resp_123"));
+        // A different path, an unknown protocol and a near-miss all miss.
+        assert!(!protocol_serves("openai_responses", "/v1/chat/completions"));
+        assert!(!protocol_serves("openai_responses", "/v1/responses/extra/segments"));
+        assert!(!protocol_serves("made_up", "/v1/responses"));
+        // Prefix matching must not leak: `/v1/responsesX` is not the endpoint.
+        assert!(!protocol_serves("openai_responses", "/v1/responsesX"));
     }
 
     #[test]

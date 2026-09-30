@@ -347,6 +347,11 @@ pub struct PluginSummary {
     /// Hooks the active build implements, so a page can show what it will do
     /// without running it.
     pub hooks: Vec<String>,
+    /// Protocols the active build claims. The routing path needs these to decide
+    /// which plugin serves an endpoint, and reading them here keeps that decision
+    /// out of the manifest parsing on the request path.
+    #[serde(default)]
+    pub protocols: Vec<String>,
     pub updated_at: DateTime<Utc>,
 }
 
