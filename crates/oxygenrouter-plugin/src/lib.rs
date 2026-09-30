@@ -96,6 +96,10 @@ pub struct PluginManifest {
     pub description: String,
     #[serde(default)]
     pub modes: Vec<PluginMode>,
+    /// Protocols this plugin claims to serve. Validated against the host's table
+    /// and against what the source actually exports.
+    #[serde(default)]
+    pub protocols: Vec<ProtocolClaim>,
 }
 
 impl PluginManifest {
@@ -141,6 +145,7 @@ enum Call {
     Hook {
         key: String,
         hook: String,
+        /// JSON-encoded argument list.
         input: String,
         reply: mpsc::Sender<Result<String, PluginError>>,
     },
@@ -189,12 +194,54 @@ impl PluginHost {
         input: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, PluginError> {
+        self.call_with_args(key, hook, &[input], timeout).await
+    }
+
+    /// `protocols.<protocol>.decodeRequest(ctx)` — the client request, turned
+    /// into the request the upstream should receive.
+    ///
+    /// The argument is the *protocol* name (`openai_responses`), which is the key
+    /// the plugin exports under, not the plugin's own key. A caller holding a
+    /// plugin key resolves it through that plugin's protocol claims.
+    pub async fn decode_request(
+        &self,
+        protocol: &str,
+        ctx: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.call_with_args(protocol, "decodeRequest", &[ctx], timeout).await
+    }
+
+    /// `protocols.<protocol>.renderFinal(ctx, task)` — the upstream's result,
+    /// turned into what the client asked for.
+    ///
+    /// Two arguments because the reference passes both: the original request
+    /// context, so a renderer can echo what the client sent, and the task the
+    /// upstream produced.
+    pub async fn render_final(
+        &self,
+        protocol: &str,
+        ctx: serde_json::Value,
+        task: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.call_with_args(protocol, "renderFinal", &[ctx, task], timeout).await
+    }
+
+    /// Send one call and decode the JSON it returned.
+    async fn call_with_args(
+        &self,
+        key: &str,
+        hook: &str,
+        args: &[serde_json::Value],
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(Call::Hook {
                 key: key.to_string(),
                 hook: hook.to_string(),
-                input: serde_json::to_string(&input).unwrap_or_else(|_| "null".to_string()),
+                input: serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string()),
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostStopped)?;
@@ -242,7 +289,9 @@ fn engine_loop(rx: mpsc::Receiver<Call>) {
                 input,
                 reply,
             } => {
-                let _ = reply.send(engine.call(&key, &hook, &input));
+                let args: Vec<serde_json::Value> =
+                    serde_json::from_str(&input).unwrap_or_else(|_| vec![serde_json::Value::Null]);
+                let _ = reply.send(engine.call_member(&key, &hook, &args));
             }
         }
     }
@@ -303,38 +352,108 @@ impl Engine {
         let manifest: PluginManifest = serde_json::from_str(&raw)
             .map_err(|error| PluginError::BadManifest(error.to_string()))?;
         manifest.validate()?;
+
+        // A manifest is a claim; an export is a fact. The host asks the engine
+        // which protocol members the source actually defined and refuses the
+        // plugin when the two disagree, so a manifest cannot promise a hook that
+        // does not exist and only fail at request time.
+        let exported = self.exported_protocol_members()?;
+        let problems = validate_protocol_claims(&manifest.protocols, &manifest.key, &exported);
+        if !problems.is_empty() {
+            return Err(PluginError::Load(problems.join("; ")));
+        }
+
         self.loaded.insert(manifest.key.clone());
+        // The protocol members are exported under the protocol's name, not the
+        // plugin's (`pkg/jsplugin/protocol_supports_test.go:13` exports
+        // `protocols.openai_responses.*`), so both spellings are addressable.
+        for claim in &manifest.protocols {
+            self.loaded.insert(claim.name.clone());
+        }
         Ok(manifest)
     }
 
-    /// Call `hook` on the plugin named `key`, passing and receiving JSON.
-    fn call(&mut self, key: &str, hook: &str, input: &str) -> Result<String, PluginError> {
+    /// Every `protocols.<protocol>.<member>` the loaded source defines as a
+    /// function, discovered from the host table rather than from the manifest.
+    fn exported_protocol_members(&mut self) -> Result<Vec<String>, PluginError> {
+        use boa_engine::Source;
+
+        let mut probe = String::from("(function () { var out = [];");
+        for protocol in HOST_PROTOCOLS {
+            let mut members: Vec<&str> = Vec::new();
+            for operation in protocol.operations {
+                members.extend_from_slice(operation.required_members);
+                members.extend_from_slice(operation.required_driver_hooks);
+                for mode in operation.modes {
+                    members.push(mode.hook);
+                }
+            }
+            members.sort_unstable();
+            members.dedup();
+            for member in members {
+                probe.push_str(&format!(
+                    "try {{ if (typeof protocols !== 'undefined' && protocols[{p:?}] && typeof protocols[{p:?}][{m:?}] === 'function') out.push({full:?}); }} catch (e) {{}}\n",
+                    p = protocol.name,
+                    m = member,
+                    full = format!("{}.{}", protocol.name, member),
+                ));
+            }
+        }
+        probe.push_str("return JSON.stringify(out); })()");
+
+        let raw = self
+            .context
+            .eval(Source::from_bytes(probe.as_bytes()))
+            .map_err(|error| PluginError::Load(describe(&error)))?
+            .to_string(&mut self.context)
+            .map_err(|error| PluginError::Load(describe(&error)))?
+            .to_std_string_escaped();
+        let names: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+        // The probe reports `protocol.member`; validation compares member names,
+        // because a hook name is unique within the host's table.
+        Ok(names
+            .into_iter()
+            .filter_map(|full| full.split_once('.').map(|(_, member)| member.to_string()))
+            .collect())
+    }
+
+    /// Call `protocols.<key>.<member>` with JSON arguments, returning JSON.
+    ///
+    /// The member is reached through the plugin's `protocols` export rather than
+    /// a name the host made up, so the call site is the same shape the reference
+    /// uses and a plugin written for it works here unchanged.
+    fn call_member(
+        &mut self,
+        key: &str,
+        member: &str,
+        args: &[serde_json::Value],
+    ) -> Result<String, PluginError> {
         use boa_engine::Source;
 
         if !self.loaded.contains(key) {
             return Err(PluginError::NoSuchHook {
                 key: key.to_string(),
-                hook: hook.to_string(),
+                hook: member.to_string(),
             });
         }
-        // The hook is invoked as a method on the plugin's exported object, which
-        // is how the reference lays its plugins out; a plugin that does not
-        // export the hook is reported rather than treated as a no-op, because a
-        // silently missing hook is a routing surprise.
+        let argv: Vec<String> = args
+            .iter()
+            .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "null".to_string()))
+            .collect();
         let script = format!(
             "(function () {{\n\
-             var __input = JSON.parse({input});\n\
-             var __plugin = (typeof plugins !== 'undefined' && plugins[{key_json}]) ||\n\
+             var __plugin = (typeof protocols !== 'undefined' && protocols[{key_json}]) ||\n\
+                            (typeof plugins !== 'undefined' && plugins[{key_json}]) ||\n\
                             (typeof module !== 'undefined' && module.exports && module.exports[{key_json}]) ||\n\
                             (typeof exports !== 'undefined' && exports[{key_json}]);\n\
              if (!__plugin) throw new Error('plugin ' + {key_json} + ' did not export an object');\n\
-             var __hook = __plugin[{hook_json}];\n\
-             if (typeof __hook !== 'function') throw new Error('plugin ' + {key_json} + ' has no hook ' + {hook_json});\n\
-             return JSON.stringify(__hook(__input));\n\
+             var __fn = __plugin[{member_json}];\n\
+             if (typeof __fn !== 'function') throw new Error('plugin ' + {key_json} + ' has no member ' + {member_json});\n\
+             return JSON.stringify(__fn.apply(null, [{argv}]));\n\
              }})()",
-            input = serde_json::to_string(input).unwrap_or_else(|_| "\"null\"".to_string()),
             key_json = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
-            hook_json = serde_json::to_string(hook).unwrap_or_else(|_| "\"\"".to_string()),
+            member_json = serde_json::to_string(member).unwrap_or_else(|_| "\"\"".to_string()),
+            argv = argv.join(", "),
         );
 
         let value = self
@@ -342,18 +461,17 @@ impl Engine {
             .eval(Source::from_bytes(script.as_bytes()))
             .map_err(|error| PluginError::Hook {
                 key: key.to_string(),
-                hook: hook.to_string(),
+                hook: member.to_string(),
                 message: describe(&error),
             })?;
-        let s = value
+        value
             .to_string(&mut self.context)
             .map_err(|error| PluginError::Hook {
                 key: key.to_string(),
-                hook: hook.to_string(),
+                hook: member.to_string(),
                 message: describe(&error),
-            })?
-            .to_std_string_escaped();
-        Ok(s)
+            })
+            .map(|s| s.to_std_string_escaped())
     }
 }
 
@@ -375,6 +493,178 @@ fn describe(error: &boa_engine::JsError) -> String {
     } else {
         out
     }
+}
+
+// ── Host protocols ─────────────────────────────────────────────────────────────
+
+/// One client request form an operation accepts, and the hook implementing it.
+///
+/// Ported from the reference's `ProtocolMode` (`pkg/jsplugin/routing.go:57`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolMode {
+    /// The request form's name, e.g. `stream` or `sync`.
+    pub name: &'static str,
+    /// The hook a plugin must export to serve it.
+    pub hook: &'static str,
+}
+
+/// One endpoint an operation serves.
+///
+/// Ported from `HostProtocolOperation` (`pkg/jsplugin/routing.go:71`). The
+/// operation is what a plugin is contracted to implement: to serve
+/// `POST /v1/responses` a plugin must export the members listed here plus the
+/// hook for whichever request forms it claims.
+#[derive(Debug, Clone, Copy)]
+pub struct HostOperation {
+    pub name: &'static str,
+    pub method: &'static str,
+    pub path: &'static str,
+    /// Members every plugin serving this operation must export, whatever forms
+    /// it claims.
+    pub required_members: &'static [&'static str],
+    /// Request forms, each naming the hook that implements it.
+    pub modes: &'static [ProtocolMode],
+    /// Hooks required regardless of the forms claimed.
+    pub required_driver_hooks: &'static [&'static str],
+}
+
+/// A client-facing protocol the host knows how to serve from a plugin.
+#[derive(Debug, Clone, Copy)]
+pub struct HostProtocol {
+    pub name: &'static str,
+    pub operations: &'static [HostOperation],
+}
+
+/// The protocols a plugin may claim.
+///
+/// A curated list rather than free naming: each entry is a promise about the
+/// hook contract, and the host can only keep a promise it knows. The first entry
+/// is the Responses API, which can only expose its full streaming semantics if a
+/// plugin renders them itself.
+pub const HOST_PROTOCOLS: &[HostProtocol] = &[HostProtocol {
+    name: "openai_responses",
+    operations: &[
+        HostOperation {
+            name: "create",
+            method: "POST",
+            path: "/v1/responses",
+            required_members: &["decodeRequest"],
+            modes: &[
+                ProtocolMode {
+                    name: "stream",
+                    hook: "renderEvents",
+                },
+                ProtocolMode {
+                    name: "sync",
+                    hook: "renderFinal",
+                },
+                ProtocolMode {
+                    name: "background",
+                    hook: "renderFinal",
+                },
+            ],
+            required_driver_hooks: &[],
+        },
+        HostOperation {
+            name: "retrieve",
+            method: "GET",
+            path: "/v1/responses/:response_id",
+            required_members: &[],
+            modes: &[],
+            required_driver_hooks: &[],
+        },
+    ],
+}];
+
+/// Look up a protocol by the name a manifest claims.
+pub fn host_protocol(name: &str) -> Option<&'static HostProtocol> {
+    HOST_PROTOCOLS.iter().find(|p| p.name == name)
+}
+
+/// What a manifest claims about one protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolClaim {
+    pub name: String,
+    /// Models this claim covers; empty means every model the plugin claims.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Which request forms the plugin serves. Empty means none are declared, and
+    /// validation will say so rather than silently serving nothing.
+    #[serde(default)]
+    pub supports: Vec<String>,
+}
+
+/// Check a set of claims against the host's protocol table and the members the
+/// plugin actually exported.
+///
+/// `exported` is the plugin's own list of `protocols.<name>.<member>` entries —
+/// the host asks the engine for it rather than trusting the manifest, because a
+/// manifest is a claim and an export is a fact. Each problem names the protocol
+/// and the hook: "supports sync but does not export
+/// protocols.openai_responses.renderFinal" tells an author exactly what to write,
+/// where "invalid plugin" does not. The reference phrases its equivalents the
+/// same way (`pkg/jsplugin/registry.go:464`).
+pub fn validate_protocol_claims(
+    claims: &[ProtocolClaim],
+    key: &str,
+    exported: &[String],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for claim in claims {
+        let Some(protocol) = host_protocol(&claim.name) else {
+            problems.push(format!(
+                "plugin {key} claims protocol {:?}, which this host does not serve",
+                claim.name
+            ));
+            continue;
+        };
+        if claim.supports.is_empty() {
+            problems.push(format!(
+                "plugin {key} protocol {:?} declares no supports; name the request forms it serves",
+                claim.name
+            ));
+            continue;
+        }
+        for support in &claim.supports {
+            let modes: Vec<&ProtocolMode> = protocol
+                .operations
+                .iter()
+                .flat_map(|op| op.modes.iter())
+                .filter(|mode| mode.name == support)
+                .collect();
+            if modes.is_empty() {
+                problems.push(format!(
+                    "plugin {key} protocol {:?} declares supports {:?}, which is not a request form of that protocol",
+                    claim.name, support
+                ));
+                continue;
+            }
+            // The hook this form needs, and the members the operation it belongs
+            // to needs whichever form was claimed.
+            let mut required: Vec<&str> = Vec::new();
+            let mut hooks: Vec<&str> = Vec::new();
+            for operation in protocol.operations {
+                if operation.modes.iter().any(|m| m.name == support) {
+                    required.extend_from_slice(operation.required_members);
+                    if let Some(mode) = operation.modes.iter().find(|m| m.name == support) {
+                        hooks.push(mode.hook);
+                    }
+                    required.extend_from_slice(operation.required_driver_hooks);
+                }
+            }
+            for member in required.into_iter().chain(hooks.into_iter()) {
+                if !exported.iter().any(|e| e == member) {
+                    problems.push(format!(
+                        "plugin {key} protocol {:?} supports {:?} but does not export protocols.{}.{}; implement it or stop claiming {:?}",
+                        claim.name, support, claim.name, member, support
+                    ));
+                }
+            }
+            // A hook exported for a form that was not claimed is not an error --
+            // the reference allows it -- so nothing is reported for extra members.
+        }
+    }
+    problems
 }
 
 #[cfg(test)]
@@ -401,6 +691,198 @@ mod tests {
         };
     "#;
 
+    /// A plugin serving the Responses API must export the members its claim
+    /// implies. The host asks the engine what the source actually defines rather
+    /// than trusting the manifest, so this is the check that stops a plugin
+    /// promising a hook it never wrote.
+    #[test]
+    fn the_responses_protocol_requires_the_members_it_names() {
+        // The reference's own minimal example for this protocol
+        // (`pkg/jsplugin/protocol_supports_test.go:14`).
+        const COMPLETE: &str = r#"
+            register({apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                modes:[{name:"responses", hook:"renderEvents"}],
+                protocols:[{name:"openai_responses", supports:["stream"]}]});
+            var protocols = { openai_responses: {
+                decodeRequest: function(ctx) { return ctx; },
+                renderEvents: function() { return {events: [], state: null, done: false}; }
+            } };
+        "#;
+        // Same manifest, but renderEvents is missing.
+        const MISSING_HOOK: &str = r#"
+            register({apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                protocols:[{name:"openai_responses", supports:["stream"]}]});
+            var protocols = { openai_responses: {
+                decodeRequest: function(ctx) { return ctx; }
+            } };
+        "#;
+        // Claims sync, which needs renderFinal, and only wrote renderEvents --
+        // the exact shape the reference reports.
+        const WRONG_MODE: &str = r#"
+            register({apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                protocols:[{name:"openai_responses", supports:["sync"]}]});
+            var protocols = { openai_responses: {
+                decodeRequest: function(ctx) { return ctx; },
+                renderEvents: function() { return {}; }
+            } };
+        "#;
+        const UNKNOWN_PROTOCOL: &str = r#"
+            register({apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                protocols:[{name:"made_up_protocol", supports:["stream"]}]});
+            var protocols = { made_up_protocol: { decodeRequest: function(){return {};} } };
+        "#;
+        const NO_SUPPORTS: &str = r#"
+            register({apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                protocols:[{name:"openai_responses", supports:[]}]});
+            var protocols = { openai_responses: { decodeRequest: function(){return {};} } };
+        "#;
+
+        let host = PluginHost::start();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            host.load(COMPLETE.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("the complete plugin must load");
+
+            for (label, source, want) in [
+                ("missing hook", MISSING_HOOK, "does not export"),
+                ("wrong mode", WRONG_MODE, "renderFinal"),
+                ("unknown protocol", UNKNOWN_PROTOCOL, "does not serve"),
+                ("no supports", NO_SUPPORTS, "declares no supports"),
+            ] {
+                let error = host
+                    .load(source.to_string(), DEFAULT_CALL_TIMEOUT)
+                    .await
+                    .expect_err(label);
+                let text = error.to_string();
+                assert!(text.contains(want), "{label}: expected {want:?} in {text:?}");
+            }
+        });
+    }
+
+    /// The host table is the contract, so it is worth pinning that the protocol
+    /// the reference serves is present and shaped the same way.
+    #[test]
+    fn the_host_serves_the_responses_protocol() {
+        let protocol = host_protocol("openai_responses").expect("known protocol");
+        assert!(host_protocol("nope").is_none());
+
+        let create = protocol
+            .operations
+            .iter()
+            .find(|op| op.name == "create")
+            .expect("create operation");
+        assert_eq!(create.method, "POST");
+        assert_eq!(create.path, "/v1/responses");
+        assert_eq!(create.required_members, &["decodeRequest"]);
+        // Streaming and non-streaming are different hooks, which is the whole
+        // reason this protocol needs a plugin: only the plugin can emit the
+        // event stream the Responses API promises.
+        let stream = create.modes.iter().find(|m| m.name == "stream").unwrap();
+        let sync = create.modes.iter().find(|m| m.name == "sync").unwrap();
+        assert_eq!(stream.hook, "renderEvents");
+        assert_eq!(sync.hook, "renderFinal");
+
+        // Validation is order-independent and reports every missing member, so an
+        // author fixing one hook is told about the rest in the same pass.
+        let problems = validate_protocol_claims(
+            &[ProtocolClaim {
+                name: "openai_responses".into(),
+                models: Vec::new(),
+                supports: vec!["stream".into(), "sync".into()],
+            }],
+            "acme",
+            &[],
+        );
+        // One problem per (claimed form, missing member): `decodeRequest` is
+        // required by both forms, so it is reported twice. That is deliberate --
+        // each message names the claim that failed, so an author who removes the
+        // `sync` claim still sees the `stream` one -- and it matches how the
+        // reference words its equivalents.
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        for member in ["decodeRequest", "renderEvents", "renderFinal"] {
+            assert!(
+                problems.iter().any(|p| p.contains(member)),
+                "{member} is missing from {problems:?}"
+            );
+        }
+        // Nothing is reported for a member the plugin did export.
+        assert!(!problems.iter().any(|p| p.contains("attributes")));
+
+        // With everything exported there is nothing to report.
+        let exported = vec![
+            "decodeRequest".to_string(),
+            "renderEvents".to_string(),
+            "renderFinal".to_string(),
+        ];
+        assert!(validate_protocol_claims(
+            &[ProtocolClaim {
+                name: "openai_responses".into(),
+                models: Vec::new(),
+                supports: vec!["stream".into(), "sync".into()],
+            }],
+            "acme",
+            &exported,
+        )
+        .is_empty());
+    }
+
+    /// The two members the routing path will call, with the argument arity the
+    /// reference gives them: `decodeRequest(ctx)` and `renderFinal(ctx, task)`.
+    #[test]
+    fn the_protocol_members_are_callable_with_their_own_arity() {
+        const BRIDGE: &str = r#"
+            register({apiVersion:1, key:"bridge", name:"Bridge", version:"1.0.0",
+                protocols:[{name:"openai_responses", supports:["sync"]}]});
+            var protocols = { openai_responses: {
+                decodeRequest: function (ctx) {
+                    // Reads the client body and states the upstream request.
+                    return { upstream: { model: ctx.body.model, input: ctx.body.input } };
+                },
+                renderFinal: function (ctx, task) {
+                    // Both arguments reach the hook: the original context and the
+                    // upstream's result.
+                    return { id: task.id, echoed: ctx.body.model, output: task.output };
+                }
+            } };
+        "#;
+        let host = PluginHost::start();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            host.load(BRIDGE.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+
+            let ctx = serde_json::json!({
+                "path": "/v1/responses",
+                "method": "POST",
+                "body": { "model": "acme-large", "input": "hello" }
+            });
+            let upstream = host
+                .decode_request("openai_responses", ctx.clone(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("decodeRequest");
+            assert_eq!(upstream["upstream"]["model"], "acme-large");
+
+            let task = serde_json::json!({ "id": "resp_1", "output": "hi there" });
+            let rendered = host
+                .render_final("openai_responses", ctx.clone(), task, DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("renderFinal");
+            assert_eq!(rendered["id"], "resp_1");
+            // Proves the second argument arrived; a one-argument call would have
+            // thrown on `task.id`.
+            assert_eq!(rendered["echoed"], "acme-large");
+            assert_eq!(rendered["output"], "hi there");
+        });
+    }
+
     #[test]
     fn a_key_must_match_the_reference_pattern() {
         assert!(valid_key("demo"));
@@ -426,6 +908,7 @@ mod tests {
                 hook: "convertRequest".into(),
                 supports: vec!["openai".into()],
             }],
+            protocols: Vec::new(),
         };
         assert!(manifest.implements("convertRequest"));
         assert!(!manifest.implements("convertResponse"));
@@ -441,6 +924,7 @@ mod tests {
             version: String::new(),
             description: String::new(),
             modes: Vec::new(),
+            protocols: Vec::new(),
         };
         assert!(matches!(
             manifest.validate(),
