@@ -893,6 +893,20 @@ async fn dispatch(
                 ) {
                     eprintln!("[OxygenRouter] billing settle failed: {error}");
                 }
+                // The settlement is the one place a request's cost is known, so it
+                // is also where the usage summary is fed. `DataExportEnabled` gates
+                // it, and the counters are held in memory until the periodic flush.
+                if state.data_export_enabled() {
+                    state.usage.record(
+                        user_id,
+                        &r.channel_id,
+                        api_key.as_ref().map(|k| k.id.as_str()).unwrap_or(""),
+                        group,
+                        &model,
+                        charge.quota,
+                        r.usage.total_tokens,
+                    );
+                }
             }
 
             // A failover is recorded on the log row so a retried request is

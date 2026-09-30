@@ -19,6 +19,103 @@ use crate::billing_store::SqliteBillingStore;
 
 const LOG_BROADCAST_CAPACITY: usize = 100;
 
+/// Hourly usage counters, held in memory until the periodic flush.
+///
+/// `DataExportEnabled` promises "Aggregate usage into quota_data for analytics",
+/// and the reference keeps these counters in a process-local cache that a timer
+/// writes out (`model/usedata.go:41,100`) rather than writing a row per request.
+/// That shape is kept here: a busy gateway folding every request straight into
+/// SQLite would pay a transaction per call for a table only read by charts.
+pub struct UsageAccumulator {
+    buckets: parking_lot::Mutex<std::collections::HashMap<String, oxygenrouter_core::QuotaData>>,
+}
+
+impl Default for UsageAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UsageAccumulator {
+    pub fn new() -> Self {
+        Self {
+            buckets: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Fold one billed request into its hour bucket.
+    ///
+    /// The bucket is the hour the request started in, matching the reference's
+    /// `created_at - created_at % 3600` (`model/usedata.go:80`).
+    pub fn record(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        token_id: &str,
+        group: &str,
+        model: &str,
+        quota: i64,
+        tokens: i64,
+    ) {
+        let bucket_at = bucket_hour(chrono::Utc::now());
+        let key = format!(
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            bucket_at.timestamp(),
+            user_id,
+            model,
+            group,
+            channel_id,
+            token_id
+        );
+        let mut buckets = self.buckets.lock();
+        let entry = buckets.entry(key).or_insert_with(|| oxygenrouter_core::QuotaData {
+            id: uuid::Uuid::new_v4().to_string(),
+            bucket_at,
+            user_id: user_id.to_string(),
+            // Resolved at flush time: the write path is the hot path, and a
+            // username lookup per request would be a query for a display field.
+            username: String::new(),
+            model_name: model.to_string(),
+            group_name: group.to_string(),
+            channel_id: channel_id.to_string(),
+            token_id: token_id.to_string(),
+            count: 0,
+            quota: 0,
+            token_used: 0,
+            created_at: chrono::Utc::now(),
+        });
+        entry.count += 1;
+        entry.quota = entry.quota.saturating_add(quota);
+        entry.token_used = entry.token_used.saturating_add(tokens);
+    }
+
+    /// Take everything accumulated so far, leaving the accumulator empty.
+    ///
+    /// Draining rather than copying means a failed flush loses at most the current
+    /// interval's counters, and a successful one cannot double-count.
+    pub fn take(&self) -> Vec<oxygenrouter_core::QuotaData> {
+        let mut buckets = self.buckets.lock();
+        if buckets.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *buckets).into_values().collect()
+    }
+
+    /// Buckets currently held, for diagnostics and tests.
+    pub fn pending(&self) -> usize {
+        self.buckets.lock().len()
+    }
+}
+
+/// Truncate a timestamp to the start of its hour, in UTC.
+pub fn bucket_hour(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Timelike;
+    at.with_minute(0)
+        .and_then(|v| v.with_second(0))
+        .and_then(|v| v.with_nanosecond(0))
+        .unwrap_or(at)
+}
+
 /// The account-creation and password-sign-in rules for this instance.
 ///
 /// Derived from the option store by `AppState::auth_policy`, never cached.
@@ -88,6 +185,13 @@ pub struct AppState {
     /// Cached with the two above: it is read on every console request that could
     /// be audited, and refreshed by the same two places.
     audit_log_enabled: AtomicBool,
+    /// Hourly usage counters awaiting the periodic flush into `quota_data`.
+    pub usage: UsageAccumulator,
+    /// `DataExportEnabled` — whether usage is aggregated at all.
+    ///
+    /// Cached with the logging flags, and refreshed by the same two places,
+    /// because it gates a write on the relay path.
+    data_export_enabled: AtomicBool,
 }
 
 impl AppState {
@@ -126,6 +230,8 @@ impl AppState {
             request_log_enabled: AtomicBool::new(true),
             record_ip_log: AtomicBool::new(false),
             audit_log_enabled: AtomicBool::new(true),
+            usage: UsageAccumulator::new(),
+            data_export_enabled: AtomicBool::new(true),
         }
     }
 
@@ -213,6 +319,8 @@ impl AppState {
             .store(read_bool("RecordIpLog", false), Ordering::Relaxed);
         self.audit_log_enabled
             .store(read_bool("AuditLogEnabled", true), Ordering::Relaxed);
+        self.data_export_enabled
+            .store(read_bool("DataExportEnabled", true), Ordering::Relaxed);
     }
 
     /// Whether request rows are persisted (`RequestLogEnabled`).
@@ -228,6 +336,11 @@ impl AppState {
     /// Whether administrative operations are recorded (`AuditLogEnabled`).
     pub fn audit_log_enabled(&self) -> bool {
         self.audit_log_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Whether usage is aggregated into `quota_data` (`DataExportEnabled`).
+    pub fn data_export_enabled(&self) -> bool {
+        self.data_export_enabled.load(Ordering::Relaxed)
     }
 
     /// Minutes a login lock lasts once it trips.
@@ -448,7 +561,57 @@ fn parse_port_list(raw: &str) -> Option<Vec<u16>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_port_list;
+    use super::{bucket_hour, parse_port_list, UsageAccumulator};
+
+    /// The accumulator is what `DataExportEnabled` buys: per-request folding in
+    /// memory instead of a transaction per request. Two properties matter and
+    /// neither is visible from the outside, so both are pinned here.
+    #[test]
+    fn the_usage_accumulator_folds_by_hour_and_drains() {
+        let acc = UsageAccumulator::new();
+        assert_eq!(acc.pending(), 0);
+        // Draining an empty accumulator is a no-op, not a panic: the flush timer
+        // runs unconditionally.
+        assert!(acc.take().is_empty());
+
+        // Same grain twice, including two spellings of the same model, folds.
+        acc.record("u1", "c1", "k1", "default", "gpt-4o", 100, 10);
+        acc.record("u1", "c1", "k1", "default", "gpt-4o", 250, 25);
+        assert_eq!(acc.pending(), 1, "the same grain must not create a second bucket");
+
+        // A different model, channel or user is a different grain.
+        acc.record("u1", "c1", "k1", "default", "claude-3", 1, 1);
+        acc.record("u1", "c2", "k1", "default", "gpt-4o", 1, 1);
+        acc.record("u2", "c1", "k1", "default", "gpt-4o", 1, 1);
+        assert_eq!(acc.pending(), 4);
+
+        // Everything comes out once, and the accumulator is empty afterwards so a
+        // successful flush cannot double-count.
+        let rows = acc.take();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(acc.pending(), 0);
+        let first = rows
+            .iter()
+            .find(|r| r.model_name == "gpt-4o" && r.channel_id == "c1" && r.user_id == "u1")
+            .expect("the folded bucket");
+        assert_eq!(first.count, 2);
+        assert_eq!(first.quota, 350);
+        assert_eq!(first.token_used, 35);
+    }
+
+    /// The bucket boundary is the hour, in UTC, matching the reference's
+    /// `created_at - created_at % 3600`.
+    #[test]
+    fn usage_buckets_align_to_the_start_of_the_hour() {
+        use chrono::{TimeZone, Utc};
+        let at = Utc.with_ymd_and_hms(2026, 9, 30, 14, 59, 59).unwrap();
+        let bucket = bucket_hour(at);
+        assert_eq!(bucket, Utc.with_ymd_and_hms(2026, 9, 30, 14, 0, 0).unwrap());
+        // An exact hour is its own bucket.
+        let exact = Utc.with_ymd_and_hms(2026, 9, 30, 14, 0, 0).unwrap();
+        assert_eq!(bucket_hour(exact), exact);
+    }
+
 
     #[test]
     fn port_lists_parse_including_ranges() {

@@ -167,6 +167,49 @@ async fn main() {
         });
     }
 
+    // Usage summary flush. `DataExportEnabled` promises "Aggregate usage into
+    // quota_data for analytics"; the counters live in memory on the relay path and
+    // are written out here, so a busy gateway pays one transaction every few
+    // minutes rather than one per request. A drain that fails leaves the counters
+    // gone rather than duplicated, which is the safer direction for a chart.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            // Sliced wait, for the reason given on the model-sync task above:
+            // reading the interval before a single long sleep would make a
+            // shorter setting take effect only after the old one elapsed.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut last_flush: Option<std::time::Instant> = None;
+            loop {
+                ticker.tick().await;
+                let minutes = state
+                    .db
+                    .get_setting("DataExportInterval")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                    .filter(|m| *m >= 1)
+                    .unwrap_or(5);
+                let due = last_flush
+                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(minutes * 60))
+                    .unwrap_or(true);
+                if !due {
+                    continue;
+                }
+                last_flush = Some(std::time::Instant::now());
+                let rows = state.usage.take();
+                if rows.is_empty() {
+                    continue;
+                }
+                let count = rows.len();
+                match state.db.upsert_quota_data(&rows) {
+                    Ok(()) => println!("[OxygenRouter] usage summary: flushed {count} buckets"),
+                    Err(error) => eprintln!("[OxygenRouter] usage summary flush failed: {error}"),
+                }
+            }
+        });
+    }
+
     // Channel model refresh. `UpstreamModelSyncEnabled` and
     // `ModelSyncIntervalMinutes` were advertised and read by nothing, so a
     // channel's model list only ever changed when an operator pressed the button.

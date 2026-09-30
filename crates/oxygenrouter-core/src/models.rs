@@ -341,6 +341,43 @@ pub struct AuditLog {
     pub created_at: DateTime<Utc>,
 }
 
+/// One hour of usage, summed across requests.
+///
+/// `DataExportEnabled` was advertised as "Aggregate usage into quota_data for
+/// analytics" with no table and no writer. The reason the reference keeps this
+/// alongside the raw log is retention: `request_logs` is pruned on
+/// `LogRetentionDays`, so a long-range chart built by scanning it silently loses
+/// everything older than the window. This table is the durable summary.
+///
+/// The grain and the columns mirror the reference's `model.QuotaData`
+/// (`model/usedata.go:13`): one row per hour per dimension tuple, with `count`,
+/// `quota` and `token_used` accumulated into it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaData {
+    pub id: String,
+    /// Start of the hour this row covers, as a UTC timestamp.
+    pub bucket_at: DateTime<Utc>,
+    pub user_id: String,
+    pub username: String,
+    pub model_name: String,
+    pub group_name: String,
+    pub channel_id: String,
+    pub token_id: String,
+    /// Billed requests counted in this hour.
+    ///
+    /// Not the same figure as `request_logs`: the relay has a pass-through path
+    /// that authorises and forwards without settling a charge, and the reference
+    /// likewise exports only its consume records. A request that cost nothing is
+    /// absent here rather than counted at zero, so this table reads as "spend",
+    /// not "traffic".
+    pub count: i64,
+    /// Quota micros spent in this hour.
+    pub quota: i64,
+    /// Prompt plus completion tokens in this hour.
+    pub token_used: i64,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_listen_host")]

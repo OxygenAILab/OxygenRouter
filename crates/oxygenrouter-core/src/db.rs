@@ -319,6 +319,28 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS quota_data (
+                id          TEXT PRIMARY KEY,
+                bucket_at   TEXT NOT NULL,
+                user_id     TEXT NOT NULL DEFAULT '',
+                username    TEXT NOT NULL DEFAULT '',
+                model_name  TEXT NOT NULL DEFAULT '',
+                group_name  TEXT NOT NULL DEFAULT '',
+                channel_id  TEXT NOT NULL DEFAULT '',
+                token_id    TEXT NOT NULL DEFAULT '',
+                count       INTEGER NOT NULL DEFAULT 0,
+                quota       INTEGER NOT NULL DEFAULT 0,
+                token_used  INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL
+            );
+            -- The unique key is what makes the upsert an accumulation rather than
+            -- a duplicate insert, so it is enforced by the database and not only
+            -- by the writer remembering to look first.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_data_grain ON quota_data(
+                bucket_at, user_id, username, model_name, group_name, channel_id, token_id
+            );
+            CREATE INDEX IF NOT EXISTS idx_quota_data_bucket ON quota_data(bucket_at DESC);
+
             CREATE INDEX IF NOT EXISTS idx_channels_priority ON channels(priority DESC);
             CREATE INDEX IF NOT EXISTS idx_model_maps_channel ON model_maps(channel_id);
             CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at DESC);
@@ -1178,6 +1200,105 @@ impl Database {
         let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         let conn = self.conn.lock();
         Ok(conn.execute("DELETE FROM audit_logs WHERE created_at < ?1", params![cutoff])?)
+    }
+
+    // ── Usage aggregates (quota_data) ─────────────────────────────────────────
+
+    /// Add one batch of hourly usage rows, accumulating into existing buckets.
+    ///
+    /// The whole batch runs in one transaction, so a crash mid-flush cannot leave
+    /// half the counters applied and the rest lost — the flush is the only write
+    /// this table ever sees, and it happens every few minutes.
+    pub fn upsert_quota_data(&self, rows: &[crate::QuotaData]) -> SqliteResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for row in rows {
+            tx.execute(
+                r#"INSERT INTO quota_data (id,bucket_at,user_id,username,model_name,group_name,channel_id,token_id,count,quota,token_used,created_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                   ON CONFLICT(bucket_at,user_id,username,model_name,group_name,channel_id,token_id)
+                   DO UPDATE SET count = count + excluded.count,
+                                 quota = quota + excluded.quota,
+                                 token_used = token_used + excluded.token_used"#,
+                params![
+                    row.id,
+                    row.bucket_at.to_rfc3339(),
+                    row.user_id,
+                    row.username,
+                    row.model_name,
+                    row.group_name,
+                    row.channel_id,
+                    row.token_id,
+                    row.count,
+                    row.quota,
+                    row.token_used,
+                    row.created_at.to_rfc3339()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Usage rows for a window, newest bucket first.
+    pub fn list_quota_data(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: i64,
+    ) -> SqliteResult<Vec<crate::QuotaData>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,bucket_at,user_id,username,model_name,group_name,channel_id,token_id,count,quota,token_used,created_at \
+             FROM quota_data WHERE bucket_at >= ?1 AND bucket_at < ?2 ORDER BY bucket_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339(), limit], |r| {
+            let parse = |s: String| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|v| v.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now())
+            };
+            Ok(crate::QuotaData {
+                id: r.get(0)?,
+                bucket_at: parse(r.get(1)?),
+                user_id: r.get(2)?,
+                username: r.get(3)?,
+                model_name: r.get(4)?,
+                group_name: r.get(5)?,
+                channel_id: r.get(6)?,
+                token_id: r.get(7)?,
+                count: r.get(8)?,
+                quota: r.get(9)?,
+                token_used: r.get(10)?,
+                created_at: parse(r.get(11)?),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Totals across a window, from the summary rather than the raw log.
+    ///
+    /// Returns `(requests, quota_micros, tokens)`. Reading the aggregate keeps a
+    /// long-range figure correct after retention has pruned the underlying rows.
+    /// A window that straddles a partial hour over-counts only if a later flush
+    /// adds to it, which is why this is documented as bucket-aligned.
+    pub fn quota_data_totals(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> SqliteResult<(i64, i64, i64)> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COALESCE(SUM(count),0), COALESCE(SUM(quota),0), COALESCE(SUM(token_used),0) \
+             FROM quota_data WHERE bucket_at >= ?1 AND bucket_at < ?2",
+            params![from.to_rfc3339(), to.to_rfc3339()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    }
+
+    pub fn count_quota_data(&self) -> SqliteResult<i64> {
+        let conn = self.conn.lock();
+        conn.query_row("SELECT COUNT(*) FROM quota_data", [], |r| r.get(0))
     }
 
     // ── Count helpers (for system info) ─────────────────────────────────────
@@ -3456,6 +3577,61 @@ mod tests {
         // Clearing is explicit and complete.
         assert_eq!(db.clear_audit_logs().unwrap(), 1);
         assert_eq!(db.count_audit_logs().unwrap(), 0);
+    }
+
+    /// `DataExportEnabled` had no table and no writer. The summary exists so a
+    /// long-range figure survives `LogRetentionDays` pruning the raw log, which
+    /// makes the accumulation — not the insert — the property that matters.
+    #[test]
+    fn usage_summary_accumulates_into_its_hour_bucket() {
+        let db = database();
+        let hour = {
+            use chrono::Timelike;
+            Utc::now().with_minute(0).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap()
+        };
+        let row = |id: &str, count: i64, quota: i64, tokens: i64| crate::QuotaData {
+            id: id.to_string(),
+            bucket_at: hour,
+            user_id: "u1".into(),
+            username: "alice".into(),
+            model_name: "gpt-4o".into(),
+            group_name: "default".into(),
+            channel_id: "c1".into(),
+            token_id: "k1".into(),
+            count,
+            quota,
+            token_used: tokens,
+            created_at: Utc::now(),
+        };
+
+        // Two flushes for the same grain must sum, not duplicate. The unique
+        // index is what enforces the grain, so this also proves it is in place.
+        db.upsert_quota_data(&[row("a", 3, 300, 30)]).unwrap();
+        db.upsert_quota_data(&[row("b", 2, 200, 20)]).unwrap();
+        assert_eq!(db.count_quota_data().unwrap(), 1, "the bucket must not be duplicated");
+
+        let stored = db.list_quota_data(hour, hour + chrono::Duration::hours(1), 10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].count, 5);
+        assert_eq!(stored[0].quota, 500);
+        assert_eq!(stored[0].token_used, 50);
+
+        // A different model is a different grain.
+        let mut other = row("c", 1, 100, 10);
+        other.model_name = "claude-3".into();
+        db.upsert_quota_data(&[other]).unwrap();
+        assert_eq!(db.count_quota_data().unwrap(), 2);
+
+        // Totals read the summary, and a window that excludes the bucket sees
+        // nothing rather than the whole table.
+        let (count, quota, tokens) = db
+            .quota_data_totals(hour, hour + chrono::Duration::hours(1))
+            .unwrap();
+        assert_eq!((count, quota, tokens), (6, 600, 60));
+        let (c2, q2, t2) = db
+            .quota_data_totals(hour - chrono::Duration::hours(2), hour)
+            .unwrap();
+        assert_eq!((c2, q2, t2), (0, 0, 0));
     }
 
     /// The token allowlist used to compare addresses as strings, so a subnet

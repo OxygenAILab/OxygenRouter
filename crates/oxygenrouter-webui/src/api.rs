@@ -3612,7 +3612,7 @@ async fn update_option(
             // remember to call.
             if matches!(
                 schema.key,
-                "RequestLogEnabled" | "RecordIpLog" | "AuditLogEnabled"
+                "RequestLogEnabled" | "RecordIpLog" | "AuditLogEnabled" | "DataExportEnabled"
             ) {
                 s.reload_log_policy();
             }

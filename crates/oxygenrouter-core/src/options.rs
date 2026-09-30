@@ -106,6 +106,9 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("RequestLogEnabled", Operations, Bool, "true", "Persist request logs"),
     schema!("RecordIpLog", Operations, Bool, "false", "Store client IP addresses on requests"),
     schema!("DataExportEnabled", Operations, Bool, "true", "Aggregate usage into quota_data for analytics"),
+    // The reference pairs the switch with an interval (`model/usedata.go:47`),
+    // because the counters are held in memory and only written out periodically.
+    schema!("DataExportInterval", Operations, Int, "5", "Minutes between usage-summary flushes"),
     schema!("UserAgent", Operations, String, "OxygenRouter/0.1.0", "User-Agent sent upstream"),
     // Security
     schema!("LocalApiToken", Security, String, "", "Bearer token required from local clients", secret),
