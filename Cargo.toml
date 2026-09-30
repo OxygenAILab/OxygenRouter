@@ -5,6 +5,7 @@ members = [
     "crates/oxygenrouter-billing",
     "crates/oxygenrouter-proxy",
     "crates/oxygenrouter-relay",
+    "crates/oxygenrouter-plugin",
     "crates/oxygenrouter-webui",
     "crates/oxygenrouter-bin",
 ]
