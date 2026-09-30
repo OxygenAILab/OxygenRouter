@@ -68,6 +68,15 @@ pub enum ProxyError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    /// The request itself is unusable, and no other channel would help.
+    ///
+    /// Distinct from `Internal` because it is the caller's configuration rather
+    /// than a fault here: a model-mapping chain that cycles is an operator's
+    /// mistake, and answering it with a retry loop would turn a fixable typo into
+    /// a hang.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +93,7 @@ impl ProxyError {
             ProxyError::Upstream { status, .. } => *status,
             ProxyError::Network(_) => 502,
             ProxyError::Internal(_) => 500,
+            ProxyError::InvalidRequest(_) => 400,
         }
     }
 
@@ -105,6 +115,8 @@ impl ProxyError {
             }
             ProxyError::Network(_) => true,
             ProxyError::Internal(_) => false,
+            // Retrying cannot help: every channel applies the same broken rule.
+            ProxyError::InvalidRequest(_) => false,
         }
     }
 

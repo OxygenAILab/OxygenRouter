@@ -145,7 +145,12 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("MaxLoginAttempts", Security, Int, "5", "Failed sign-ins before a temporary lock"),
     schema!("AuditLogEnabled", Security, Bool, "true", "Record administrative operations"),
     // Models
-    schema!("GlobalModelMapping", Models, String, "{}", "Requested -> upstream model mapping (JSON)"),
+    // No `GlobalModelMapping`. The reference has no such key: its model rewriting
+    // lives on the channel (`channel.ModelMapping`, relay/helper/model_mapped.go),
+    // which is what this project's `model_maps` rows already are, complete with a
+    // console page. A global layer on top would be a second place to configure the
+    // same decision, and the key was never read in any case -- the same shape as
+    // the other invented options removed from this list.
     // The pricing tables the engine actually consumes. The previous pair here
     // was named for what the *engine* calls its override layer
     // (`ModelRatioOverride`) rather than for the option the reference stores,

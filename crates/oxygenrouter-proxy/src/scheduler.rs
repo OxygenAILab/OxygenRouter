@@ -75,7 +75,16 @@ impl ChannelScheduler {
     }
 
     /// Apply channel-specific model map rewriting.
-    fn rewrite_model(&self, channel: &Channel, model: &str) -> String {
+    ///
+    /// Refuses rather than guesses when a chain cycles: sending the original name
+    /// would silently bill and route something the operator did not configure,
+    /// and sending a half-resolved name would be worse. The error names the chain
+    /// so the rule can be fixed.
+    fn rewrite_model(
+        &self,
+        channel: &Channel,
+        model: &str,
+    ) -> Result<String, crate::selection::ModelMapError> {
         apply_model_map(&self.model_maps, &channel.id, model)
     }
 
@@ -158,7 +167,10 @@ impl ChannelScheduler {
                     .and_then(|id| candidates.iter().find(|c| &c.id == id).cloned())
             });
             if let Some(channel) = pinned {
-                let actual_model = self.rewrite_model(&channel, &current_model);
+                let actual_model = match self.rewrite_model(&channel, &current_model) {
+                    Ok(name) => name,
+                    Err(error) => return Err(ProxyError::InvalidRequest(error.to_string())),
+                };
                 let format = relay_format_for_path(&req.path);
                 match self.relay.send(&channel, &actual_model, req, format).await {
                     Ok(outcome) => {
@@ -193,7 +205,10 @@ impl ChannelScheduler {
             };
             tried.push(channel.id.clone());
 
-            let actual_model = self.rewrite_model(&channel, &current_model);
+            let actual_model = match self.rewrite_model(&channel, &current_model) {
+                Ok(name) => name,
+                Err(error) => return Err(ProxyError::InvalidRequest(error.to_string())),
+            };
             let format = relay_format_for_path(&req.path);
             match self.relay.send(&channel, &actual_model, req, format).await {
                 Ok(outcome) => {

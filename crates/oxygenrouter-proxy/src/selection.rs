@@ -156,19 +156,92 @@ pub fn tiers_exhausted(candidates: &[Channel], retry: u32) -> bool {
 
 /// Rewrite a model name for a channel using that channel's model maps.
 ///
-/// The first matching enabled map wins, so map order is significant and is
-/// preserved from the database's ordering.
-pub fn apply_model_map(maps: &[ModelMap], channel_id: &str, model: &str) -> String {
-    for map in maps {
-        if !map.enabled || map.channel_id != channel_id {
-            continue;
+/// Two things make this more than a lookup, both taken from the reference
+/// (`relay/helper/model_mapped.go:28`):
+///
+/// * **Chaining.** A target may itself be a pattern another rule matches, and
+///   the last name in the chain is the one sent upstream. Resolution follows the
+///   chain rather than stopping at the first hop.
+/// * **Cycle detection.** A chain that returns to a name it has already visited
+///   is refused rather than followed forever: `a -> b -> a` would otherwise hang
+///   the request. A rule that maps a name to itself is not a cycle but a no-op,
+///   which is what an operator writing `gpt-4* -> gpt-4*` means.
+///
+/// The first matching enabled map wins at each hop, so map order is significant
+/// and is preserved from the database's ordering.
+///
+/// Returns the resolved name, or `Err` when the chain cycles.
+pub fn apply_model_map(
+    maps: &[ModelMap],
+    channel_id: &str,
+    model: &str,
+) -> Result<String, ModelMapError> {
+    let rules: Vec<&ModelMap> = maps
+        .iter()
+        .filter(|map| map.enabled && map.channel_id == channel_id)
+        .collect();
+
+    let mut current = model.to_string();
+    let mut visited: Vec<String> = vec![current.clone()];
+    // Bounded by the table size: every hop either lands on a name already seen
+    // (caught below) or is a new one, and there are finitely many rules.
+    for _ in 0..=rules.len() {
+        // Exact match first, then the first pattern that matches.
+        //
+        // The order matters and is not cosmetic. Patterns overlap, so a broad rule
+        // like `gpt-4* -> gpt-4-turbo` also matches the `gpt-4-turbo` that rule
+        // just produced; with plain first-match the chain stalls on its own output
+        // and the operator's more specific follow-up rule never runs. Preferring
+        // an exact key reproduces the reference's dictionary lookup
+        // (`relay/helper/model_mapped.go:34` looks up `modelMap[currentModel]`)
+        // while keeping the patterns this project's console already offers.
+        let exact = rules
+            .iter()
+            .find(|map| map.pattern == current)
+            .map(|map| map.target_model.clone());
+        let target = exact.or_else(|| {
+            rules
+                .iter()
+                .find(|map| glob_match(&map.pattern, &current))
+                .map(|map| map.target_model.clone())
+        });
+        let Some(target) = target else {
+            return Ok(current);
+        };
+        if target == current {
+            // A self-map is a no-op, not a cycle: the reference treats it that way
+            // explicitly (`model_mapped.go:42`).
+            return Ok(current);
         }
-        if glob_match(&map.pattern, model) {
-            return map.target_model.clone();
+        if visited.contains(&target) {
+            return Err(ModelMapError::Cycle {
+                chain: visited.join(" -> ") + " -> " + &target,
+            });
+        }
+        visited.push(target.clone());
+        current = target;
+    }
+    // Unreachable given the bound, but returning the current name is safer than
+    // looping if the reasoning above is ever broken by an edit.
+    Ok(current)
+}
+
+/// Why a model map could not be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelMapError {
+    /// The rewrite chain returned to a name it had already visited.
+    Cycle { chain: String },
+}
+
+impl std::fmt::Display for ModelMapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cycle { chain } => write!(f, "model mapping contains a cycle: {chain}"),
         }
     }
-    model.to_string()
 }
+
+impl std::error::Error for ModelMapError {}
 
 /// Glob matching supporting `*` anywhere, matching the existing project
 /// convention (`model map uses simple glob patterns; no full regex`).
@@ -452,13 +525,82 @@ mod tests {
             created_at: Utc::now(),
         }];
         assert_eq!(
-            apply_model_map(&maps, "ch-a", "gpt-4o"),
+            apply_model_map(&maps, "ch-a", "gpt-4o").unwrap(),
             "gpt-4-turbo".to_string()
         );
         // A different channel is untouched.
-        assert_eq!(apply_model_map(&maps, "ch-b", "gpt-4o"), "gpt-4o");
+        assert_eq!(apply_model_map(&maps, "ch-b", "gpt-4o").unwrap(), "gpt-4o");
         // A non-matching model is untouched.
-        assert_eq!(apply_model_map(&maps, "ch-a", "claude-3"), "claude-3");
+        assert_eq!(apply_model_map(&maps, "ch-a", "claude-3").unwrap(), "claude-3");
+    }
+
+    fn map(id: &str, channel: &str, pattern: &str, target: &str) -> ModelMap {
+        ModelMap {
+            id: id.into(),
+            channel_id: channel.into(),
+            pattern: pattern.into(),
+            target_model: target.into(),
+            enabled: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// The reference follows a chain of rewrites and refuses one that loops
+    /// (`relay/helper/model_mapped.go:28`). Both halves matter: a chain is how an
+    /// operator maps a family to a canonical name and then that name to the
+    /// upstream's spelling, and a loop would otherwise hang the request.
+    #[test]
+    fn a_rewrite_chain_is_followed_to_its_end() {
+        let maps = vec![
+            map("m1", "ch-a", "gpt-4*", "gpt-4-turbo"),
+            map("m2", "ch-a", "gpt-4-turbo", "gpt-4-turbo-2024"),
+            map("m3", "ch-a", "gpt-4-turbo-2024", "upstream-4-turbo"),
+        ];
+        assert_eq!(
+            apply_model_map(&maps, "ch-a", "gpt-4o").unwrap(),
+            "upstream-4-turbo"
+        );
+        // A name that matches nothing on the way is left alone.
+        assert_eq!(apply_model_map(&maps, "ch-a", "claude-3").unwrap(), "claude-3");
+    }
+
+    #[test]
+    fn a_cyclic_rewrite_is_refused_with_the_chain() {
+        let maps = vec![
+            map("m1", "ch-a", "a", "b"),
+            map("m2", "ch-a", "b", "c"),
+            map("m3", "ch-a", "c", "a"),
+        ];
+        match apply_model_map(&maps, "ch-a", "a") {
+            Err(ModelMapError::Cycle { chain }) => {
+                assert!(chain.contains("a -> b -> c -> a"), "{chain}");
+            }
+            other => panic!("expected a cycle, got {other:?}"),
+        }
+    }
+
+    /// A rule that maps a name to itself is written by operators as a catch-all
+    /// and must not be reported as a loop -- the reference special-cases it
+    /// (`model_mapped.go:42`).
+    #[test]
+    fn a_self_map_is_a_no_op_not_a_cycle() {
+        let maps = vec![map("m1", "ch-a", "gpt-4*", "gpt-4o")];
+        assert_eq!(apply_model_map(&maps, "ch-a", "gpt-4o").unwrap(), "gpt-4o");
+        // And a later rule can still claim the name.
+        let maps = vec![
+            map("m1", "ch-a", "gpt-4*", "gpt-4o"),
+            map("m2", "ch-a", "gpt-4o", "upstream-4o"),
+        ];
+        assert_eq!(apply_model_map(&maps, "ch-a", "gpt-4o").unwrap(), "upstream-4o");
+    }
+
+    /// A disabled rule must not participate, including as a chain link.
+    #[test]
+    fn a_disabled_map_is_not_followed() {
+        let mut disabled = map("m2", "ch-a", "gpt-4-turbo", "upstream-4-turbo");
+        disabled.enabled = false;
+        let maps = vec![map("m1", "ch-a", "gpt-4*", "gpt-4-turbo"), disabled];
+        assert_eq!(apply_model_map(&maps, "ch-a", "gpt-4o").unwrap(), "gpt-4-turbo");
     }
 
     #[test]
@@ -471,7 +613,7 @@ mod tests {
             enabled: false,
             created_at: Utc::now(),
         }];
-        assert_eq!(apply_model_map(&maps, "ch-a", "anything"), "anything");
+        assert_eq!(apply_model_map(&maps, "ch-a", "anything").unwrap(), "anything");
     }
 
     #[test]
