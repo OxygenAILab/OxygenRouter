@@ -15,6 +15,265 @@
 //! allowed (`pkg/jsplugin/request.go:12`).
 //!
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
+//!
+/// The progress text a submitted-but-not-started task shows, matching the
+/// reference's `ProgressSubmitted` (`service/task_polling.go:559`).
+pub const PROGRESS_SUBMITTED: &str = "任务已提交";
+
+/// The task lifecycle transitions and the HTTP classification a poll makes.
+///
+/// Ported from `service/task_polling.go:475-760`, and kept as pure functions
+/// because the decisions are the part worth testing: which statuses settle a
+/// quota, which HTTP answers mean "keep trying" versus "this task is gone", and
+/// whether a failure owes the caller a refund.
+
+/// Whether a status is one a plugin may report. Anything else is a parser gap
+/// the host refuses to act on (`service/task_polling.go:730`).
+pub fn known_status(status: &str) -> bool {
+    matches!(
+        status,
+        STATUS_NOT_START
+            | STATUS_SUBMITTED
+            | STATUS_QUEUED
+            | STATUS_IN_PROGRESS
+            | STATUS_SUCCESS
+            | STATUS_FAILURE
+    )
+}
+
+/// Whether a status means the task is still running
+/// (`service/task_polling.go:739`).
+pub fn status_is_in_flight(status: &str) -> bool {
+    matches!(
+        status,
+        STATUS_NOT_START | STATUS_SUBMITTED | STATUS_QUEUED | STATUS_IN_PROGRESS
+    )
+}
+
+/// What a poll's HTTP status means for the task
+/// (`service/task_polling.go:713`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollClass {
+    /// The upstream answered.
+    Ok,
+    /// The upstream does not know this task. The task is gone, so it fails
+    /// rather than retrying forever.
+    NotFound,
+    /// The credential was refused. Worth retrying only after an operator acts,
+    /// so it is recorded rather than treated as the task's fault.
+    Auth,
+    /// A rate limit or an upstream fault: retry.
+    Transient,
+    /// The upstream rejected the request itself. A non-terminal answer on a 4xx
+    /// means the two sides disagree about the protocol, not that the task is
+    /// running (`service/task_polling.go:541`).
+    OtherClient,
+}
+
+pub fn classify_poll_http(status: u16) -> PollClass {
+    match status {
+        200..=299 => PollClass::Ok,
+        // Gone as well as NotFound: an upstream that purges a finished task
+        // should not be polled forever.
+        404 | 410 => PollClass::NotFound,
+        401 | 403 => PollClass::Auth,
+        429 => PollClass::Transient,
+        500..=599 => PollClass::Transient,
+        400..=499 => PollClass::OtherClient,
+        _ => PollClass::Transient,
+    }
+}
+
+/// Why a poll failed, in the reference's wording
+/// (`service/task_polling.go:748`).
+pub fn poll_failure_reason(class: PollClass, status: Option<u16>, detail: &str) -> String {
+    let name = match class {
+        PollClass::Ok => "ok",
+        PollClass::NotFound => "not_found",
+        PollClass::Auth => "auth",
+        PollClass::Transient => "transient",
+        PollClass::OtherClient => "client_error",
+    };
+    let mut reason = match status {
+        Some(status) => format!("poll failed: {name} (HTTP {status})"),
+        None => format!("poll failed: {name}"),
+    };
+    if !detail.is_empty() {
+        reason.push_str(": ");
+        reason.push_str(detail);
+    }
+    reason
+}
+
+/// What the host should do with a poll's answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PollDecision {
+    /// The task is still running; store the progress and poll again.
+    Continue {
+        progress: String,
+    },
+    /// The task finished; settle it.
+    Terminal {
+        status: String,
+        progress: String,
+        reason: String,
+        result: TaskResult,
+    },
+    /// The poll itself failed in a way the task should not pay for: record it
+    /// and try again later.
+    Retry {
+        reason: String,
+    },
+    /// The poll's answer is not something the host can act on: the upstream
+    /// rejected the request, or the plugin reported a status it may not report.
+    Refuse {
+        reason: String,
+    },
+    /// The upstream does not know this task, so it becomes a failure.
+    Fail {
+        reason: String,
+    },
+}
+
+/// Decide what one poll's outcome means.
+///
+/// The order matters and is the reference's: an HTTP answer that says the task
+/// is gone fails it before the plugin is even asked, an ambiguous answer never
+/// settles a quota, and only a *terminal* status settles.
+pub fn decide_poll(outcome: &crate::HttpOutcome, result: Option<&TaskResult>) -> PollDecision {
+    match classify_poll_http(outcome.status) {
+        PollClass::NotFound => {
+            return PollDecision::Fail {
+                reason: format!("upstream task not found (HTTP {})", outcome.status),
+            }
+        }
+        PollClass::Auth => {
+            return PollDecision::Retry {
+                reason: poll_failure_reason(PollClass::Auth, Some(outcome.status), ""),
+            }
+        }
+        PollClass::Transient => {
+            return PollDecision::Retry {
+                reason: poll_failure_reason(PollClass::Transient, Some(outcome.status), ""),
+            }
+        }
+        PollClass::OtherClient | PollClass::Ok => {}
+    }
+
+    let Some(result) = result else {
+        return PollDecision::Refuse {
+            reason: poll_failure_reason(
+                PollClass::OtherClient,
+                Some(outcome.status),
+                "the plugin returned no result to read",
+            ),
+        };
+    };
+
+    if !known_status(&result.status) {
+        return PollDecision::Refuse {
+            reason: poll_failure_reason(
+                PollClass::OtherClient,
+                Some(outcome.status),
+                if result.reason.is_empty() {
+                    "the plugin reported an unknown status"
+                } else {
+                    &result.reason
+                },
+            ),
+        };
+    }
+    // A 4xx that the plugin still reads as "running" is the two sides disagreeing
+    // about the protocol, not a task that is progressing.
+    if classify_poll_http(outcome.status) == PollClass::OtherClient
+        && status_is_in_flight(&result.status)
+    {
+        return PollDecision::Refuse {
+            reason: poll_failure_reason(
+                PollClass::OtherClient,
+                Some(outcome.status),
+                &result.reason,
+            ),
+        };
+    }
+
+    if status_is_terminal(&result.status) {
+        return PollDecision::Terminal {
+            status: result.status.clone(),
+            progress: if result.progress.is_empty() {
+                "100%".to_string()
+            } else {
+                result.progress.clone()
+            },
+            reason: result.reason.clone(),
+            result: result.clone(),
+        };
+    }
+
+    let progress = if result.progress.is_empty() {
+        if result.status == STATUS_SUBMITTED || result.status == STATUS_NOT_START {
+            PROGRESS_SUBMITTED.to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        result.progress.clone()
+    };
+    PollDecision::Continue { progress }
+}
+
+/// Whether a task has outlived its budget and should be failed
+/// (`service/task_polling.go:70`).
+///
+/// A task that never settles would hold its reserved quota forever, so the host
+/// fails it and refunds. The window is compared against the task's *creation*,
+/// not its last poll, because an upstream that answers "still running" forever
+/// must still eventually be cut off.
+pub fn is_timed_out(created_at: i64, now: i64, window_secs: i64) -> bool {
+    window_secs > 0 && now.saturating_sub(created_at) > window_secs
+}
+
+/// Whether a finished task owes the caller a refund.
+///
+/// A failure costs nothing (the billing invariants say so), and a success keeps
+/// whatever was reserved -- unless the plugin reported actual usage, which the
+/// billing layer settles separately. This function states the *refund* half so
+/// the poller cannot forget it.
+pub fn terminal_refund_decision(status: &str, billing_settled: bool) -> bool {
+    status == STATUS_FAILURE && !billing_settled
+}
+
+/// The Billing invariants the poller must respect
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlePlan {
+    /// Success with no usage reported: the reservation stands, nothing moves.
+    KeepReservation,
+    /// Failure: refund in full.
+    Refund,
+    /// Success with usage facts: settle against what actually happened.
+    SettleWithUsage,
+}
+
+/// Which settlement a terminal task gets
+/// (`service/task_polling.go:673`).
+///
+/// The order is the reference's, and the invariant it protects is: a failed task
+/// never pays, and a per-call price never gets a second look. A success that
+/// reported tokens settles against them; a success that reported none keeps its
+/// reservation, because "the plugin said nothing" is not "the plugin said zero".
+pub fn settle_plan(status: &str, has_usage: bool, per_call_pricing: bool) -> SettlePlan {
+    if status == STATUS_FAILURE {
+        return SettlePlan::Refund;
+    }
+    if per_call_pricing {
+        return SettlePlan::KeepReservation;
+    }
+    if has_usage {
+        return SettlePlan::SettleWithUsage;
+    }
+    SettlePlan::KeepReservation
+}
+
 
 use serde::{Deserialize, Serialize};
 
@@ -1176,5 +1435,213 @@ mod tests {
         // The credential is not part of this shape at all.
         assert!(value.get("apiKey").is_none());
         assert!(value.get("authHeader").is_none());
+    }
+
+    fn outcome(status: u16) -> crate::HttpOutcome {
+        crate::HttpOutcome {
+            status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: b"{}".to_vec(),
+        }
+    }
+
+    fn result(status: &str, progress: &str) -> TaskResult {
+        TaskResult {
+            status: status.to_string(),
+            progress: progress.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Only the six statuses a plugin may report are known, and only four of them
+    /// mean the task is still running (`service/task_polling.go:730,739`).
+    #[test]
+    fn the_known_and_in_flight_statuses_are_the_reference_sets() {
+        for status in [
+            STATUS_NOT_START,
+            STATUS_SUBMITTED,
+            STATUS_QUEUED,
+            STATUS_IN_PROGRESS,
+            STATUS_SUCCESS,
+            STATUS_FAILURE,
+        ] {
+            assert!(known_status(status), "{status} must be known");
+        }
+        for status in [STATUS_UNKNOWN, "RUNNING", "", "success"] {
+            assert!(!known_status(status), "{status:?} must be unknown");
+        }
+
+        for status in [
+            STATUS_NOT_START,
+            STATUS_SUBMITTED,
+            STATUS_QUEUED,
+            STATUS_IN_PROGRESS,
+        ] {
+            assert!(status_is_in_flight(status), "{status}");
+        }
+        assert!(!status_is_in_flight(STATUS_SUCCESS));
+        assert!(!status_is_in_flight(STATUS_FAILURE));
+        assert!(!status_is_in_flight(STATUS_UNKNOWN));
+    }
+
+    /// The HTTP classification, including the two answers that are easy to get
+    /// wrong: `410 Gone` means the same as `404`, and a 4xx that is not an auth or
+    /// rate-limit answer is the client's own fault
+    /// (`service/task_polling.go:713`).
+    #[test]
+    fn a_poll_response_is_classified_the_way_the_reference_classifies_it() {
+        for status in [200, 201, 204, 299] {
+            assert_eq!(classify_poll_http(status), PollClass::Ok, "{status}");
+        }
+        for status in [404, 410] {
+            assert_eq!(classify_poll_http(status), PollClass::NotFound, "{status}");
+        }
+        for status in [401, 403] {
+            assert_eq!(classify_poll_http(status), PollClass::Auth, "{status}");
+        }
+        for status in [429, 500, 502, 503, 504] {
+            assert_eq!(classify_poll_http(status), PollClass::Transient, "{status}");
+        }
+        for status in [400, 402, 409, 422, 418] {
+            assert_eq!(
+                classify_poll_http(status),
+                PollClass::OtherClient,
+                "{status}"
+            );
+        }
+        // An unrecognised status is treated as a transient fault rather than as a
+        // signal about the task.
+        assert_eq!(classify_poll_http(0), PollClass::Transient);
+        assert_eq!(classify_poll_http(100), PollClass::Transient);
+
+        assert_eq!(
+            poll_failure_reason(PollClass::Transient, Some(503), ""),
+            "poll failed: transient (HTTP 503)"
+        );
+        assert_eq!(
+            poll_failure_reason(PollClass::NotFound, None, "gone"),
+            "poll failed: not_found: gone"
+        );
+    }
+
+    /// What one poll's answer means. The order matters: an answer that says the
+    /// task is gone fails it before the plugin is consulted, and an ambiguous
+    /// answer never settles a quota.
+    #[test]
+    fn a_poll_is_decided_before_anything_is_settled() {
+        // A task the upstream has forgotten fails rather than retrying forever.
+        assert!(matches!(
+            decide_poll(&outcome(404), None),
+            PollDecision::Fail { .. }
+        ));
+        // An auth or transient answer is the host's problem, not the task's.
+        assert!(matches!(
+            decide_poll(&outcome(401), None),
+            PollDecision::Retry { .. }
+        ));
+        assert!(matches!(
+            decide_poll(&outcome(503), None),
+            PollDecision::Retry { .. }
+        ));
+
+        // A poll that answered but produced nothing to read settles nothing.
+        assert!(matches!(
+            decide_poll(&outcome(200), None),
+            PollDecision::Refuse { .. }
+        ));
+
+        // A status the plugin may not report settles nothing, and the refusal
+        // carries the plugin's own reason when it gave one.
+        let mut unknown = result(STATUS_UNKNOWN, "");
+        unknown.reason = "vendor said later".to_string();
+        match decide_poll(&outcome(200), Some(&unknown)) {
+            PollDecision::Refuse { reason } => assert!(reason.contains("vendor said later"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // A 4xx the plugin still reads as "running" is the two sides disagreeing
+        // about the protocol, not a task that is progressing
+        // (`service/task_polling.go:541`).
+        let running = result(STATUS_IN_PROGRESS, "40%");
+        assert!(matches!(
+            decide_poll(&outcome(400), Some(&running)),
+            PollDecision::Refuse { .. }
+        ));
+        // The same answer on a 2xx is an ordinary "still running".
+        match decide_poll(&outcome(200), Some(&running)) {
+            PollDecision::Continue { progress } => assert_eq!(progress, "40%"),
+            other => panic!("expected a continue, got {other:?}"),
+        }
+
+        // A submitted task with no progress text reports the reference's own
+        // submitted text rather than an empty string.
+        match decide_poll(&outcome(200), Some(&result(STATUS_QUEUED, ""))) {
+            PollDecision::Continue { progress } => assert!(progress.is_empty()),
+            other => panic!("expected a continue, got {other:?}"),
+        }
+        match decide_poll(&outcome(200), Some(&result(STATUS_SUBMITTED, ""))) {
+            PollDecision::Continue { progress } => assert_eq!(progress, PROGRESS_SUBMITTED),
+            other => panic!("expected a continue, got {other:?}"),
+        }
+
+        // Terminal statuses settle, and a terminal answer without progress text
+        // is complete rather than unknown.
+        for status in [STATUS_SUCCESS, STATUS_FAILURE] {
+            match decide_poll(&outcome(200), Some(&result(status, ""))) {
+                PollDecision::Terminal { progress, status: got, .. } => {
+                    assert_eq!(got, status);
+                    assert_eq!(progress, "100%");
+                }
+                other => panic!("expected a terminal decision, got {other:?}"),
+            }
+        }
+    }
+
+    /// A task that never settles is eventually cut off, so its reservation cannot
+    /// be held forever (`service/task_polling.go:70`).
+    #[test]
+    fn a_task_that_never_settles_is_eventually_timed_out() {
+        let created = 1_000_000;
+        assert!(!is_timed_out(created, created, 3600));
+        assert!(!is_timed_out(created, created + 3599, 3600));
+        // The boundary is exclusive: exactly at the window the task still lives.
+        assert!(!is_timed_out(created, created + 3600, 3600));
+        assert!(is_timed_out(created, created + 3601, 3600));
+        // A window of zero means no timeout is configured, not "everything".
+        assert!(!is_timed_out(created, created + 1_000_000, 0));
+        // A clock that went backwards must not time out a fresh task.
+        assert!(!is_timed_out(created, created - 10, 3600));
+    }
+
+    /// The settlement a terminal task gets, and the invariant it protects: a
+    /// failure never pays, and a per-call price never gets a second look
+    /// (`service/task_polling.go:673`).
+    #[test]
+    fn a_terminal_task_settles_by_the_reference_rules() {
+        // A failure owes a refund, whatever else is true.
+        assert_eq!(settle_plan(STATUS_FAILURE, true, false), SettlePlan::Refund);
+        assert_eq!(settle_plan(STATUS_FAILURE, false, true), SettlePlan::Refund);
+        assert!(terminal_refund_decision(STATUS_FAILURE, false));
+        // A settled failure does not refund twice.
+        assert!(!terminal_refund_decision(STATUS_FAILURE, true));
+
+        // A per-call price keeps its reservation even when the plugin reported
+        // token counts, because the price was the contract.
+        assert_eq!(
+            settle_plan(STATUS_SUCCESS, true, true),
+            SettlePlan::KeepReservation
+        );
+        // A success that reported usage settles against it.
+        assert_eq!(
+            settle_plan(STATUS_SUCCESS, true, false),
+            SettlePlan::SettleWithUsage
+        );
+        // A success that reported nothing keeps its reservation: "the plugin said
+        // nothing" is not "the plugin said zero".
+        assert_eq!(
+            settle_plan(STATUS_SUCCESS, false, false),
+            SettlePlan::KeepReservation
+        );
+        assert!(!terminal_refund_decision(STATUS_SUCCESS, false));
     }
 }

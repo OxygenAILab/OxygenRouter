@@ -42,8 +42,11 @@ pub use task_flow::{
 };
 
 pub use task::{
-    build_request_body, parse_absolute_url, replace_private_task_id, status_is_terminal,
-    validate_request_url, OutboundBody, ResolvedFile, DEFAULT_MAX_INLINE_FILE_BYTES,
+    build_request_body, classify_poll_http, decide_poll, is_timed_out, known_status,
+    parse_absolute_url, poll_failure_reason, replace_private_task_id, settle_plan,
+    status_is_in_flight, status_is_terminal, terminal_refund_decision, validate_request_url,
+    OutboundBody, PollClass, PollDecision, ResolvedFile, SettlePlan, DEFAULT_MAX_INLINE_FILE_BYTES,
+    PROGRESS_SUBMITTED,
     QueryContext, RequestDescriptor, RequestPart, SimpleUrl, SubmitOutcome, TaskResult, TaskView,
     UpstreamKind, STATUS_FAILURE, STATUS_IN_PROGRESS, STATUS_NOT_START, STATUS_QUEUED,
     STATUS_SUBMITTED, STATUS_SUCCESS, STATUS_UNKNOWN,
