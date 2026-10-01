@@ -33,6 +33,13 @@ use serde::{Deserialize, Serialize};
 
 mod routing;
 mod task;
+mod task_flow;
+
+pub use task_flow::{
+    build_outbound_request, build_query_request, interpret_submit, interpret_task_result,
+    send_submit, validate_descriptor, FlowError, HttpOutcome, OutboundRequest, SubmitAnswer,
+    TaskFlowContext, TaskTransport, TransportFuture,
+};
 
 pub use task::{
     build_request_body, parse_absolute_url, replace_private_task_id, status_is_terminal,
@@ -720,6 +727,23 @@ impl PluginHost {
         self.call_with_args(protocol, "renderFinal", &[ctx, task], timeout).await
     }
 
+    /// Call one hook with the exact argument list its contract states.
+    ///
+    /// A plugin's hooks are not uniform: `buildQueryRequest(ctx)` takes one
+    /// argument, `parseSubmitResponse(ctx, response)` two, and
+    /// `parseTaskResult(ctx, body, response)` three
+    /// (`relay/channel/task/jsplugin/adaptor.go:492,607,777`). The host must pass
+    /// the arity the reference passes, so the caller states it.
+    pub async fn call_hook_args(
+        &self,
+        key: &str,
+        hook: &str,
+        args: &[serde_json::Value],
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.call_with_args(key, hook, args, timeout).await
+    }
+
     /// Send one call and decode the JSON it returned.
     async fn call_with_args(
         &self,
@@ -1139,15 +1163,168 @@ impl Engine {
     /// The member is reached through the module's own `protocols` export, so the
     /// call site matches the shape a plugin is written in and a plugin authored
     /// for the reference works unchanged.
+    /// Call a top-level export: the driver hooks (`buildSubmitRequest`,
+    /// `buildQueryRequest`, `parseTaskResult`, ...).
+    ///
+    /// The driver hooks live on the module itself, not under `protocols`, because
+    /// the adaptor calls them directly (`pkg/jsplugin/registry.go:337`). A
+    /// instance-form plugin keeps them as globals, which is why the fallback is
+    /// the global object rather than an error.
+    fn call_export(
+        &mut self,
+        key: &str,
+        hook: &str,
+        args: &[serde_json::Value],
+    ) -> Result<String, PluginError> {
+        let Some((module, plugin_key)) = self
+            .loaded
+            .get(key)
+            .map(|loaded| (loaded.module.clone(), loaded.manifest.key.clone()))
+        else {
+            return Err(PluginError::NoSuchHook {
+                key: key.to_string(),
+                hook: hook.to_string(),
+            });
+        };
+
+        let function = match module.as_ref() {
+            Some(module) => module
+                .namespace(&mut self.context)
+                .get(boa_engine::js_string!(hook), &mut self.context),
+            None => {
+                let global = self.context.global_object();
+                global.get(boa_engine::js_string!(hook), &mut self.context)
+            }
+        }
+        .map_err(|error| PluginError::Hook {
+            key: key.to_string(),
+            hook: hook.to_string(),
+            message: describe(&error),
+        })?;
+        let Some(callable) = function.as_callable() else {
+            return Err(PluginError::Hook {
+                key: key.to_string(),
+                hook: hook.to_string(),
+                message: format!(
+                    "plugin {plugin_key} has no export {hook:?}; implement it as a top-level function"
+                ),
+            });
+        };
+        self.invoke(callable, key, hook, args)
+    }
+
+    /// The plugin's `protocols` entry that implements `hook`.
+    ///
+    /// The reference resolves a protocol hook by looking for a member of that
+    /// name in the plugin's *own* protocol objects, in one fixed order
+    /// (`pkg/jsplugin/registry.go:468`). Searching by the caller's key instead
+    /// would let an object that happens to be keyed like a protocol shadow the
+    /// real implementation.
+    fn protocol_object_for(
+        &mut self,
+        module: Option<&boa_engine::Module>,
+        protocol: &str,
+        plugin_key: &str,
+    ) -> Result<boa_engine::JsObject, PluginError> {
+        let Some(object) = self.protocols_object(module) else {
+            return Err(PluginError::Load(
+                "plugin exports no protocols object".to_string(),
+            ));
+        };
+        // Owned names, because a candidate borrowed from the manifest would not
+        // outlive the borrow of `self` the lookup needs.
+        let mut candidates: Vec<String> = Vec::new();
+        for name in [protocol, plugin_key] {
+            if !name.is_empty() && !candidates.iter().any(|c| c == name) {
+                candidates.push(name.to_string());
+            }
+        }
+        if let Ok(manifest) = self.manifest_for(plugin_key) {
+            for claim in &manifest.protocols {
+                if !candidates.iter().any(|c| c == &claim.name) {
+                    candidates.push(claim.name.clone());
+                }
+            }
+        }
+        for name in candidates {
+            let entry = object.get(boa_engine::js_string!(name.as_str()), &mut self.context);
+            if let Ok(entry) = entry {
+                if !entry.is_undefined() && !entry.is_null() {
+                    if let Ok(entry) = entry.to_object(&mut self.context) {
+                        return Ok(entry);
+                    }
+                }
+            }
+        }
+        Err(PluginError::Hook {
+            key: plugin_key.to_string(),
+            hook: protocol.to_string(),
+            message: format!("plugin {plugin_key} implements no protocol {protocol:?}"),
+        })
+    }
+
+    /// A loaded plugin's manifest, by key.
+    fn manifest_for(&self, key: &str) -> Result<PluginManifest, PluginError> {
+        self.loaded
+            .values()
+            .find(|loaded| loaded.manifest.key == key)
+            .map(|loaded| loaded.manifest.clone())
+            .ok_or_else(|| PluginError::NoSuchHook {
+                key: key.to_string(),
+                hook: String::new(),
+            })
+    }
+
+    /// Convert arguments to JavaScript values, call, and convert the result back.
+    fn invoke(
+        &mut self,
+        callable: boa_engine::JsObject,
+        key: &str,
+        hook: &str,
+        args: &[serde_json::Value],
+    ) -> Result<String, PluginError> {
+        let mut argv = Vec::new();
+        for arg in args {
+            let value = boa_engine::JsValue::from_json(
+                &serde_json::to_value(arg).unwrap_or(serde_json::Value::Null),
+                &mut self.context,
+            )
+            .map_err(|error| PluginError::Hook {
+                key: key.to_string(),
+                hook: hook.to_string(),
+                message: describe(&error),
+            })?;
+            argv.push(value);
+        }
+        let result = callable
+            .call(&boa_engine::JsValue::undefined(), &argv, &mut self.context)
+            .map_err(|error| PluginError::Hook {
+                key: key.to_string(),
+                hook: hook.to_string(),
+                message: describe(&error),
+            })?;
+        let json = result.to_json(&mut self.context).map_err(|error| PluginError::Hook {
+            key: key.to_string(),
+            hook: hook.to_string(),
+            message: describe(&error),
+        })?;
+        serde_json::to_string(&serde_json::to_value(json).unwrap_or(serde_json::Value::Null))
+            .map_err(|error| PluginError::Hook {
+                key: key.to_string(),
+                hook: hook.to_string(),
+                message: error.to_string(),
+            })
+    }
+
+    /// Call `protocols.<name>.<member>` with JSON arguments, returning JSON.
     fn call_member(
         &mut self,
         key: &str,
         member: &str,
         args: &[serde_json::Value],
     ) -> Result<String, PluginError> {
-        // Cloned out of the map before anything else borrows `self` mutably: the
-        // manifest is needed for the fallback lookup and the module for the call,
-        // and holding the map entry across either would trap the borrow.
+        // The module is borrowed once and cloned out, so the rest of the call can
+        // take `&mut self` for the engine.
         let Some((module, plugin_key)) = self
             .loaded
             .get(key)
@@ -1158,45 +1335,7 @@ impl Engine {
                 hook: member.to_string(),
             });
         };
-
-        let Some(protocol) = self.protocols_object(module.as_ref()) else {
-            return Err(PluginError::Hook {
-                key: key.to_string(),
-                hook: member.to_string(),
-                message: "plugin exports no protocols object".to_string(),
-            });
-        };
-        // The caller may hold either the plugin's key or the protocol's name, so
-        // both are tried before giving up.
-        let entry = {
-            let by_key = protocol.get(boa_engine::js_string!(key), &mut self.context);
-            match by_key {
-                Ok(value) if !value.is_undefined() => Ok(value),
-                _ => {
-                    // Fall back to the plugin's own key when the caller passed a
-                    // protocol name that this plugin does not own.
-                    protocol.get(boa_engine::js_string!(plugin_key.as_str()), &mut self.context)
-                }
-            }
-        };
-        let entry = entry
-            .map_err(|error| PluginError::Hook {
-                key: key.to_string(),
-                hook: member.to_string(),
-                message: describe(&error),
-            })?
-            .to_object(&mut self.context)
-            .map_err(|error| PluginError::Hook {
-                key: key.to_string(),
-                hook: member.to_string(),
-                message: format!(
-                    "plugin {} exports no object for {:?}: {}",
-                    plugin_key,
-                    key,
-                    describe(&error)
-                ),
-            })?;
-
+        let entry = self.protocol_object_for(module.as_ref(), key, &plugin_key)?;
         let function = entry
             .get(boa_engine::js_string!(member), &mut self.context)
             .map_err(|error| PluginError::Hook {
@@ -1205,42 +1344,13 @@ impl Engine {
                 message: describe(&error),
             })?;
         let Some(callable) = function.as_callable() else {
-            return Err(PluginError::Hook {
-                key: key.to_string(),
-                hook: member.to_string(),
-                message: format!("plugin has no member {member:?}"),
-            });
+            // Not a protocol member, so it is a driver hook: the reference calls
+            // those as ordinary top-level exports (`pkg/jsplugin/registry.go:337`),
+            // and this host resolves both names through one entry point so the
+            // caller does not have to know which kind it is holding.
+            return self.call_export(&plugin_key, member, args);
         };
-
-        let mut argv = Vec::new();
-        for arg in args {
-            let value = boa_engine::JsValue::from_json(
-                &serde_json::to_value(arg).unwrap_or(serde_json::Value::Null),
-                &mut self.context,
-            )
-            .map_err(|error| PluginError::Hook {
-                key: key.to_string(),
-                hook: member.to_string(),
-                message: describe(&error),
-            })?;
-            argv.push(value);
-        }
-        let result = callable
-            .call(&boa_engine::JsValue::undefined(), &argv, &mut self.context)
-            .map_err(|error| PluginError::Hook {
-                key: key.to_string(),
-                hook: member.to_string(),
-                message: describe(&error),
-            })?;
-        let json = result
-            .to_json(&mut self.context)
-            .map_err(|error| PluginError::Hook {
-                key: key.to_string(),
-                hook: member.to_string(),
-                message: describe(&error),
-            })?;
-        Ok(serde_json::to_string(&serde_json::to_value(json).unwrap_or(serde_json::Value::Null))
-            .unwrap_or_else(|_| "null".to_string()))
+        self.invoke(callable, key, member, args)
     }
 }
 
@@ -2065,6 +2175,27 @@ pub fn normalize_protocol_supports(claims: &mut [ProtocolClaim]) {
     }
 }
 
+/// The driver hook names, as the reference spells them.
+///
+/// One place, because two callers depend on the same spelling: the load-time
+/// check that a plugin exports them, and the submit/poll path that calls them. A
+/// typo in one would otherwise make a valid plugin look incomplete.
+pub const HOOK_BUILD_SUBMIT_REQUEST: &str = "buildSubmitRequest";
+pub const HOOK_PARSE_SUBMIT_RESPONSE: &str = "parseSubmitResponse";
+pub const HOOK_PARSE_SUBMIT_EVENT: &str = "parseSubmitEvent";
+pub const HOOK_PARSE_SUBMIT_EVENT_DELTA: &str = "parseSubmitEventDelta";
+pub const HOOK_BUILD_QUERY_REQUEST: &str = "buildQueryRequest";
+pub const HOOK_PARSE_TASK_RESULT: &str = "parseTaskResult";
+pub const HOOK_BUILD_BATCH_QUERY_REQUEST: &str = "buildBatchQueryRequest";
+pub const HOOK_PARSE_BATCH_RESULT: &str = "parseBatchResult";
+pub const HOOK_LIST_ARTIFACTS: &str = "listArtifacts";
+pub const HOOK_BUILD_CONTENT_REQUEST: &str = "buildContentRequest";
+/// Optional: the usage hooks a plugin may add. Their absence is not an error,
+/// which is why they are not in the required set.
+pub const HOOK_EXTRACT_USAGE: &str = "extractUsage";
+pub const HOOK_EXTRACT_USAGE_ON_SUBMIT: &str = "extractUsageOnSubmit";
+pub const HOOK_EXTRACT_USAGE_ON_COMPLETE: &str = "extractUsageOnComplete";
+
 /// The top-level exports every plugin must have, and the two extra ones a
 /// `batch` plugin needs instead of `buildQueryRequest`
 /// (`pkg/jsplugin/registry.go:324,332`).
@@ -2073,7 +2204,11 @@ pub fn normalize_protocol_supports(claims: &mut [ProtocolClaim]) {
 /// way the unknown-field refusal now does: a plugin that loads but cannot be
 /// called is worse than one that fails to load.
 pub fn validate_required_hooks(manifest: &PluginManifest, exports: &PluginExports) -> Vec<String> {
-    let mut required: Vec<&str> = vec!["buildSubmitRequest", "parseSubmitResponse", "parseTaskResult"];
+    let mut required: Vec<&str> = vec![
+        HOOK_BUILD_SUBMIT_REQUEST,
+        HOOK_PARSE_SUBMIT_RESPONSE,
+        HOOK_PARSE_TASK_RESULT,
+    ];
     // A plugin that accepts an SSE submission must parse one event at a time,
     // and which hook depends on whether it asked for the delta capability.
     if manifest.submit_response_types.iter().any(|kind| kind == "sse") {
@@ -2082,16 +2217,16 @@ pub fn validate_required_hooks(manifest: &PluginManifest, exports: &PluginExport
             .iter()
             .any(|capability| capability == CAPABILITY_SUBMIT_SSE_DELTA)
         {
-            required.push("parseSubmitEventDelta");
+            required.push(HOOK_PARSE_SUBMIT_EVENT_DELTA);
         } else {
-            required.push("parseSubmitEvent");
+            required.push(HOOK_PARSE_SUBMIT_EVENT);
         }
     }
     if manifest.fetch_mode == FETCH_MODE_BATCH {
-        required.push("buildBatchQueryRequest");
-        required.push("parseBatchResult");
+        required.push(HOOK_BUILD_BATCH_QUERY_REQUEST);
+        required.push(HOOK_PARSE_BATCH_RESULT);
     } else {
-        required.push("buildQueryRequest");
+        required.push(HOOK_BUILD_QUERY_REQUEST);
     }
 
     let mut problems = Vec::new();
@@ -2105,11 +2240,11 @@ pub fn validate_required_hooks(manifest: &PluginManifest, exports: &PluginExport
     }
     // The two artifact hooks are optional, but only together: the content
     // endpoint needs both to answer anything (`pkg/jsplugin/registry.go:364`).
-    let lists = exports.top_level.iter().any(|name| name == "listArtifacts");
+    let lists = exports.top_level.iter().any(|name| name == HOOK_LIST_ARTIFACTS);
     let builds = exports
         .top_level
         .iter()
-        .any(|name| name == "buildContentRequest");
+        .any(|name| name == HOOK_BUILD_CONTENT_REQUEST);
     if lists != builds {
         problems.push(format!(
             "plugin {} must export listArtifacts and buildContentRequest together",
@@ -2923,7 +3058,7 @@ export function parseTaskResult() {{ return {{}}; }}
         function parseTaskResult() { return {}; }
     "#;
 
-    fn runtime() -> tokio::runtime::Runtime {
+    pub(crate) fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

@@ -128,7 +128,7 @@ impl RequestDescriptor {
 /// polls with; `immediate` is an upstream that answered already, which is how the
 /// synchronous image protocol works; `state` is opaque data the host stores and
 /// hands back on every poll.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SubmitOutcome {
     #[serde(rename = "taskId", default)]
     pub task_id: String,
@@ -143,7 +143,7 @@ pub struct SubmitOutcome {
 /// One poll's answer, from `parseTaskResult` or from an immediate submission.
 ///
 /// Ported from `taskResult` (`adaptor.go:63`).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TaskResult {
     #[serde(default)]
     pub code: i64,
