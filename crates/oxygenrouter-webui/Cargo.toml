@@ -8,7 +8,7 @@ embed-webui = ["dep:include_dir"]
 
 [dependencies]
 tokio       = { version = "1", features = ["full"] }
-axum        = { version = "0.7", features = ["macros"] }
+axum        = { version = "0.7", features = ["macros", "multipart"] }
 tower        = { version = "0.4", features = ["util"] }
 tower-http   = { version = "0.5", features = ["fs", "cors"] }
 serde       = { version = "1", features = ["derive"] }
@@ -21,6 +21,8 @@ chrono       = { version = "0.4", features = ["serde"] }
 parking_lot  = "0.12"
 include_dir  = { version = "0.7", optional = true }
 mime_guess   = "2"
+url          = "2"
+multer       = "3"
 bytes        = "1"
 rusqlite     = "0.31"
 

@@ -431,6 +431,22 @@ async fn image_generations(
     request: Request,
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
+    let model = request_body_model(&headers, &body_bytes).await;
+    if let Some(binding) = model
+        .as_deref()
+        .and_then(|model| plugin_for_endpoint(&state, "POST", "/v1/images/generations", model))
+    {
+        return plugin_bridge(
+            state,
+            PluginInvocation {
+                binding: &binding,
+                headers: &headers,
+                body: &body_bytes,
+            },
+            "/v1/images/generations",
+        )
+        .await;
+    }
     dispatch_openai(state, "/v1/images/generations", body_bytes, "dall-e-3", headers).await
 }
 
@@ -1031,37 +1047,248 @@ pub fn caller_address(headers: &axum::http::HeaderMap) -> String {
 /// `DefaultCallTimeout` (`pkg/jsplugin/engine.go:18`).
 const PLUGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// An enabled plugin serving this endpoint, if one is active.
+/// Every endpoint binding an enabled plugin claims, as a lookup index.
 ///
-/// The lookup is on the request path, so it reads the instance's plugin list
-/// rather than reaching into the engine: a plugin that is merely installed must
-/// not affect traffic, and only an enabled one with the protocol claimed counts.
-fn plugin_for_path(state: &AppState, client_path: &str) -> Option<String> {
-    let plugins = state.db.list_plugins().ok()?;
-    plugins
+/// Built from the instance's stored claims rather than from the engine, because a
+/// plugin that is merely installed must not affect traffic and a plugin with no
+/// active build has nothing to call. The key is `method + path + model`, which is
+/// the reference's (`pkg/jsplugin/routing.go:994`): one endpoint serves many
+/// models, and two plugins may share it while declaring disjoint model sets, so a
+/// path-only lookup would hand a model to a plugin that never claimed it.
+fn plugin_endpoint_index(state: &AppState) -> oxygenrouter_plugin::EndpointIndex {
+    let claims = state.db.list_enabled_plugin_claims().unwrap_or_default();
+    // One claim per (plugin, protocol a manifest claims), which is the unit the
+    // reference indexes: the plugin's own model list, narrowed by the claim's.
+    let expanded: Vec<oxygenrouter_plugin::EndpointClaim<'_>> = claims
         .iter()
-        .find(|p| p.enabled && p.protocols.iter().any(|name| protocol_serves(name, client_path)))
-        .map(|p| p.key.clone())
+        .flat_map(|claim| {
+            claim.protocols.iter().map(move |protocol| {
+                oxygenrouter_plugin::EndpointClaim {
+                    plugin_key: &claim.key,
+                    protocol: &protocol.name,
+                    claim_models: &protocol.models,
+                    models: &claim.models,
+                    supports: &protocol.supports,
+                }
+            })
+        })
+        .collect();
+    oxygenrouter_plugin::EndpointIndex::build(expanded)
 }
 
-/// Whether a host protocol serves a client path.
+/// The plugin bound to one endpoint, if any.
+fn plugin_for_endpoint(
+    state: &AppState,
+    method: &str,
+    client_path: &str,
+    model: &str,
+) -> Option<oxygenrouter_plugin::ProtocolBinding> {
+    plugin_endpoint_index(state).lookup(method, client_path, model)
+}
+
+/// The model a request names, from whichever encoding it used.
 ///
-/// Matched on the path shape the protocol table declares, with the `:param`
-/// segments treated as wildcards, because that table is the contract and a
-/// second hand-written mapping would drift from it.
-fn protocol_serves(protocol: &str, client_path: &str) -> bool {
-    let Some(definition) = oxygenrouter_plugin::host_protocol(protocol) else {
-        return false;
+/// A task submission may be JSON, a URL-encoded form, or multipart, and the model
+/// is the declared field top-level in all three (`pkg/jsplugin/routing.go:38`).
+/// Reading it is the only body parsing the host does before a hook runs, which is
+/// what keeps the host out of the vendor's dialect.
+async fn request_body_model(headers: &axum::http::HeaderMap, body_bytes: &[u8]) -> Option<String> {
+    let content_type = request_content_type(headers);
+    if content_type == "multipart/form-data" {
+        let boundary = multipart_boundary(headers)?;
+        let mut multipart = multer::Multipart::new(body_stream(body_bytes), boundary);
+        while let Some(field) = multipart.next_field().await.ok()? {
+            if field.name() != Some("model") {
+                continue;
+            }
+            let data = field.bytes().await.ok()?;
+            let value = String::from_utf8(data.to_vec()).ok()?.trim().to_string();
+            return (!value.is_empty()).then_some(value);
+        }
+        return None;
+    }
+    if content_type == "application/x-www-form-urlencoded" {
+        let text = std::str::from_utf8(body_bytes).ok()?;
+        return url::form_urlencoded::parse(text.as_bytes())
+            .find(|(key, _)| key == "model")
+            .map(|(_, value)| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body_bytes).ok()?;
+    parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+}
+
+/// The one-shot byte stream a multipart parser reads.
+fn body_stream(
+    bytes: &[u8],
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + '_ {
+    futures_util::stream::once(async move { Ok(bytes::Bytes::copy_from_slice(bytes)) })
+}
+
+/// The boundary of a multipart request, without its surrounding quotes.
+fn multipart_boundary(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .split(';')
+                .skip(1)
+                .find_map(|part| part.trim().strip_prefix("boundary="))
+        })
+        .map(|value| value.trim_matches('"').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Every plugin bound to one endpoint, in binding order.
+fn plugin_candidates_for_endpoint(
+    state: &AppState,
+    method: &str,
+    client_path: &str,
+    model: &str,
+) -> Vec<oxygenrouter_plugin::ProtocolBinding> {
+    plugin_endpoint_index(state).candidates(method, client_path, model)
+}
+
+/// Whether a request body asks for one of the forms the protocol defines.
+fn body_wants(body: &serde_json::Value, key: &str) -> bool {
+    body.as_object()
+        .and_then(|_| body.get("body"))
+        .and_then(|tagged| tagged.get("value"))
+        .unwrap_or(body)
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// The content type of a request, with any parameters stripped.
+fn request_content_type(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default()
+}
+
+/// The context a plugin's hooks read, built from what the client actually sent.
+///
+/// The reference's shape is `path`, `method`, `params`, `query`, `body`,
+/// `protocol`, `operation`, `model`, `upstreamModel` and `stream`
+/// (`pkg/jsplugin/routing.go:283,342`). `body` is a tagged union so a hook can
+/// tell a JSON body from a form body from no body at all
+/// (`middleware/task_plugin.go:793`).
+#[allow(clippy::too_many_arguments)]
+async fn build_protocol_context(
+    headers: &axum::http::HeaderMap,
+    body_bytes: &[u8],
+    client_path: &str,
+    protocol: &'static str,
+    operation: &'static str,
+    model: &str,
+    upstream_model: &str,
+) -> Result<(oxygenrouter_plugin::ProtocolContext, serde_json::Value), String> {
+    let content_type = request_content_type(headers);
+    let mut request = oxygenrouter_plugin::RequestContext::new(client_path, "POST");
+    let mut stream = false;
+
+    if content_type == "multipart/form-data" {
+        let Some(boundary) = multipart_boundary(headers) else {
+            return Err("multipart request is missing its boundary".to_string());
+        };
+        let mut multipart = multer::Multipart::new(body_stream(body_bytes), boundary);
+        let mut fields = std::collections::BTreeMap::<String, Vec<String>>::new();
+        let mut files = Vec::new();
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|error| format!("multipart body could not be read: {error}"))?
+        {
+            let name = field.name().unwrap_or_default().to_string();
+            if name.is_empty() {
+                return Err("multipart part is missing a field name".to_string());
+            }
+            let filename = field.file_name().map(String::from);
+            let mime_type = field.content_type().map(|m| m.to_string()).unwrap_or_default();
+            let data = field
+                .bytes()
+                .await
+                .map_err(|error| format!("multipart field {name:?} could not be read: {error}"))?;
+            match filename {
+                // The bytes stay host-owned: a plugin gets a reference and asks
+                // for the content by name (`pkg/jsplugin/routing.go:248`).
+                Some(filename) => {
+                    let index = fields.get(&name).map(Vec::len).unwrap_or(0);
+                    files.push(oxygenrouter_plugin::BodyFile {
+                        reference: oxygenrouter_plugin::file_reference(&name, index),
+                        field: name.clone(),
+                        filename,
+                        mime_type,
+                        size: data.len() as u64,
+                    });
+                }
+                None => {
+                    let text = String::from_utf8(data.to_vec())
+                        .map_err(|_| format!("multipart field {name:?} must be valid UTF-8"))?;
+                    fields.entry(name).or_default().push(text);
+                }
+            }
+        }
+        // A multipart form carries its text fields in the tagged body alongside
+        // the file references (`middleware/task_plugin.go:955`).
+        // A multipart form carries its text fields in the tagged body
+        // alongside the file references (`middleware/task_plugin.go:955`).
+        request = request.with_multipart(fields, files);
+    } else if content_type == "application/x-www-form-urlencoded" {
+        let text = String::from_utf8(body_bytes.to_vec())
+            .map_err(|_| "form body must be valid UTF-8".to_string())?;
+        let mut fields = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for (key, value) in url::form_urlencoded::parse(text.as_bytes()) {
+            fields.entry(key.into_owned()).or_default().push(value.into_owned());
+        }
+        request = request.with_form(fields);
+    } else {
+        // JSON is the default, as it is for every OpenAI-compatible endpoint. An
+        // empty body is "none" rather than an empty object, so a hook can tell
+        // the two apart.
+        if body_bytes.is_empty() {
+            request = oxygenrouter_plugin::RequestContext::new(client_path, "POST");
+        } else {
+            let parsed: serde_json::Value = serde_json::from_slice(body_bytes)
+                .map_err(|error| format!("request body must be JSON: {error}"))?;
+            stream = body_wants(&parsed, "stream");
+            request = request.with_json(parsed);
+        }
+    }
+
+    let context = oxygenrouter_plugin::ProtocolContext {
+        request,
+        protocol,
+        operation,
+        model: model.to_string(),
+        upstream_model: upstream_model.to_string(),
+        stream,
     };
-    definition.operations.iter().any(|operation| {
-        let pattern: Vec<&str> = operation.path.split('/').collect();
-        let actual: Vec<&str> = client_path.split('/').collect();
-        pattern.len() == actual.len()
-            && pattern
-                .iter()
-                .zip(actual.iter())
-                .all(|(want, got)| want.starts_with(':') || want == got)
-    })
+    let value = context.js_value();
+    Ok((context, value))
+}
+
+/// What a plugin-backed endpoint is called for, once a binding is known.
+struct PluginInvocation<'a> {
+    binding: &'a oxygenrouter_plugin::ProtocolBinding,
+    headers: &'a axum::http::HeaderMap,
+    body: &'a [u8],
 }
 
 /// Run one plugin-backed request: decode, dispatch, render.
@@ -1069,45 +1296,86 @@ fn protocol_serves(protocol: &str, client_path: &str) -> bool {
 /// This is what makes a plugin a *bridge* rather than a filter. The plugin states
 /// the upstream request through `decodeRequest`; the host dispatches exactly that
 /// to the selected channel; the plugin renders the result back into the shape the
-/// client asked for through `renderFinal`. Nothing about the client's dialect is
-/// interpreted here, which is the point: it is how the Responses API can be served
-/// with its own streaming semantics instead of a fixed adapter's approximation.
+/// client asked for. Nothing about the client's dialect is interpreted here, which
+/// is the point: it is how the Responses API can be served with its own semantics
+/// instead of a fixed adapter's approximation.
+///
+/// The render half is **not implemented yet**, and that is enforced rather than
+/// approximated. Every protocol the host serves is `fetchMode: per_task`: the
+/// decode step produces a *task submission*, the host has to persist the task,
+/// poll it to a terminal state, and only then is there a task view for the plugin
+/// to render (`controller/plugin_protocol.go:925`, `plugin_protocol_image.go:125`).
+/// This instance has no task store, so the host refuses the request with a reason
+/// it can stand behind instead of dispatching an upstream call whose result it
+/// could neither settle nor shape.
 async fn plugin_bridge(
     state: std::sync::Arc<AppState>,
-    plugin_key: &str,
-    protocol: &str,
-    headers: axum::http::HeaderMap,
-    body_bytes: Vec<u8>,
+    invocation: PluginInvocation<'_>,
     client_path: &str,
 ) -> Response {
-    let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(error) => {
+    let binding = invocation.binding.clone();
+    let protocol = binding.protocol;
+    let plugin_key = binding.plugin_key.clone();
+
+    let (_, context_value) = match build_protocol_context(
+        invocation.headers,
+        invocation.body,
+        client_path,
+        protocol,
+        binding.operation.name,
+        &binding.model,
+        "",
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(reason) => return json_error(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    // Which request form this request needs, and whether the plugin that owns the
+    // endpoint declared it. A plugin that never claimed `stream` must not be
+    // handed a streaming request: it would return a non-streaming payload that the
+    // host then has no way to frame (`middleware/task_plugin.go:382`).
+    let wants_stream = context_value
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let wants_background = body_wants(&context_value, "background");
+    // Only a protocol that *defines* request forms can be checked against them.
+    // A mode-less protocol (the synchronous image API) has nothing to declare, so
+    // demanding `sync` of it would refuse every request it exists to serve
+    // (`middleware/task_plugin.go:382`).
+    let protocol_has_modes = oxygenrouter_plugin::host_protocol(protocol)
+        .map(oxygenrouter_plugin::protocol_has_modes)
+        .unwrap_or(false);
+    for mode in oxygenrouter_plugin::required_modes(wants_stream, wants_background)
+        .into_iter()
+        .filter(|_| protocol_has_modes)
+    {
+        if !binding.supports_mode(mode) {
+            let candidates = plugin_candidates_for_endpoint(
+                &state,
+                "POST",
+                client_path,
+                &binding.model,
+            );
             return json_error(
                 StatusCode::BAD_REQUEST,
-                &format!("plugin-bridged request must be JSON: {error}"),
-            )
+                &oxygenrouter_plugin::unsupported_form_message(
+                    &candidates,
+                    protocol,
+                    wants_stream,
+                    wants_background,
+                ),
+            );
         }
-    };
-    // The context a plugin sees is the canonical request view the reference
-    // exposes (`RouteRequestContext`, `pkg/jsplugin/routing.go:283`): what the
-    // client sent, not an interpretation of it.
-    let ctx = serde_json::json!({
-        "path": client_path,
-        "method": "POST",
-        "query": {},
-        "params": {},
-        "body": parsed.clone(),
-    });
-    let client_model = parsed
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    }
 
+    // Decode first: the plugin decides what goes upstream, and a decode that
+    // fails is reported as the plugin's fault rather than the upstream's.
     let decoded = match state
         .plugins
-        .decode_request(protocol, ctx.clone(), PLUGIN_TIMEOUT)
+        .decode_request(protocol, context_value.clone(), PLUGIN_TIMEOUT)
         .await
     {
         Ok(value) => value,
@@ -1124,16 +1392,30 @@ async fn plugin_bridge(
     // comes back. A decoder that changes the model would silently route the
     // request to a different upstream than the caller asked for and was quoted
     // for; a decoder that returns a renderer would choose the *response* shape
-    // from the request side, where the caller can influence it.
+    // from the request side, where the caller can influence it
+    // (`relay/channel/task/jsplugin/adaptor.go:103,106`).
+    // The decoder must name the model it resolved, and it must be the one this
+    // endpoint serves. A decoder that stays silent about the model would let the
+    // host dispatch a request whose quota was quoted for a different one; a
+    // decoder that renames it would route the request somewhere the caller never
+    // asked for (`middleware/task_plugin.go:640,643`).
     let decoded_model = decoded
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !client_model.is_empty() && decoded_model != client_model {
+        .map(str::trim)
+        .unwrap_or("");
+    if decoded_model.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("plugin {plugin_key:?} decoded request is missing a model"),
+        );
+    }
+    if decoded_model != binding.model {
         return json_error(
             StatusCode::BAD_REQUEST,
             &format!(
-                "plugin {plugin_key:?} decoded model {decoded_model:?}, but the request asked for {client_model:?}"
+                "plugin {plugin_key:?} decoded model {decoded_model:?}, but the endpoint serves {:?}",
+                binding.model
             ),
         );
     }
@@ -1144,86 +1426,32 @@ async fn plugin_bridge(
         );
     }
 
-    // `requestBody` is what the plugin states should go upstream; `action` names
-    // a sub-operation the plugin wants. Both are optional, and when no request
-    // body is given the client's own body is forwarded unchanged rather than an
-    // empty one, because "the plugin had nothing to add" is not "send nothing".
-    let upstream_body = decoded
-        .get("requestBody")
-        .map(|v| serde_json::to_vec(v).unwrap_or_else(|_| body_bytes.clone()))
-        .unwrap_or_else(|| body_bytes.clone());
-    let action = decoded.get("action").and_then(|v| v.as_str()).map(String::from);
-    let upstream_path = action
-        .as_deref()
-        .filter(|a| !a.trim().is_empty())
-        .map(|a| format!("{client_path}/{a}"))
-        .unwrap_or_else(|| client_path.to_string());
-    let model = if decoded_model.is_empty() {
-        client_model
-    } else {
-        decoded_model.to_string()
-    };
-
-    // The plugin decided the request; the ordinary relay path performs it, so
-    // channel selection, retries, billing, limits and logging all still apply.
-    let response = relay_passthrough(
-        state.clone(),
-        "POST",
-        client_path,
-        &upstream_path,
-        upstream_body,
-        headers,
-        &model,
-    )
-    .await;
-
-    // A failure is passed through untouched: rendering a plugin-specific error
-    // shape over an upstream error would hide the reason the request failed, and
-    // the status the relay chose (429 for a limit, 502 for an upstream fault) is
-    // the one the client should act on.
-    if !response.status().is_success() {
-        return response;
+    let kind = decoded.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "submit" {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "plugin {plugin_key:?} decodeRequest must return kind \"submit\"; it returned {kind:?}"
+            ),
+        );
     }
-    let (parts, body) = response.into_parts();
-    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(error) => {
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("reading the upstream response failed: {error}"),
-            )
-        }
-    };
-    let upstream_value: serde_json::Value =
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
 
-    match state
-        .plugins
-        .render_final(protocol, ctx, upstream_value, PLUGIN_TIMEOUT)
-        .await
-    {
-        Ok(rendered) => {
-            // Status and headers from the relay are kept; only the body is the
-            // plugin's, because the plugin renders a payload, not a transport
-            // outcome.
-            let mut builder = Response::builder().status(parts.status);
-            for (name, value) in parts.headers.iter() {
-                builder = builder.header(name, value);
-            }
-            builder
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&rendered).unwrap_or_else(|_| b"null".to_vec()),
-                ))
-                .unwrap_or_else(|_| error_500())
-        }
-        Err(error) => json_error(
-            StatusCode::BAD_GATEWAY,
-            &format!("plugin {plugin_key:?} could not render the response: {error}"),
+    // The task subsystem the render half needs does not exist yet. Naming it here
+    // keeps the gap visible in production logs and in the console's error, rather
+    // than looking like an upstream fault.
+    let _ = state;
+    let _ = binding.operation.render_hook;
+    json_error(
+        StatusCode::NOT_IMPLEMENTED,
+        &format!(
+            "plugin {plugin_key:?} serves {protocol} through the task bridge, which this instance \
+             does not implement yet: the request decoded correctly, but there is no task store to \
+             persist, poll or settle the upstream work, and no task view to render the response from"
         ),
-    }
+    )
 }
 
-/// Render a limit rejection in the OpenAI error shape.
+/// Render a limit rejection in the OpenAI error shape./// Render a limit rejection in the OpenAI error shape.
 fn limit_error_response(error: oxygenrouter_proxy::limits::LimitError) -> Response {
     let message = match error {
         oxygenrouter_proxy::limits::LimitError::RateLimited { retry_after_secs } => {
@@ -1881,16 +2109,22 @@ async fn responses_endpoint(
     request: Request,
 ) -> Response {
     let (headers, body_bytes) = read_body(request).await;
-    // A plugin claiming this protocol takes the request, because only a plugin
-    // can render the Responses API's own semantics; without one the ordinary
-    // OpenAI-compatible dispatch answers, so the endpoint works either way.
-    if let Some(key) = plugin_for_path(&state, "/v1/responses") {
+    // A plugin bound to this endpoint and model takes the request, because only a
+    // plugin can render the Responses API's own semantics; without one the
+    // ordinary OpenAI-compatible dispatch answers, so the endpoint works either
+    // way.
+    let model = request_body_model(&headers, &body_bytes).await;
+    if let Some(binding) = model
+        .as_deref()
+        .and_then(|model| plugin_for_endpoint(&state, "POST", "/v1/responses", model))
+    {
         return plugin_bridge(
             state,
-            &key,
-            "openai_responses",
-            headers,
-            body_bytes,
+            PluginInvocation {
+                binding: &binding,
+                headers: &headers,
+                body: &body_bytes,
+            },
             "/v1/responses",
         )
         .await;
@@ -1979,6 +2213,24 @@ async fn audio_translation(
 
 async fn image_edits(State(state): State<std::sync::Arc<AppState>>, request: Request) -> Response {
     let (headers, body_bytes) = read_body(request).await;
+    // An edit may be multipart, in which case the model is a form field rather
+    // than a JSON one; `request_body_model` reads all three encodings.
+    let model = request_body_model(&headers, &body_bytes).await;
+    if let Some(binding) = model
+        .as_deref()
+        .and_then(|model| plugin_for_endpoint(&state, "POST", "/v1/images/edits", model))
+    {
+        return plugin_bridge(
+            state,
+            PluginInvocation {
+                binding: &binding,
+                headers: &headers,
+                body: &body_bytes,
+            },
+            "/v1/images/edits",
+        )
+        .await;
+    }
     dispatch_openai(
         state,
         "/v1/images/edits",
@@ -2384,35 +2636,215 @@ mod tests {
         ));
     }
 
-    /// Which endpoint a plugin's protocol claim covers. Matched against the host
-    /// protocol table rather than a second hand-written list, so a `:param`
-    /// segment is a wildcard and the two cannot drift apart.
+    /// Which endpoint a plugin owns, and for which model.
+    ///
+    /// Matched on the host's protocol table with the `:param` segments treated as
+    /// wildcards, because that table is the contract and a second hand-written
+    /// mapping would drift from it. The model matters as much as the path: two
+    /// plugins may share an endpoint while owning different models
+    /// (`pkg/jsplugin/routing.go:994`).
     #[test]
-    fn a_protocol_claim_matches_the_paths_its_operations_declare() {
-        assert!(protocol_serves("openai_responses", "/v1/responses"));
-        // The retrieve operation's `:response_id` is a wildcard.
-        assert!(protocol_serves("openai_responses", "/v1/responses/resp_123"));
-        // A different path, an unknown protocol and a near-miss all miss.
-        assert!(!protocol_serves("openai_responses", "/v1/chat/completions"));
-        assert!(!protocol_serves("openai_responses", "/v1/responses/extra/segments"));
-        assert!(!protocol_serves("made_up", "/v1/responses"));
-        // Prefix matching must not leak: `/v1/responsesX` is not the endpoint.
-        assert!(!protocol_serves("openai_responses", "/v1/responsesX"));
+    fn a_binding_is_looked_up_by_method_path_and_model() {
+        use oxygenrouter_plugin::{EndpointClaim, EndpointIndex};
+
+        let models: Vec<String> = vec!["acme-large".into()];
+        let index = EndpointIndex::build([EndpointClaim {
+            plugin_key: "acme",
+            protocol: "openai_responses",
+            claim_models: &[],
+            models: &models,
+            supports: &[],
+        }]);
+
+        assert!(index.lookup("POST", "/v1/responses", "acme-large").is_some());
+        // The path alone chooses nothing: the model has to be the one bound.
+        assert!(index.lookup("POST", "/v1/responses", "someone-elses-model").is_none());
+        // A different method, and a different endpoint, both miss.
+        assert!(index.lookup("GET", "/v1/responses", "acme-large").is_none());
+        assert!(index.lookup("POST", "/v1/chat/completions", "acme-large").is_none());
     }
 
+    /// A video *submission* is bound to a plugin, but the video *retrieve* and
+    /// *content* operations are not: the host answers those from its task store,
+    /// which is why they declare no model field (`pkg/jsplugin/routing.go:94,989`).
     #[test]
-    fn a_non_gemini_passthrough_falls_back_to_the_body_flag() {
-        let body = serde_json::json!({"stream": true});
-        assert!(passthrough_wants_stream(
-            &axum::http::HeaderMap::new(),
-            &body,
-            "/v1/files"
-        ));
-        let buffered = serde_json::json!({"stream": false});
-        assert!(!passthrough_wants_stream(
-            &headers_with_accept("text/event-stream"),
-            &buffered,
-            "/v1/files"
-        ));
+    fn host_answered_operations_are_not_bound_to_a_plugin() {
+        use oxygenrouter_plugin::{EndpointClaim, EndpointIndex};
+
+        let models: Vec<String> = vec!["wan-video".into()];
+        let index = EndpointIndex::build([EndpointClaim {
+            plugin_key: "alibaba",
+            protocol: "openai_video",
+            claim_models: &[],
+            models: &models,
+            supports: &[],
+        }]);
+
+        assert!(index.lookup("POST", "/v1/videos", "wan-video").is_some());
+        assert!(index.lookup("GET", "/v1/videos/task_1", "wan-video").is_none());
+        assert!(
+            index
+                .lookup("GET", "/v1/videos/task_1/content", "wan-video")
+                .is_none()
+        );
+    }
+
+    /// The context a plugin's `decodeRequest` reads is the reference's shape, and
+    /// the body is tagged so a hook can tell encodings apart
+    /// (`pkg/jsplugin/routing.go:293`, `middleware/task_plugin.go:793`).
+    #[tokio::test]
+    async fn the_protocol_context_is_built_from_what_the_client_sent() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let body = br#"{"model":"acme-large","input":"hi","stream":true}"#;
+        let (context, value) = build_protocol_context(
+            &headers,
+            body,
+            "/v1/responses",
+            "openai_responses",
+            "create",
+            "acme-large",
+            "",
+        )
+        .await
+        .expect("context");
+
+        assert_eq!(value["protocol"], "openai_responses");
+        assert_eq!(value["operation"], "create");
+        assert_eq!(value["model"], "acme-large");
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["body"]["kind"], "json");
+        assert_eq!(value["body"]["value"]["input"], "hi");
+        assert!(context.stream);
+
+        // A form body declares itself and keeps its fields.
+        let mut form_headers = axum::http::HeaderMap::new();
+        form_headers.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let (_, form) = build_protocol_context(
+            &form_headers,
+            b"model=acme-large&prompt=a+cat",
+            "/v1/images/edits",
+            "openai_image",
+            "edit",
+            "acme-large",
+            "",
+        )
+        .await
+        .expect("form context");
+        assert_eq!(form["body"]["kind"], "form");
+        assert_eq!(form["body"]["fields"]["prompt"][0], "a cat");
+        assert_eq!(form["stream"], false);
+
+        // An empty body is "none", not an empty object.
+        let (_, empty) = build_protocol_context(
+            &headers,
+            b"",
+            "/v1/images/generations",
+            "openai_image",
+            "generate",
+            "acme-large",
+            "",
+        )
+        .await
+        .expect("empty context");
+        assert_eq!(empty["body"]["kind"], "none");
+
+        // Malformed JSON is refused rather than silently treated as empty.
+        assert!(build_protocol_context(
+            &headers,
+            b"{not json",
+            "/v1/responses",
+            "openai_responses",
+            "create",
+            "acme-large",
+            "",
+        )
+        .await
+        .is_err());
+    }
+
+    /// A multipart body yields text fields and file *references*; the bytes stay
+    /// host-owned (`pkg/jsplugin/routing.go:248`).
+    #[tokio::test]
+    async fn a_multipart_body_carries_file_references_not_bytes() {
+        let boundary = "XBOUNDARYX";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nacme-large\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\na cat\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"cat.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGBYTES\r\n--{boundary}--\r\n"
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
+                .expect("header"),
+        );
+
+        let (_, value) = build_protocol_context(
+            &headers,
+            body.as_bytes(),
+            "/v1/images/edits",
+            "openai_image",
+            "edit",
+            "acme-large",
+            "",
+        )
+        .await
+        .expect("multipart context");
+
+        assert_eq!(value["body"]["kind"], "multipart");
+        assert_eq!(value["body"]["fields"]["model"][0], "acme-large");
+        assert_eq!(value["body"]["files"][0]["ref"], "request_file:image[]");
+        assert_eq!(value["body"]["files"][0]["filename"], "cat.png");
+        assert_eq!(value["body"]["files"][0]["mimeType"], "image/png");
+        // The bytes are not in the context at all.
+        let rendered = value.to_string();
+        assert!(!rendered.contains("PNGBYTES"), "{rendered}");
+
+        // The model is readable from the multipart body, which is how the host
+        // finds the binding before any hook runs.
+        assert_eq!(
+            request_body_model(&headers, body.as_bytes()).await.as_deref(),
+            Some("acme-large")
+        );
+    }
+
+    /// A plugin bound to an endpoint must have claimed the request form the
+    /// request needs, and the refusal names both sides
+    /// (`middleware/task_plugin.go:382,412`).
+    #[tokio::test]
+    async fn a_request_form_the_plugin_did_not_claim_is_refused_by_name() {
+        let mode_less = oxygenrouter_plugin::required_modes(false, false);
+        assert_eq!(mode_less, vec!["sync"]);
+        assert_eq!(
+            oxygenrouter_plugin::required_modes(true, false),
+            vec!["stream"]
+        );
+
+        let models: Vec<String> = vec!["acme".into()];
+        let index = oxygenrouter_plugin::EndpointIndex::build([
+            oxygenrouter_plugin::EndpointClaim {
+                plugin_key: "streamer",
+                protocol: "openai_responses",
+                claim_models: &[],
+                models: &models,
+                supports: &["stream".to_string()],
+            },
+        ]);
+        let candidates = index.candidates("POST", "/v1/responses", "acme");
+        assert!(candidates[0].supports_mode("stream"));
+        assert!(!candidates[0].supports_mode("sync"));
+
+        let message =
+            oxygenrouter_plugin::unsupported_form_message(&candidates, "openai_responses", false, false);
+        assert!(message.contains("synchronous"), "{message}");
+        assert!(message.contains("\"stream\""), "{message}");
     }
 }
