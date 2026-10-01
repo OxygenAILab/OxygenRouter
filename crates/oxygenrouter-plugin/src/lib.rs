@@ -31,6 +31,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+mod routing;
+
+pub use routing::{
+    endpoint_index_key, file_reference, normalize_route_method, normalize_route_path,
+    protocol_has_modes, required_modes, unsupported_form_message, BodyFile, BodyKind,
+    EndpointClaim, EndpointIndex, ProtocolBinding, ProtocolContext, RequestContext,
+};
+
 /// The manifest API version this host understands.
 ///
 /// Mirrors the reference's `APIVersion1` (`pkg/jsplugin/registry.go:29`), so a
@@ -70,7 +78,7 @@ pub enum PluginError {
 ///
 /// The reference groups hooks under named "modes" (`pkg/jsplugin/registry.go`),
 /// so a mode says which platform it serves and which hook it implements.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginMode {
     pub name: String,
     /// Which hook this mode implements, e.g. `convertRequest`.
@@ -94,6 +102,21 @@ pub struct PluginManifest {
     pub version: String,
     #[serde(default)]
     pub description: String,
+    /// The models this plugin serves. Required, and at least one, because a
+    /// binding names the model it serves: a plugin that declares none is bound
+    /// to no endpoint at all (`pkg/jsplugin/registry.go:1287`).
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// How the host collects this plugin's upstream work: `per_task` (one poll
+    /// per task) or `batch` (`pkg/jsplugin/registry.go:1284`). Required, because
+    /// the two demand different hooks, but read leniently so a manifest that
+    /// omits it gets the reference's own message rather than a serde error.
+    #[serde(rename = "fetchMode", default)]
+    pub fetch_mode: String,
+    /// Who wrote it. The name is required, and the reference's fixtures always
+    /// carry one (`pkg/jsplugin/registry.go:1257`).
+    #[serde(default)]
+    pub author: PluginAuthor,
     #[serde(default)]
     pub modes: Vec<PluginMode>,
     /// Protocols this plugin claims to serve. Validated against the host's table
@@ -102,9 +125,25 @@ pub struct PluginManifest {
     pub protocols: Vec<ProtocolClaim>,
 }
 
+/// A plugin's author, as the reference models it (`pkg/jsplugin/registry.go:177`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginAuthor {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// The `fetchMode` values a manifest may declare.
+pub const FETCH_MODE_PER_TASK: &str = "per_task";
+pub const FETCH_MODE_BATCH: &str = "batch";
+
 impl PluginManifest {
     /// Validate the fields the host relies on.
     fn validate(&self) -> Result<(), PluginError> {
+        // The reference asks this first, before any other field
+        // (`pkg/jsplugin/registry.go:1233`), so a manifest written for another
+        // host is told what this host speaks rather than what it left out.
         if self.api_version != API_VERSION_1 {
             return Err(PluginError::UnsupportedApiVersion {
                 found: self.api_version,
@@ -113,6 +152,21 @@ impl PluginManifest {
         }
         if !valid_key(&self.key) {
             return Err(PluginError::BadKey(self.key.clone()));
+        }
+        if self.models.iter().all(|model| model.trim().is_empty()) {
+            return Err(PluginError::Load(
+                "plugin meta models must contain at least one model".to_string(),
+            ));
+        }
+        if self.fetch_mode != FETCH_MODE_PER_TASK && self.fetch_mode != FETCH_MODE_BATCH {
+            return Err(PluginError::Load(
+                "plugin meta fetchMode must be per_task or batch".to_string(),
+            ));
+        }
+        if self.author.name.trim().is_empty() {
+            return Err(PluginError::Load(
+                "plugin meta author name is required".to_string(),
+            ));
         }
         Ok(())
     }
@@ -979,7 +1033,7 @@ pub struct ProtocolMode {
 /// operation is what a plugin is contracted to implement: to serve
 /// `POST /v1/responses` a plugin must export the members listed here plus the
 /// hook for whichever request forms it claims.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostOperation {
     pub name: &'static str,
     /// The HTTP methods this operation answers. Two entries where the
@@ -992,6 +1046,13 @@ pub struct HostOperation {
     /// refused the way the reference refuses it
     /// (`middleware/task_plugin.go:575`).
     pub body_kinds: &'static [&'static str],
+    /// The body field naming the model this endpoint serves, or empty when the
+    /// host answers the operation itself.
+    ///
+    /// An operation with no model field is not bound to any plugin: retrieval
+    /// reads a task the host already recorded, so there is no model to choose by
+    /// (`pkg/jsplugin/routing.go:989`).
+    pub model_field: &'static str,
     /// Members every plugin serving this operation must export, whatever forms
     /// it claims.
     pub required_members: &'static [&'static str],
@@ -1009,7 +1070,7 @@ pub struct HostOperation {
 }
 
 /// A client-facing protocol the host knows how to serve from a plugin.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostProtocol {
     pub name: &'static str,
     pub operations: &'static [HostOperation],
@@ -1060,6 +1121,7 @@ pub const HOST_PROTOCOLS: &[HostProtocol] = &[
                 path: "/v1/responses",
                 body_kinds: &[BODY_JSON],
                 required_members: &["decodeRequest"],
+                model_field: "model",
                 modes: &[
                     ProtocolMode {
                         name: "stream",
@@ -1087,6 +1149,7 @@ pub const HOST_PROTOCOLS: &[HostProtocol] = &[
                 path: "/v1/responses/:response_id",
                 body_kinds: &[BODY_NONE],
                 required_members: &[],
+                model_field: "",
                 modes: &[],
                 required_driver_hooks: &[],
                 render_hook: None,
@@ -1102,6 +1165,7 @@ pub const HOST_PROTOCOLS: &[HostProtocol] = &[
                 path: "/v1/videos",
                 body_kinds: &[BODY_JSON, BODY_MULTIPART],
                 required_members: &["decodeRequest"],
+                model_field: "model",
                 modes: &[],
                 required_driver_hooks: &[],
                 render_hook: None,
@@ -1112,6 +1176,7 @@ pub const HOST_PROTOCOLS: &[HostProtocol] = &[
                 path: "/v1/videos/:task_id",
                 body_kinds: &[BODY_NONE],
                 required_members: &["render"],
+                model_field: "",
                 modes: &[],
                 required_driver_hooks: &[],
                 render_hook: Some("render"),
@@ -1124,6 +1189,7 @@ pub const HOST_PROTOCOLS: &[HostProtocol] = &[
                 required_members: &[],
                 modes: &[],
                 required_driver_hooks: &["listArtifacts", "buildContentRequest"],
+                model_field: "",
                 render_hook: None,
             },
         ],
@@ -1136,6 +1202,7 @@ pub const HOST_PROTOCOLS: &[HostProtocol] = &[
                 methods: &["POST"],
                 path: "/v1/images/generations",
                 body_kinds: &[BODY_JSON],
+                model_field: "model",
                 // Both members are required whatever the plugin claims: without
                 // a decoder there is no request to send, and without a renderer
                 // there is no answer to return. There are no modes here, so
@@ -1151,6 +1218,7 @@ pub const HOST_PROTOCOLS: &[HostProtocol] = &[
                 path: "/v1/images/edits",
                 body_kinds: &[BODY_JSON, BODY_MULTIPART],
                 required_members: &["decodeRequest", "render"],
+                model_field: "model",
                 modes: &[],
                 required_driver_hooks: &[],
                 render_hook: Some("render"),
@@ -2022,6 +2090,9 @@ export function parseTaskResult() {{ return {{}}; }}
             name: "Demo Plugin",
             version: "1.0.0",
             description: "renders a fixed reply",
+            author: { name: "Test" },
+            models: ["acme-large"],
+            fetchMode: "per_task",
             protocols: [{ name: "openai_responses", supports: ["sync"] }]
         };
         export const protocols = {
@@ -2040,6 +2111,7 @@ export function parseTaskResult() {{ return {{}}; }}
     /// It costs nothing to support and is a reasonable thing to write.
     const SCRIPT_FORM: &str = r#"
         register({apiVersion:1, key:"scripted", name:"Scripted", version:"1.0.0",
+            author:{name:"Test"}, models:["acme-large"], fetchMode:"per_task",
             protocols:[{name:"openai_responses", supports:["sync"]}]});
         var protocols = { openai_responses: {
             decodeRequest: function (ctx) { return ctx; },
@@ -2195,6 +2267,7 @@ export function parseTaskResult() {{ return {{}}; }}
         runtime().block_on(async {
             const MISSING: &str = r#"
                 export const meta = { apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-large"], fetchMode:"per_task",
                     protocols:[{name:"openai_responses", supports:["stream"]}] };
                 export const protocols = { openai_responses: {
                     decodeRequest: function (ctx) { return ctx; }
@@ -2202,11 +2275,13 @@ export function parseTaskResult() {{ return {{}}; }}
             "#;
             const UNKNOWN: &str = r#"
                 export const meta = { apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-large"], fetchMode:"per_task",
                     protocols:[{name:"made_up", supports:["stream"]}] };
                 export const protocols = { made_up: { decodeRequest: function(){return {};} } };
             "#;
             const NO_SUPPORTS: &str = r#"
                 export const meta = { apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-large"], fetchMode:"per_task",
                     protocols:[{name:"openai_responses", supports:[]}] };
                 export const protocols = { openai_responses: { decodeRequest: function(){return {};} } };
             "#;
@@ -2235,7 +2310,7 @@ export function parseTaskResult() {{ return {{}}; }}
         let host = PluginHost::start();
         runtime().block_on(async {
             let old = r#"
-                export const meta = { apiVersion: 7, key:"old", name:"Old", version:"1.0.0" };
+                export const meta = { apiVersion: 7, key:"old", name:"Old", version:"1.0.0", author:{name:"Test"}, models:["m"], fetchMode:"per_task" };
                 export const protocols = {};
             "#;
             let error = host
@@ -2287,6 +2362,7 @@ export function parseTaskResult() {{ return {{}}; }}
         runtime().block_on(async {
             const SPINNING: &str = r#"
                 export const meta = { apiVersion:1, key:"spin", name:"Spin", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-large"], fetchMode:"per_task",
                     protocols:[{name:"openai_responses", supports:["sync"]}] };
                 export const protocols = { openai_responses: {
                     decodeRequest: function () { while (true) {} },

@@ -355,6 +355,31 @@ pub struct PluginSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One endpoint claim an enabled plugin makes, flattened for the routing index.
+///
+/// The index is keyed by `method + path + model`, so a plugin that shares an
+/// endpoint with another but declares a different model set still binds only the
+/// models it claimed (`pkg/jsplugin/routing.go:994`). Reading the claims here
+/// rather than from the manifest at request time keeps the routing decision out
+/// of JSON parsing on the hot path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginClaim {
+    pub key: String,
+    /// Every model the plugin declares.
+    pub models: Vec<String>,
+    pub protocols: Vec<PluginProtocolClaim>,
+}
+
+/// One protocol a plugin claims, with the narrowing it declared.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginProtocolClaim {
+    pub name: String,
+    /// Models this claim is narrowed to; empty means every declared model.
+    pub models: Vec<String>,
+    /// The request forms the claim declares. Empty for a mode-less protocol.
+    pub supports: Vec<String>,
+}
+
 /// One administrative action, recorded for accountability.
 ///
 /// The console has always offered `AuditLogEnabled` with the description

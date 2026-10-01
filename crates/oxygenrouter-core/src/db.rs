@@ -1288,6 +1288,52 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
         .unwrap_or_default()
 }
 
+    /// The protocols a stored manifest claims, with the narrowing each declared.
+    ///
+    /// A bare name claims every declared model and no request forms; the object
+    /// form narrows either (`pkg/jsplugin/routing_test.go:111,124`).
+    pub(crate) fn claimed_protocol_details(
+        manifest: &serde_json::Value,
+    ) -> Vec<crate::PluginProtocolClaim> {
+        manifest
+            .get("protocols")
+            .and_then(|v| v.as_array())
+            .map(|claims| {
+                claims
+                    .iter()
+                    .filter_map(|claim| match claim {
+                        serde_json::Value::String(name) => Some(crate::PluginProtocolClaim {
+                            name: name.clone(),
+                            models: Vec::new(),
+                            supports: Vec::new(),
+                        }),
+                        serde_json::Value::Object(_) => {
+                            let name = claim.get("name")?.as_str()?.to_string();
+                            let strings = |field: &str| -> Vec<String> {
+                                claim
+                                    .get(field)
+                                    .and_then(|v| v.as_array())
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(|m| m.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            Some(crate::PluginProtocolClaim {
+                                name,
+                                models: strings("models"),
+                                supports: strings("supports"),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Every plugin the instance knows about, for the console listing.
     ///
     /// The keys come from the union of versions and state, so a plugin uploaded
@@ -1371,6 +1417,46 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
                     .map(Self::claimed_protocol_names)
                     .unwrap_or_default(),
                 updated_at: state.map(|s| s.updated_at).unwrap_or_else(Utc::now),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The endpoint claims of every enabled plugin, for the routing index.
+    ///
+    /// Only an enabled plugin with an active build counts: an installed plugin
+    /// must not affect traffic, and a plugin with no active version has nothing
+    /// to call.
+    pub fn list_enabled_plugin_claims(&self) -> SqliteResult<Vec<crate::PluginClaim>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT s.key, v.manifest FROM plugin_state s
+               JOIN plugin_versions v ON v.key = s.key AND v.version = s.active_version
+              WHERE s.enabled = 1",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, manifest_text) = row?;
+            let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_text) else {
+                continue;
+            };
+            let models: Vec<String> = manifest
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|m| m.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(crate::PluginClaim {
+                key,
+                models,
+                protocols: Self::claimed_protocol_details(&manifest),
             });
         }
         Ok(out)
