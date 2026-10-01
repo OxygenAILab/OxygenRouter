@@ -407,6 +407,216 @@ pub async fn interpret_task_result(
     })
 }
 
+/// A task as the poller needs to see it.
+///
+/// Deliberately its own shape rather than a borrow of the stored record: the
+/// plugin crate cannot depend on the store, and the poller only needs these
+/// fields to build a query and to know what state it is comparing and setting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PollTask {
+    /// The public id, which is what a settlement is recorded against.
+    pub task_id: String,
+    /// The status the caller read. Completion is a compare-and-set against it, so
+    /// a second finisher loses the race instead of settling twice.
+    pub status: String,
+    /// The id the upstream knows, which is what a query addresses.
+    pub upstream_task_id: String,
+    pub action: String,
+    pub model: String,
+    pub upstream_model: String,
+    /// When the task was created, which is the clock the timeout measures.
+    pub created_at: i64,
+    /// The plugin's own persisted data, handed back on every poll.
+    pub data: serde_json::Value,
+    /// The opaque state the plugin asked the host to keep.
+    pub state: serde_json::Value,
+}
+
+/// What one poll round produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollRound {
+    /// Still running; the progress was updated.
+    Continued,
+    /// A terminal status; settle the quota.
+    Settled,
+    /// The upstream does not know the task, or it outlived its budget. It is a
+    /// failure, so it refunds.
+    Failed,
+    /// The poll itself failed; the task is untouched and will be polled again.
+    Retried,
+    /// The answer is not something the host can act on; the task is untouched and
+    /// an operator should look.
+    Refused,
+}
+
+/// What a poll round asks the caller to store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PollSettlement {
+    pub task_id: String,
+    /// The status the caller read, so it can compare-and-set against it.
+    pub expected_status: String,
+    /// The new status, or `None` when the poll changed nothing.
+    pub status: Option<String>,
+    pub progress: Option<String>,
+    pub reason: Option<String>,
+    /// The plugin's updated opaque state, when it asked the host to keep one.
+    pub plugin_state: Option<serde_json::Value>,
+    /// What the quota should do. `None` means "leave it alone for now".
+    pub settle: Option<crate::SettlePlan>,
+    pub round: PollRound,
+}
+
+impl PollSettlement {
+    fn untouched(task: &PollTask, round: PollRound, reason: String) -> Self {
+        PollSettlement {
+            task_id: task.task_id.clone(),
+            expected_status: task.status.clone(),
+            status: None,
+            progress: None,
+            reason: Some(reason),
+            plugin_state: None,
+            settle: None,
+            round,
+        }
+    }
+}
+
+/// Run one poll round for one task and report what should be stored.
+///
+/// The caller owns the CAS and the money; this decides *what* to do, which is the
+/// part with the invariants in it. It never retries on its own: a backlog is
+/// drained by calling this once per task per tick, so a slow upstream cannot make
+/// one request hold a worker.
+pub async fn poll_once(
+    host: &PluginHost,
+    transport: &dyn TaskTransport,
+    context: &TaskFlowContext,
+    task: &PollTask,
+    now: i64,
+    timeout_secs: i64,
+    per_call_pricing: bool,
+) -> PollSettlement {
+    // A task that outlived its budget is failed, because an upstream answering
+    // "still running" forever would otherwise hold the caller's reservation
+    // indefinitely (`service/task_polling.go:70`).
+    if crate::is_timed_out(task.created_at, now, timeout_secs) {
+        return PollSettlement {
+            task_id: task.task_id.clone(),
+            expected_status: task.status.clone(),
+            status: Some(crate::STATUS_FAILURE.to_string()),
+            progress: None,
+            reason: Some(format!(
+                "task did not finish within {timeout_secs}s; it was failed and refunded"
+            )),
+            plugin_state: None,
+            settle: Some(crate::SettlePlan::Refund),
+            round: PollRound::Failed,
+        };
+    }
+
+    let query_context = crate::QueryContext {
+        task_id: task.upstream_task_id.clone(),
+        public_task_id: task.task_id.clone(),
+        action: task.action.clone(),
+        model: task.model.clone(),
+        upstream_model: task.upstream_model.clone(),
+        base_url: context.base_url.clone(),
+        data: task.data.clone(),
+        state: task.state.clone(),
+        upstream: None,
+    };
+    let query_value = match serde_json::to_value(&query_context) {
+        Ok(value) => value,
+        Err(error) => {
+            return PollSettlement::untouched(
+                task,
+                PollRound::Refused,
+                format!("task state could not be presented to the plugin: {error}"),
+            )
+        }
+    };
+
+    let request = match build_query_request(host, context, query_value.clone()).await {
+        Ok(request) => request,
+        Err(error) => {
+            // A plugin that cannot describe its own poll is a plugin bug, not an
+            // upstream fault, so the task is left alone rather than failed.
+            return PollSettlement::untouched(task, PollRound::Refused, error.message);
+        }
+    };
+    let outcome = match transport.execute(request).await {
+        Ok(outcome) => outcome,
+        Err(reason) => return PollSettlement::untouched(task, PollRound::Retried, reason),
+    };
+
+    // A parser failure must not hide the HTTP answer: a 503 needs no parser, and a
+    // 200 with an unusable body is a plugin gap the decision below reports.
+    let parsed = interpret_task_result(host, context, query_value, &outcome)
+        .await
+        .ok();
+
+    match crate::decide_poll(&outcome, parsed.as_ref()) {
+        crate::PollDecision::Continue { progress } => PollSettlement {
+            task_id: task.task_id.clone(),
+            expected_status: task.status.clone(),
+            status: Some(
+                parsed
+                    .as_ref()
+                    .map(|result| result.status.clone())
+                    .unwrap_or_else(|| task.status.clone()),
+            ),
+            progress: Some(progress),
+            reason: None,
+            plugin_state: plugin_state_of(parsed.as_ref()),
+            settle: None,
+            round: PollRound::Continued,
+        },
+        crate::PollDecision::Terminal {
+            status,
+            progress,
+            reason,
+            result,
+        } => {
+            let has_usage = result.total_tokens > 0.0 || result.completion_tokens > 0.0;
+            PollSettlement {
+                task_id: task.task_id.clone(),
+                expected_status: task.status.clone(),
+                status: Some(status.clone()),
+                progress: Some(progress),
+                reason: if reason.is_empty() { None } else { Some(reason) },
+                plugin_state: plugin_state_of(parsed.as_ref()),
+                settle: Some(crate::settle_plan(&status, has_usage, per_call_pricing)),
+                round: PollRound::Settled,
+            }
+        }
+        crate::PollDecision::Fail { reason } => PollSettlement {
+            task_id: task.task_id.clone(),
+            expected_status: task.status.clone(),
+            status: Some(crate::STATUS_FAILURE.to_string()),
+            progress: None,
+            reason: Some(reason),
+            plugin_state: None,
+            // A task that failed costs nothing, so it refunds in full. A failure
+            // that already settled is not refunded again by the caller.
+            settle: Some(crate::SettlePlan::Refund),
+            round: PollRound::Failed,
+        },
+        crate::PollDecision::Retry { reason } => {
+            PollSettlement::untouched(task, PollRound::Retried, reason)
+        }
+        crate::PollDecision::Refuse { reason } => {
+            PollSettlement::untouched(task, PollRound::Refused, reason)
+        }
+    }
+}
+
+/// The plugin state a poll asked the host to keep, when it sent one.
+fn plugin_state_of(result: Option<&TaskResult>) -> Option<serde_json::Value> {
+    result
+        .map(|result| result.state.clone())
+        .filter(|state| !state.is_null())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1205,248 @@ mod tests {
             "{:?}",
             request.headers
         );
+        });
+    }
+
+    /// A plugin whose poll the host can read, for the poller's tests.
+    const POLLING_PLUGIN: &str = r#"
+        export const meta = {apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+            author:{name:"Test"}, models:["acme-video"], fetchMode:"per_task",
+            protocols:["openai_video"]};
+        export function buildSubmitRequest() { return {}; }
+        export function parseSubmitResponse() { return {taskId: "vendor-1"}; }
+        export function buildQueryRequest(ctx) { return {url: ctx.baseUrl + "/jobs/" + ctx.taskId}; }
+        export function parseTaskResult(ctx, body, response) { return body; }
+        export function listArtifacts() { return []; }
+        export function buildContentRequest() { return {}; }
+        export const protocols = {openai_video: {
+            decodeRequest: function(ctx) { return {kind:"submit", model: ctx.model}; },
+            render: function(ctx, task) { return task; }
+        }};
+    "#;
+
+    fn poll_task(status: &str) -> PollTask {
+        PollTask {
+            task_id: "task_public".to_string(),
+            status: status.to_string(),
+            upstream_task_id: "vendor-1".to_string(),
+            action: "text_to_video".to_string(),
+            model: "acme-video".to_string(),
+            upstream_model: "acme-video".to_string(),
+            created_at: 1_000_000,
+            data: serde_json::json!({ "kind": "video" }),
+            state: serde_json::json!({ "cursor": 1 }),
+        }
+    }
+
+    /// A whole poll round: the descriptor is addressed by the task's *upstream*
+    /// id, the answer is read by the plugin, and the settlement says what the
+    /// caller should store.
+    #[test]
+    fn a_poll_round_reports_what_to_store_and_what_it_costs() {
+        runtime().block_on(async {
+            let host = PluginHost::start();
+            host.load(POLLING_PLUGIN.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+            let ctx = context();
+            let task = poll_task(crate::STATUS_QUEUED);
+
+            // Still running: progress moves, nothing settles.
+            let transport = StubTransport::answering(vec![json_outcome(
+                200,
+                r#"{"status":"IN_PROGRESS","progress":"40%"}"#,
+            )]);
+            let settlement = poll_once(&host, &transport, &ctx, &task, 1_000_100, 0, false).await;
+            assert_eq!(settlement.round, PollRound::Continued);
+            assert_eq!(settlement.status.as_deref(), Some(crate::STATUS_IN_PROGRESS));
+            assert_eq!(settlement.progress.as_deref(), Some("40%"));
+            assert_eq!(settlement.settle, None, "a running task settles nothing");
+            assert_eq!(settlement.expected_status, crate::STATUS_QUEUED);
+            {
+                let sent = transport.sent.lock().expect("lock");
+                assert_eq!(sent[0].method, "GET");
+                assert_eq!(sent[0].url, "https://api.vendor.example/jobs/vendor-1");
+            }
+
+            // Terminal success with usage: settle against what actually happened.
+            let transport = StubTransport::answering(vec![json_outcome(
+                200,
+                r#"{"status":"SUCCESS","progress":"100%","totalTokens":8}"#,
+            )]);
+            let settlement = poll_once(&host, &transport, &ctx, &task, 1_000_100, 0, false).await;
+            assert_eq!(settlement.round, PollRound::Settled);
+            assert_eq!(settlement.status.as_deref(), Some(crate::STATUS_SUCCESS));
+            assert_eq!(
+                settlement.settle,
+                Some(crate::SettlePlan::SettleWithUsage)
+            );
+
+            // The same success under a per-call price keeps its reservation.
+            let transport = StubTransport::answering(vec![json_outcome(
+                200,
+                r#"{"status":"SUCCESS","progress":"100%","totalTokens":8}"#,
+            )]);
+            let settlement = poll_once(&host, &transport, &ctx, &task, 1_000_100, 0, true).await;
+            assert_eq!(
+                settlement.settle,
+                Some(crate::SettlePlan::KeepReservation),
+                "a per-call price never gets a second look"
+            );
+
+            // Terminal failure refunds, and carries the plugin's reason.
+            let transport = StubTransport::answering(vec![json_outcome(
+                200,
+                r#"{"status":"FAILURE","reason":"upstream refused the prompt"}"#,
+            )]);
+            let settlement = poll_once(&host, &transport, &ctx, &task, 1_000_100, 0, false).await;
+            assert_eq!(settlement.round, PollRound::Settled);
+            assert_eq!(settlement.settle, Some(crate::SettlePlan::Refund));
+            assert_eq!(
+                settlement.reason.as_deref(),
+                Some("upstream refused the prompt")
+            );
+        });
+    }
+
+    /// A poll the host should not act on leaves the task exactly as it found it,
+    /// and a poll that says the task is gone fails it and refunds.
+    #[test]
+    fn a_poll_that_cannot_be_acted_on_does_not_touch_the_task() {
+        runtime().block_on(async {
+            let host = PluginHost::start();
+            host.load(POLLING_PLUGIN.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+            let ctx = context();
+            let task = poll_task(crate::STATUS_IN_PROGRESS);
+
+            // An auth failure is the operator's problem: the task is untouched and
+            // nothing settles, so a broken credential cannot burn a reservation.
+            let transport = StubTransport::answering(vec![json_outcome(401, "{}")]);
+            let settlement = poll_once(&host, &transport, &ctx, &task, 1_000_100, 0, false).await;
+            assert_eq!(settlement.round, PollRound::Retried);
+            assert_eq!(settlement.status, None);
+            assert_eq!(settlement.settle, None);
+            assert!(settlement
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("auth"));
+
+            // A transport failure is the same: retry, do not judge.
+            let settlement = poll_once(
+                &host,
+                &StubTransport::default(),
+                &ctx,
+                &task,
+                1_000_100,
+                0,
+                false,
+            )
+            .await;
+            assert_eq!(settlement.round, PollRound::Retried);
+            assert_eq!(settlement.status, None);
+
+            // The upstream forgot the task, so it fails and refunds rather than
+            // being polled forever.
+            let transport = StubTransport::answering(vec![json_outcome(404, "{}")]);
+            let settlement = poll_once(&host, &transport, &ctx, &task, 1_000_100, 0, false).await;
+            assert_eq!(settlement.round, PollRound::Failed);
+            assert_eq!(
+                settlement.status.as_deref(),
+                Some(crate::STATUS_FAILURE)
+            );
+            assert_eq!(settlement.settle, Some(crate::SettlePlan::Refund));
+            assert!(settlement
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("not found"));
+
+            // A status the plugin may not report is refused, not settled.
+            let transport = StubTransport::answering(vec![json_outcome(
+                200,
+                r#"{"status":"VIBING","progress":"?"}"#,
+            )]);
+            let settlement = poll_once(&host, &transport, &ctx, &task, 1_000_100, 0, false).await;
+            assert_eq!(settlement.round, PollRound::Refused);
+            assert_eq!(settlement.status, None);
+            assert_eq!(settlement.settle, None);
+        });
+    }
+
+    /// A task that outlived its budget is failed and refunded without the
+    /// upstream being asked at all, because an upstream that answers "still
+    /// running" forever would hold the caller's reservation indefinitely.
+    #[test]
+    fn a_task_that_outlived_its_budget_is_failed_without_asking_the_upstream() {
+        runtime().block_on(async {
+            let host = PluginHost::start();
+            host.load(POLLING_PLUGIN.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+            let transport = StubTransport::answering(vec![json_outcome(
+                200,
+                r#"{"status":"IN_PROGRESS"}"#,
+            )]);
+            let settlement = poll_once(
+                &host,
+                &transport,
+                &context(),
+                &poll_task(crate::STATUS_IN_PROGRESS),
+                1_003_601,
+                3_600,
+                false,
+            )
+            .await;
+
+            assert_eq!(settlement.round, PollRound::Failed);
+            assert_eq!(settlement.status.as_deref(), Some(crate::STATUS_FAILURE));
+            assert_eq!(settlement.settle, Some(crate::SettlePlan::Refund));
+            assert!(settlement
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("3600s"));
+            assert!(
+                transport.sent.lock().expect("lock").is_empty(),
+                "the upstream must not be asked about a task that is already over budget"
+            );
+        });
+    }
+
+    /// A plugin's updated poll state is carried back for storage, because a
+    /// plugin that asked the host to remember something must get it next round.
+    #[test]
+    fn a_poll_carries_the_plugin_state_it_wants_kept() {
+        runtime().block_on(async {
+            let host = PluginHost::start();
+            host.load(
+                POLLING_PLUGIN.replace(
+                    "export function parseTaskResult(ctx, body, response) { return body; }",
+                    "export function parseTaskResult(ctx, body, response) { return {status: \"IN_PROGRESS\", progress: \"20%\", state: {cursor: 9}}; }",
+                ),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await
+            .expect("load");
+            let transport = StubTransport::answering(vec![json_outcome(200, "{}")]);
+            let settlement = poll_once(
+                &host,
+                &transport,
+                &context(),
+                &poll_task(crate::STATUS_QUEUED),
+                1_000_100,
+                0,
+                false,
+            )
+            .await;
+            assert_eq!(settlement.round, PollRound::Continued);
+            assert_eq!(
+                settlement.plugin_state,
+                Some(serde_json::json!({ "cursor": 9 }))
+            );
         });
     }
 }

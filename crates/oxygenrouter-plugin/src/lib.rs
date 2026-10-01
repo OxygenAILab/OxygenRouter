@@ -36,9 +36,9 @@ mod task;
 mod task_flow;
 
 pub use task_flow::{
-    build_outbound_request, build_query_request, interpret_submit, interpret_task_result,
-    send_submit, validate_descriptor, FlowError, HttpOutcome, OutboundRequest, SubmitAnswer,
-    TaskFlowContext, TaskTransport, TransportFuture,
+    build_outbound_request, build_query_request, interpret_submit, interpret_task_result, poll_once,
+    send_submit, validate_descriptor, FlowError, HttpOutcome, OutboundRequest, PollRound,
+    PollSettlement, PollTask, SubmitAnswer, TaskFlowContext, TaskTransport, TransportFuture,
 };
 
 pub use task::{
