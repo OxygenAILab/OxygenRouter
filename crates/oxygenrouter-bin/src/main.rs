@@ -216,6 +216,13 @@ async fn main() {
         });
     }
 
+    /// How often a task is polled.
+    ///
+    /// The reference exposes no per-instance interval for this pass, so neither
+    /// does this: a knob the reference lacks would make the two behave differently
+    /// with nothing to compare against.
+    const TASK_POLL_SECONDS: u64 = 5;
+
     // Task polling. A plugin-backed protocol is `fetchMode: per_task`: the
     // submission stores a task and the work finishes upstream, so something has to
     // ask. This is that something, and it is the reason a task bridge is worth
@@ -228,22 +235,19 @@ async fn main() {
     {
         let state = state.clone();
         tokio::spawn(async move {
-            // A one-second floor, because a zero or negative interval would spin.
+            // A one-second floor, so the due check is responsive without spinning.
             let tick = std::time::Duration::from_secs(1);
             let mut ticker = tokio::time::interval(tick);
             let mut last_run: Option<std::time::Instant> = None;
             loop {
                 ticker.tick().await;
-                let seconds = state
-                    .db
-                    .get_setting("TaskPollIntervalSeconds")
-                    .ok()
-                    .flatten()
-                    .and_then(|raw| raw.trim().parse::<u64>().ok())
-                    .filter(|value| *value >= 1)
-                    .unwrap_or(5);
+                // A fixed cadence rather than an option: the reference's poll pass
+                // is driven by its system-task runner and exposes no per-instance
+                // interval for this. Inventing one would give an operator a knob
+                // the reference does not have -- exactly the divergence this
+                // project keeps removing.
                 let due = last_run
-                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(seconds))
+                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(TASK_POLL_SECONDS))
                     .unwrap_or(true);
                 if !due {
                     continue;

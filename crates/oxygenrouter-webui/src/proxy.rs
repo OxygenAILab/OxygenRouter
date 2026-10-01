@@ -1505,6 +1505,20 @@ async fn plugin_bridge(
         );
     };
 
+    // The task's quota is reserved *now*, and the facts settlement will need travel
+    // with the task. A task settles long after this request is gone, from a loop
+    // that has no access to the key or the group; the reference persists the same
+    // snapshot for the same reason (`model/task.go`'s `BillingContext`).
+    let task_billing = match reserve_task_quota(
+        &state,
+        invocation.headers,
+        &binding.model,
+        invocation.body,
+    ) {
+        Ok(billing) => billing,
+        Err(response) => return response,
+    };
+
     let flow_context = oxygenrouter_plugin::TaskFlowContext {
         plugin_key: plugin_key.clone(),
         model: binding.model.clone(),
@@ -1590,7 +1604,7 @@ async fn plugin_bridge(
     .await
     {
         Ok(oxygenrouter_plugin::SubmitAnswer::Immediate { result, body }) => {
-            render_immediate(
+            let response = render_immediate(
                 &state,
                 &binding,
                 &protocol_context,
@@ -1598,7 +1612,10 @@ async fn plugin_bridge(
                 &result,
                 body,
             )
-            .await
+            .await;
+            // A synchronous answer is already terminal, so its reservation settles
+            // here rather than waiting for a poll that will never come.
+            settle_immediate_task(&state, task_billing.as_ref(), &result, response)
         }
         Ok(oxygenrouter_plugin::SubmitAnswer::Pending(submission)) => {
             persist_task(
@@ -1607,6 +1624,7 @@ async fn plugin_bridge(
                 &channel,
                 &flow_context,
                 &submission,
+                task_billing,
             )
         }
         Err(error) => json_error(
@@ -1955,6 +1973,7 @@ fn persist_task(
     channel: &oxygenrouter_core::Channel,
     flow_context: &oxygenrouter_plugin::TaskFlowContext,
     submission: &oxygenrouter_plugin::SubmitOutcome,
+    billing: Option<oxygenrouter_core::TaskBilling>,
 ) -> Response {
     let now = Utc::now();
     let task_id = format!("task_{}", Uuid::new_v4().simple());
@@ -1962,9 +1981,17 @@ fn persist_task(
         id: Uuid::new_v4().to_string(),
         task_id: task_id.clone(),
         platform: binding.plugin_key.clone(),
-        user_id: String::new(),
+        // Attributed to whoever paid, so the console's per-user view and the
+        // billing record cannot disagree about whose task this is.
+        user_id: billing
+            .as_ref()
+            .map(|billing| billing.user_id.clone())
+            .unwrap_or_default(),
         channel_id: channel.id.clone(),
-        api_key_id: String::new(),
+        api_key_id: billing
+            .as_ref()
+            .map(|billing| billing.key_id.clone())
+            .unwrap_or_default(),
         action: String::new(),
         model: flow_context.model.clone(),
         upstream_model: flow_context.model.clone(),
@@ -1987,6 +2014,9 @@ fn persist_task(
                 "model": flow_context.model,
                 "baseUrl": flow_context.base_url,
             }),
+            // The reservation's facts, so the poll loop can settle without knowing
+            // anything about the request that created the task.
+            billing,
         },
     };
     if let Err(error) = state.db.upsert_task(&record) {
@@ -2027,7 +2057,7 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
     if tasks.is_empty() {
         return (0, 0);
     }
-    let timeout_secs = task_timeout_secs(state);
+    let timeout_secs = task_timeout_secs();
     let mut polled = 0;
     let mut advanced = 0;
 
@@ -2156,46 +2186,256 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
         }
 
         if let Some(plan) = settlement.settle {
-            report_settlement(&task, plan);
+            settle_polled_task(state, &task, plan);
         }
     }
     (polled, advanced)
 }
 
-/// Say what a terminal task's quota should do.
+/// Reserve a task's quota, and describe it for the settlement that comes later.
 ///
-/// Named rather than silent, because the reservation half is not wired yet: a
-/// task is submitted without a pre-consume, so there is nothing to settle or
-/// refund. Saying so out loud is the difference between a known gap and a silent
-/// one -- a `SettleWithUsage` verdict in this log is a real instruction that
-/// nothing is acting on.
-fn report_settlement(task: &oxygenrouter_core::TaskRecord, plan: oxygenrouter_plugin::SettlePlan) {
-    match plan {
-        oxygenrouter_plugin::SettlePlan::Refund => println!(
-            "[OxygenRouter] task {} finished as {} and owes a refund",
-            task.task_id, task.status
-        ),
+/// `Ok(None)` when nothing is billed: a channel-only deployment has no tokens, and
+/// a key with no owning user is not wallet-backed. Same shape as the relay path, so
+/// a task and a chat call agree about who pays.
+fn reserve_task_quota(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    client_body: &[u8],
+) -> Result<Option<oxygenrouter_core::TaskBilling>, Response> {
+    let Some(api_key) = authorize_for_task(state, headers, model) else {
+        return Ok(None);
+    };
+    let Some((key_id, user_id)) = billing_target(state, &Some(api_key.clone())) else {
+        return Ok(None);
+    };
+    let fallback_group = state.default_group();
+    let group = if api_key.group_name.trim().is_empty() {
+        fallback_group
+    } else {
+        api_key.group_name.clone()
+    };
+    // The reservation estimates from *what the caller sent*: the estimator counts
+    // the prompt in the body, so an empty body reserves nothing and a task would
+    // ride free. A task's exact price is what the plugin's usage hooks exist to
+    // report (`adaptor.go:155`); until those are wired the estimate is the honest
+    // ceiling rather than an invented number.
+    let body: serde_json::Value = serde_json::from_slice(client_body)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let amount = state
+        .billing
+        .reservation(model, &group, &body, "/v1/tasks");
+    let funding = match state.db.subscription_funding_source(&user_id, amount) {
+        Ok(Some(subscription)) => oxygenrouter_billing::FundingSource::Subscription {
+            user_id: user_id.clone(),
+            subscription_id: subscription.id.clone(),
+        },
+        Ok(None) => oxygenrouter_billing::FundingSource::Wallet {
+            user_id: user_id.clone(),
+        },
+        Err(error) => {
+            eprintln!(
+                "[OxygenRouter] subscription lookup failed for user {user_id} ({error}); billing the wallet"
+            );
+            oxygenrouter_billing::FundingSource::Wallet {
+                user_id: user_id.clone(),
+            }
+        }
+    };
+    match state
+        .billing
+        .begin(state.billing_store.as_ref(), &key_id, &funding, false, amount)
+    {
+        Ok((_session, reserved)) => {
+            let subscription_id = match &funding {
+                oxygenrouter_billing::FundingSource::Subscription {
+                    subscription_id, ..
+                } => subscription_id.clone(),
+                oxygenrouter_billing::FundingSource::Wallet { .. } => String::new(),
+            };
+            Ok(Some(oxygenrouter_core::TaskBilling {
+                key_id,
+                user_id,
+                group,
+                model: model.to_string(),
+                reserved_micros: reserved,
+                from_subscription: !subscription_id.is_empty(),
+                subscription_id,
+                settled: false,
+            }))
+        }
+        // A refused reservation is the client's condition: NewAPI answers
+        // insufficient quota with 403, not 429.
+        Err(error) => Err(json_policy_error(
+            StatusCode::FORBIDDEN,
+            "insufficient_quota",
+            &error.to_string(),
+        )),
+    }
+}
+
+/// Resolve the caller's key for a task without recording a usage tick first.
+///
+/// The relay path's `authorize` bumps the key's last-used stamp, which is right for
+/// a call that may or may not spend; a task's reservation is what decides whether
+/// this request is billed at all, so the stamp is written once the key resolves.
+fn authorize_for_task(state: &AppState, headers: &axum::http::HeaderMap, model: &str) -> Option<ApiKey> {
+    if !state.db.has_active_api_keys().unwrap_or(false) {
+        return None;
+    }
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })?;
+    let key = state
+        .db
+        .resolve_api_key(token, model, &remote_ip(headers))
+        .ok()?;
+    let _ = state.db.record_api_key_usage(&key.id, 0);
+    Some(key)
+}
+
+/// Settle a synchronously-answered task's reservation.
+fn settle_immediate_task(
+    state: &AppState,
+    billing: Option<&oxygenrouter_core::TaskBilling>,
+    result: &oxygenrouter_plugin::TaskResult,
+    response: Response,
+) -> Response {
+    let Some(billing) = billing else {
+        return response;
+    };
+    // A request that already failed has nothing to settle: its reservation is
+    // returned here, and doing it twice would pay the caller twice.
+    if !response.status().is_success() {
+        refund_task_quota(state, billing);
+        return response;
+    }
+    let has_usage = result.total_tokens > 0.0 || result.completion_tokens > 0.0;
+    match oxygenrouter_plugin::settle_plan(&result.status, has_usage, false) {
+        oxygenrouter_plugin::SettlePlan::Refund => refund_task_quota(state, billing),
         oxygenrouter_plugin::SettlePlan::KeepReservation => {}
+        // The usage-fact settlement is a separate piece of work. Saying so is the
+        // difference between a known gap and a silent one; the reservation stands
+        // meanwhile, so a caller is never under-charged by omission.
         oxygenrouter_plugin::SettlePlan::SettleWithUsage => eprintln!(
-            "[OxygenRouter] task {} reported usage, but no quota was reserved at submit, \
-             so there is nothing to settle against it",
-            task.task_id
+            "[OxygenRouter] a synchronous task reported usage, but task usage settlement is \
+             not wired; the reservation of {} micros stands",
+            billing.reserved_micros
         ),
+    }
+    response
+}
+
+/// Return a task's reservation in full.
+fn refund_task_quota(state: &AppState, billing: &oxygenrouter_core::TaskBilling) {
+    if billing.reserved_micros <= 0 || billing.key_id.trim().is_empty() {
+        return;
+    }
+    let funding = task_funding(billing);
+    match state.billing.refund(
+        state.billing_store.as_ref(),
+        &oxygenrouter_billing::BillingSession::new(
+            billing.key_id.clone(),
+            billing.user_id.clone(),
+            false,
+        ),
+        &billing.key_id,
+        &billing.user_id,
+        &funding,
+    ) {
+        Ok(()) => println!(
+            "[OxygenRouter] task {} refunded {} micros to key {}",
+            billing.model, billing.reserved_micros, billing.key_id
+        ),
+        Err(error) => eprintln!(
+            "[OxygenRouter] task refund for key {} failed: {error}",
+            billing.key_id
+        ),
+    }
+}
+
+/// The funding source a stored task settles against.
+fn task_funding(billing: &oxygenrouter_core::TaskBilling) -> oxygenrouter_billing::FundingSource {
+    if billing.from_subscription && !billing.subscription_id.is_empty() {
+        oxygenrouter_billing::FundingSource::Subscription {
+            user_id: billing.user_id.clone(),
+            subscription_id: billing.subscription_id.clone(),
+        }
+    } else {
+        oxygenrouter_billing::FundingSource::Wallet {
+            user_id: billing.user_id.clone(),
+        }
+    }
+}
+
+/// Settle a terminal task's reservation, once.
+///
+/// The idempotence guard is the stored record's own `settled` flag: the
+/// compare-and-set that got here already made this the single writer for this
+/// transition, and the flag is what stops a second finisher from moving money
+/// again. A task with no record was never reserved (a channel-only deployment),
+/// which is why "no record" is a no-op rather than an error.
+fn settle_polled_task(
+    state: &AppState,
+    task: &oxygenrouter_core::TaskRecord,
+    plan: oxygenrouter_plugin::SettlePlan,
+) {
+    let Some(billing) = task.private.billing.as_ref() else {
+        return;
+    };
+    if billing.settled {
+        return;
+    }
+    match plan {
+        // A task that failed costs nothing.
+        oxygenrouter_plugin::SettlePlan::Refund => {
+            refund_task_quota(state, billing);
+            mark_settled(state, task);
+        }
+        // The price was the contract: a per-call task keeps what it reserved.
+        oxygenrouter_plugin::SettlePlan::KeepReservation => mark_settled(state, task),
+        oxygenrouter_plugin::SettlePlan::SettleWithUsage => eprintln!(
+            "[OxygenRouter] task {} reported usage, but task usage settlement is not wired; \
+             the reservation of {} micros stands",
+            task.task_id, billing.reserved_micros
+        ),
+    }
+}
+
+/// Record that a task's quota has moved, so a second finisher is a no-op.
+fn mark_settled(state: &AppState, task: &oxygenrouter_core::TaskRecord) {
+    if let Err(error) = state.db.mark_task_billing_settled(&task.task_id) {
+        eprintln!(
+            "[OxygenRouter] task {} could not record its settlement: {error}",
+            task.task_id
+        );
     }
 }
 
 /// How long a task may live before it is failed and refunded.
 ///
-/// `0` disables the rule, matching the reference's "no timeout configured".
-fn task_timeout_secs(state: &AppState) -> i64 {
-    state
-        .db
-        .get_setting("TaskTimeoutSeconds")
+/// The reference keeps this as a deployment constant rather than a per-instance
+/// option -- `constant.TaskTimeoutMinutes`, read from `TASK_TIMEOUT_MINUTES` with
+/// a one-day default (`common/init.go:203`), and it skips the sweep entirely when
+/// the value is not positive (`service/task_polling.go:71`). Mirroring that matters
+/// more than the convenience of a console field: an instance whose timeout lives in
+/// a setting the reference does not have is an instance whose behaviour cannot be
+/// compared with it.
+pub fn task_timeout_secs() -> i64 {
+    let minutes: i64 = std::env::var("TASK_TIMEOUT_MINUTES")
         .ok()
-        .flatten()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(0)
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(1440);
+    if minutes <= 0 {
+        0
+    } else {
+        minutes.saturating_mul(60)
+    }
 }
 
 /// Answer a task read: the stored task's public shape, or a reason it is absent.

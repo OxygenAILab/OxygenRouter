@@ -378,13 +378,23 @@ impl BillingService {
         request_path: &str,
     ) -> i64 {
         let estimated_prompt = crate::estimator::estimate_prompt_tokens(model, body);
+        // An image request has no completion cap to read, so it reserves the
+        // reference's own figure for one image rather than a chat-sized default
+        // (`relaykit/dto/openai_image.go:173`).
+        let image_request = crate::estimator::is_image_request(body);
         let requested_max = body
             .get("max_tokens")
             .or_else(|| body.get("max_completion_tokens"))
             .or_else(|| body.get("max_output_tokens"))
             .and_then(|v| v.as_i64())
             .filter(|v| *v > 0)
-            .unwrap_or(self.policy.read().assumed_completion_tokens);
+            .unwrap_or_else(|| {
+                if image_request {
+                    crate::estimator::IMAGE_ASSUMED_TOKENS
+                } else {
+                    self.policy.read().assumed_completion_tokens
+                }
+            });
 
         let usage = BillingUsage {
             prompt_tokens: estimated_prompt,
@@ -700,6 +710,75 @@ mod tests {
             trust_quota: i64::MAX,
             ..Default::default()
         }
+    }
+
+    /// An image request must reserve against its `prompt`.
+    ///
+    /// Found live: an image reservation came out as zero, so a task rode free.
+    /// Two causes, both real -- the estimator did not read `prompt` at all, and an
+    /// image request has no completion cap so it reserved the chat default. This
+    /// pins the end result rather than either cause: a body shaped like an image
+    /// request must produce a non-zero reservation.
+    #[test]
+    fn an_image_request_reserves_against_its_prompt() {
+        let service = service();
+        {
+            let handle = service.pricing();
+            let mut pricing = handle.write();
+            pricing.set_model_ratio("acme-image", 10.0);
+            pricing.set_group_ratio("default", 2.0);
+        }
+
+        let body = serde_json::json!({
+            "model": "acme-image",
+            "prompt": "a cat on a rug",
+            "n": 1
+        });
+        assert!(crate::estimator::is_image_request(&body));
+        assert!(
+            crate::estimator::estimate_prompt_tokens("acme-image", &body) > 0,
+            "an image prompt is input and must be counted"
+        );
+
+        // Exactly the live configuration: a model with a configured ratio, the
+        // group the console defaults to, and an image-shaped body.
+        let amount = service.reservation("acme-image", "default", &body, "/v1/images/generations");
+        assert!(
+            amount > 0,
+            "an image reservation must hold something back, got {amount}"
+        );
+
+        // And the same for a model that is *absent from the shipped pack*, which is
+        // what a task or image model named by a plugin is: it reserves only because
+        // the operator priced it, which is the documented behaviour for an
+        // unconfigured model rather than a regression.
+        let unconfigured_service = BillingService::new(
+            Pricing::from_embedded().expect("embedded pack"),
+            service_policy(),
+        );
+        let unconfigured = unconfigured_service.reservation(
+            "a-model-the-pack-does-not-know",
+            "default",
+            &body,
+            "/v1/images/generations",
+        );
+        assert_eq!(
+            unconfigured, 0,
+            "an unpriced model reserves nothing, matching the relay path"
+        );
+        assert!(unconfigured_service
+            .pricing()
+            .read()
+            .is_unpriced("a-model-the-pack-does-not-know"));
+
+        // A chat body is unaffected: it still counts `messages` and still uses the
+        // chat default when it states no cap.
+        let chat = serde_json::json!({
+            "model": "acme-image",
+            "messages": [{ "role": "user", "content": "hello there" }]
+        });
+        assert!(!crate::estimator::is_image_request(&chat));
+        assert!(crate::estimator::estimate_prompt_tokens("acme-image", &chat) > 0);
     }
 
     #[test]

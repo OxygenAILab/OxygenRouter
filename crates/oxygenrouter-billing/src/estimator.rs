@@ -287,6 +287,20 @@ pub fn estimate_prompt_tokens(model: &str, body: &serde_json::Value) -> i64 {
         total += estimator.count(system);
     }
 
+    // A chat body carries its input in `messages`; an image or task body carries
+    // it in `prompt`, which is a different request shape rather than a chat
+    // without messages. The reference makes the same distinction explicitly -- its
+    // image request reports `CombineText: i.Prompt` for counting
+    // (`relaykit/dto/openai_image.go:162,172`) -- and without it an image prompt
+    // priced as zero and its task rode free.
+    if let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) {
+        total += estimator.count(prompt);
+    }
+    // An image edit or a video request may carry the input as text parts instead.
+    if let Some(input) = body.get("input").and_then(|v| v.as_str()) {
+        total += estimator.count(input);
+    }
+
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
         for message in messages {
             total += estimate_content(estimator, message.get("content"));
@@ -407,6 +421,26 @@ fn bpe_count(model: &str, text: &str) -> Option<i64> {
     let count = bpe.as_ref().map(|b| b.encode_ordinary(text).len() as i64);
     CACHE.write().insert(key, bpe);
     count
+}
+
+/// The assumed completion length an image request reserves, mirroring the
+/// reference's `MaxTokens: 1584` (`relaykit/dto/openai_image.go:173`).
+///
+/// An image has no `max_tokens` to read, so a reservation that used the chat
+/// default would hold back a chat-sized amount for one picture. The reference
+/// states its own figure, so this one is stated rather than inherited.
+pub const IMAGE_ASSUMED_TOKENS: i64 = 1584;
+
+/// Whether a body is an image or task request rather than a chat request.
+///
+/// Decided by shape, because that is what the two differ in: a chat request
+/// carries `messages`, while an image or task request carries its input in
+/// `prompt`. The reference branches on the decoded request *type*
+/// (`relay/request_billing.go:38`), which is the same distinction reaching the
+/// same answer.
+pub fn is_image_request(body: &serde_json::Value) -> bool {
+    body.get("prompt").map(|v| !v.is_null()).unwrap_or(false)
+        && body.get("messages").is_none()
 }
 
 #[cfg(test)]

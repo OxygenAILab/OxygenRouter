@@ -1049,6 +1049,43 @@ pub struct TaskPrivate {
     /// (`adaptor.go:1279`).
     #[serde(default)]
     pub request_snapshot: serde_json::Value,
+    /// What settlement will need, captured at submission.
+    ///
+    /// A task settles when it finishes, which is a different request than the one
+    /// that reserved its quota -- and usually a different process lifetime. The
+    /// billing session itself cannot be stored (its fields are private and it is
+    /// per-request), so what is stored is what rebuilding one needs: who paid,
+    /// which accounts, and the group the price was quoted in. The reference does
+    /// the same, persisting a billing snapshot on the task
+    /// (`model/task.go`'s `BillingContext`).
+    #[serde(default)]
+    pub billing: Option<TaskBilling>,
+}
+
+/// The billing facts a task carries from submission to settlement.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TaskBilling {
+    /// The local token that paid, which is the account a settle or refund moves.
+    pub key_id: String,
+    /// The wallet or subscription owner.
+    pub user_id: String,
+    /// The price group the reservation was quoted in, so a later settle uses the
+    /// same price rather than whatever the key's group is by then.
+    pub group: String,
+    /// The model the reservation was quoted for.
+    pub model: String,
+    /// How much was actually reserved, which is the ceiling a settlement cannot
+    /// exceed and the amount a refund returns.
+    pub reserved_micros: i64,
+    /// Whether the funding source is a subscription pool rather than the wallet.
+    pub from_subscription: bool,
+    /// The subscription that funded it, when one did.
+    #[serde(default)]
+    pub subscription_id: String,
+    /// Set once the task has settled or refunded, so a second finisher is a no-op
+    /// rather than a second movement of money.
+    #[serde(default)]
+    pub settled: bool,
 }
 
 /// What changed on a task since it was read.

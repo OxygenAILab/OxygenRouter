@@ -1688,6 +1688,39 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
         Ok(())
     }
 
+    /// Mark a task's billing record as settled.
+    ///
+    /// The flag is what makes settlement idempotent without holding a lock across
+    /// two different subsystems: the task row's compare-and-set already made the
+    /// caller the single writer for this transition, and this records that the
+    /// money moved. No-op when there is no billing record, which is the
+    /// unreserved case rather than an error.
+    pub fn mark_task_billing_settled(&self, task_id: &str) -> SqliteResult<()> {
+        let conn = self.conn.lock();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT private_data FROM tasks WHERE task_id=?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        let mut private: serde_json::Value =
+            serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(billing) = private.get_mut("billing").and_then(|value| value.as_object_mut())
+        else {
+            return Ok(());
+        };
+        billing.insert("settled".to_string(), serde_json::Value::Bool(true));
+        conn.execute(
+            "UPDATE tasks SET private_data=?2 WHERE task_id=?1",
+            params![task_id, private.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Delete terminal tasks older than a cutoff, returning how many went.
     ///
     /// Retention is what keeps the in-flight scan cheap on a long-lived instance.
@@ -4446,6 +4479,7 @@ mod task_store_tests {
                 plugin_state: serde_json::json!({ "cursor": 1 }),
                 credential: "secret-key".to_string(),
                 request_snapshot: serde_json::json!({ "action": "text_to_video" }),
+                billing: None,
             },
         }
     }
@@ -4581,6 +4615,55 @@ mod task_store_tests {
         assert_eq!(merged.private.request_snapshot["action"], "text_to_video");
         assert_eq!(merged.private.plugin_state["cursor"], 99);
         assert_eq!(merged.status, crate::STATUS_IN_PROGRESS);
+    }
+
+    /// A task's billing record survives a poll and can be marked settled once.
+    ///
+    /// The record is what lets a *later* process settle a reservation made by an
+    /// earlier request, so losing it -- as the private half's wholesale write once
+    /// did -- would leave a reservation that nothing can return.
+    #[test]
+    fn a_task_carries_its_billing_record_to_settlement() {
+        let db = Database::new(":memory:").expect("db");
+        let mut task = record("task_bill", crate::STATUS_SUBMITTED);
+        task.private.billing = Some(crate::TaskBilling {
+            key_id: "key-1".to_string(),
+            user_id: "user-1".to_string(),
+            group: "default".to_string(),
+            model: "acme-video".to_string(),
+            reserved_micros: 4321,
+            from_subscription: true,
+            subscription_id: "sub-1".to_string(),
+            settled: false,
+        });
+        db.upsert_task(&task).expect("store");
+
+        // A poll's status change and its plugin state both leave the record alone.
+        let update = TaskUpdate {
+            status: Some(crate::STATUS_IN_PROGRESS.to_string()),
+            ..Default::default()
+        };
+        assert!(db
+            .complete_task("task_bill", crate::STATUS_SUBMITTED, &update)
+            .expect("cas"));
+        db.merge_task_plugin_state("task_bill", &serde_json::json!({ "cursor": 5 }))
+            .expect("merge");
+
+        let loaded = db.get_task("task_bill").expect("query").expect("present");
+        let billing = loaded.private.billing.expect("billing record");
+        assert_eq!(billing.reserved_micros, 4321);
+        assert_eq!(billing.key_id, "key-1");
+        assert!(billing.from_subscription);
+        assert_eq!(billing.subscription_id, "sub-1");
+        assert!(!billing.settled);
+
+        db.mark_task_billing_settled("task_bill").expect("settle");
+        let settled = db.get_task("task_bill").expect("query").expect("present");
+        assert!(settled.private.billing.expect("record").settled);
+        // Marking twice is harmless, and a task with no record is a no-op rather
+        // than an error: that is the unreserved case.
+        db.mark_task_billing_settled("task_bill").expect("idempotent");
+        assert!(db.mark_task_billing_settled("task_none").is_ok());
     }
 
     #[test]
