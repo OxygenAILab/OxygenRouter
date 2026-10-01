@@ -382,7 +382,7 @@ impl Engine {
         let path = format!("plugin{}.js", self.next_module);
         let is_module = looks_like_module(source);
 
-        let (module, manifest, exported) = if is_module {
+        let (module, mut manifest, exports) = if is_module {
             let module = boa_engine::Module::parse(
                 boa_engine::Source::from_bytes(source.as_bytes())
                     .with_path(std::path::Path::new(&path)),
@@ -431,22 +431,23 @@ impl Engine {
                 boa_engine::builtins::promise::PromiseState::Fulfilled(_) => {}
             }
             let manifest = self.manifest_from_module(&module)?;
-            let exported = self.exported_protocol_members(Some(&module));
-            (Some(module), manifest, exported)
+            let exports = self.plugin_exports(Some(&module));
+            (Some(module), manifest, exports)
         } else {
             self.context
                 .eval(boa_engine::Source::from_bytes(source.as_bytes()))
                 .map_err(|error| PluginError::Load(describe(&error)))?;
             let manifest = self.manifest_from_register()?;
-            let exported = self.exported_protocol_members(None);
-            (None, manifest, exported)
+            let exports = self.plugin_exports(None);
+            (None, manifest, exports)
         };
 
         manifest.validate()?;
-        let problems = validate_protocol_claims(&manifest.protocols, &manifest.key, &exported);
+        let problems = validate_protocol_claims(&manifest.protocols, &manifest.key, &exports);
         if !problems.is_empty() {
             return Err(PluginError::Load(problems.join("; ")));
         }
+        normalize_protocol_supports(&mut manifest.protocols);
 
         // Addressable by plugin key and by every protocol the plugin claims,
         // because those are the two names a caller may hold.
@@ -530,44 +531,111 @@ impl Engine {
         value.to_object(&mut self.context).ok()
     }
 
-    /// Every protocol member the plugin provides as a function.
-    fn exported_protocol_members(
-        &mut self,
-        module: Option<&boa_engine::Module>,
-    ) -> Vec<String> {
-        let Some(obj) = self.protocols_object(module) else {
-            return Vec::new();
+    /// The string form of an own property key, when it has one.
+    ///
+    /// A plugin's exports are addressed by name; symbol keys are not
+    /// addressable, so they are dropped rather than guessed at.
+    fn property_key_name(key: boa_engine::property::PropertyKey) -> Option<String> {
+        match key {
+            boa_engine::property::PropertyKey::String(s) => Some(s.to_std_string_escaped()),
+            boa_engine::property::PropertyKey::Index(i) => Some(i.get().to_string()),
+            _ => None,
+        }
+    }
+
+    /// Everything the plugin's live exports provide, as the host sees them.
+    ///
+    /// The reference asks its engine the same questions one at a time
+    /// (`HasCallablePath`, `Export`; `pkg/jsplugin/registry.go:388-495`). Doing
+    /// it in one pass keeps the answers consistent with each other: the set of
+    /// protocols present, the callable members under each, and the callable
+    /// top-level exports that driver hooks live in.
+    fn plugin_exports(&mut self, module: Option<&boa_engine::Module>) -> PluginExports {
+        let mut out = PluginExports::default();
+
+        // Top-level: driver hooks (`buildSubmitRequest`, `listArtifacts`, ...)
+        // and the `native` members routes reference are ordinary exports.
+        let top_level_keys: Vec<String> = match module {
+            Some(module) => {
+                let namespace = module.namespace(&mut self.context);
+                match namespace.own_property_keys(&mut self.context) {
+                    Ok(keys) => keys
+                        .into_iter()
+                        .filter_map(Self::property_key_name)
+                        .collect(),
+                    Err(_) => Vec::new(),
+                }
+            }
+            None => {
+                let global = self.context.global_object();
+                match global.own_property_keys(&mut self.context) {
+                    Ok(keys) => keys
+                        .into_iter()
+                        .filter_map(Self::property_key_name)
+                        .collect(),
+                    Err(_) => Vec::new(),
+                }
+            }
         };
-        let mut out = Vec::new();
-        for protocol in HOST_PROTOCOLS {
-            let Ok(entry) = obj.get(boa_engine::js_string!(protocol.name), &mut self.context) else {
+        for name in top_level_keys {
+            let value = match module {
+                Some(module) => module
+                    .namespace(&mut self.context)
+                    .get(boa_engine::js_string!(name.clone()), &mut self.context),
+                None => self
+                    .context
+                    .global_object()
+                    .get(boa_engine::js_string!(name.clone()), &mut self.context),
+            };
+            if let Ok(value) = value {
+                if value.as_callable().is_some() {
+                    out.top_level.push(name);
+                }
+            }
+        }
+
+        // The `protocols` object: every protocol it names, and every callable
+        // member under each. Read the object's own keys rather than a table of
+        // expected names, so an unclaimed protocol is visible to the validator.
+        let Some(obj) = self.protocols_object(module) else {
+            return out;
+        };
+        let Ok(keys) = obj.own_property_keys(&mut self.context) else {
+            return out;
+        };
+        for key in keys {
+            let name = match Self::property_key_name(key) {
+                Some(name) => name,
+                None => continue,
+            };
+            out.protocol_names.push(name.clone());
+            let Ok(entry) = obj.get(boa_engine::js_string!(name.clone()), &mut self.context) else {
                 continue;
             };
             let Ok(entry) = entry.to_object(&mut self.context) else {
                 continue;
             };
-            let mut members: Vec<&str> = Vec::new();
-            for operation in protocol.operations {
-                members.extend_from_slice(operation.required_members);
-                members.extend_from_slice(operation.required_driver_hooks);
-                for mode in operation.modes {
-                    members.push(mode.hook);
+            let mut members = Vec::new();
+            if let Ok(member_keys) = entry.own_property_keys(&mut self.context) {
+                for member_key in member_keys {
+                    let member = match Self::property_key_name(member_key) {
+                        Some(name) => name,
+                        None => continue,
+                    };
+                    let Ok(value) = entry.get(boa_engine::js_string!(member.clone()), &mut self.context)
+                    else {
+                        continue;
+                    };
+                    if value.as_callable().is_some() {
+                        members.push(member);
+                    }
                 }
             }
-            members.sort_unstable();
-            members.dedup();
-            for member in members {
-                let Ok(value) = entry.get(boa_engine::js_string!(member), &mut self.context) else {
-                    continue;
-                };
-                if value.as_callable().is_some() {
-                    out.push(member.to_string());
-                }
-            }
+            members.sort();
+            out.protocol_members.insert(name, members);
         }
         out
     }
-
     /// Call `protocols.<name>.<member>` with JSON arguments, returning JSON.
     ///
     /// The member is reached through the module's own `protocols` export, so the
@@ -914,15 +982,30 @@ pub struct ProtocolMode {
 #[derive(Debug, Clone, Copy)]
 pub struct HostOperation {
     pub name: &'static str,
-    pub method: &'static str,
+    /// The HTTP methods this operation answers. Two entries where the
+    /// reference registers two (`HEAD` for the artifact content endpoint,
+    /// `pkg/jsplugin/routing.go:95`).
+    pub methods: &'static [&'static str],
     pub path: &'static str,
+    /// The request body encodings the operation accepts, as the reference's
+    /// `BodyKinds`. A caller sending a form to a JSON-only operation is
+    /// refused the way the reference refuses it
+    /// (`middleware/task_plugin.go:575`).
+    pub body_kinds: &'static [&'static str],
     /// Members every plugin serving this operation must export, whatever forms
     /// it claims.
     pub required_members: &'static [&'static str],
-    /// Request forms, each naming the hook that implements it.
+    /// Request forms, each naming the hook that implements it. Empty for a
+    /// protocol that has none -- the image API is synchronous, so there is
+    /// nothing to choose between.
     pub modes: &'static [ProtocolMode],
     /// Hooks required regardless of the forms claimed.
     pub required_driver_hooks: &'static [&'static str],
+    /// The hook that shapes a completed response, when the operation has one.
+    ///
+    /// Per operation rather than derived from the modes, because the image
+    /// protocol's renderer is simply `render`: it has no modes to name one.
+    pub render_hook: Option<&'static str>,
 }
 
 /// A client-facing protocol the host knows how to serve from a plugin.
@@ -932,46 +1015,165 @@ pub struct HostProtocol {
     pub operations: &'static [HostOperation],
 }
 
+/// The request body encodings a host operation accepts.
+///
+/// Spelled the way the reference spells them (`pkg/jsplugin/routing.go:64`) so
+/// the names also appear in the context a plugin reads as `body.kind`.
+pub const BODY_NONE: &str = "none";
+pub const BODY_JSON: &str = "json";
+pub const BODY_FORM: &str = "form";
+pub const BODY_MULTIPART: &str = "multipart";
+
+impl HostProtocol {
+    /// Every client request form the protocol accepts, in table order.
+    ///
+    /// Two shapes matter to a plugin author: whether the protocol has forms at
+    /// all (a mode-less protocol must not be given `supports`), and the full
+    /// ordered list to name when a claim declared none
+    /// (`pkg/jsplugin/protocol_supports_test.go:13`).
+    pub fn defined_modes(&self) -> Vec<&'static ProtocolMode> {
+        let mut out: Vec<&'static ProtocolMode> = Vec::new();
+        for operation in self.operations {
+            for mode in operation.modes {
+                if !out.iter().any(|m| m.name == mode.name) {
+                    out.push(mode);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The protocols a plugin may claim.
 ///
 /// A curated list rather than free naming: each entry is a promise about the
-/// hook contract, and the host can only keep a promise it knows. The first entry
-/// is the Responses API, which can only expose its full streaming semantics if a
-/// plugin renders them itself.
-pub const HOST_PROTOCOLS: &[HostProtocol] = &[HostProtocol {
-    name: "openai_responses",
-    operations: &[
-        HostOperation {
-            name: "create",
-            method: "POST",
-            path: "/v1/responses",
-            required_members: &["decodeRequest"],
-            modes: &[
-                ProtocolMode {
-                    name: "stream",
-                    hook: "renderEvents",
-                },
-                ProtocolMode {
-                    name: "sync",
-                    hook: "renderFinal",
-                },
-                ProtocolMode {
-                    name: "background",
-                    hook: "renderFinal",
-                },
-            ],
-            required_driver_hooks: &[],
-        },
-        HostOperation {
-            name: "retrieve",
-            method: "GET",
-            path: "/v1/responses/:response_id",
-            required_members: &[],
-            modes: &[],
-            required_driver_hooks: &[],
-        },
-    ],
-}];
+/// hook contract, and the host can only keep a promise it knows. Ported whole
+/// from the reference's `hostProtocols` (`pkg/jsplugin/routing.go:87`), in the
+/// same order, because a manifest written for one host must load in the other.
+pub const HOST_PROTOCOLS: &[HostProtocol] = &[
+    HostProtocol {
+        name: PROTOCOL_OPENAI_RESPONSES,
+        operations: &[
+            HostOperation {
+                name: "create",
+                methods: &["POST"],
+                path: "/v1/responses",
+                body_kinds: &[BODY_JSON],
+                required_members: &["decodeRequest"],
+                modes: &[
+                    ProtocolMode {
+                        name: "stream",
+                        hook: "renderEvents",
+                    },
+                    ProtocolMode {
+                        name: "sync",
+                        hook: "renderFinal",
+                    },
+                    ProtocolMode {
+                        name: "background",
+                        hook: "renderFinal",
+                    },
+                ],
+                required_driver_hooks: &[],
+                render_hook: Some("renderFinal"),
+            },
+            // Retrieval reads a task the host already recorded. It declares no
+            // members because the host answers it itself; a plugin cannot
+            // claim "retrieve" as a form, which the reference says explicitly
+            // (`pkg/jsplugin/protocol_supports_test.go:55`).
+            HostOperation {
+                name: "retrieve",
+                methods: &["GET"],
+                path: "/v1/responses/:response_id",
+                body_kinds: &[BODY_NONE],
+                required_members: &[],
+                modes: &[],
+                required_driver_hooks: &[],
+                render_hook: None,
+            },
+        ],
+    },
+    HostProtocol {
+        name: PROTOCOL_OPENAI_VIDEO,
+        operations: &[
+            HostOperation {
+                name: "create",
+                methods: &["POST"],
+                path: "/v1/videos",
+                body_kinds: &[BODY_JSON, BODY_MULTIPART],
+                required_members: &["decodeRequest"],
+                modes: &[],
+                required_driver_hooks: &[],
+                render_hook: None,
+            },
+            HostOperation {
+                name: "retrieve",
+                methods: &["GET"],
+                path: "/v1/videos/:task_id",
+                body_kinds: &[BODY_NONE],
+                required_members: &["render"],
+                modes: &[],
+                required_driver_hooks: &[],
+                render_hook: Some("render"),
+            },
+            HostOperation {
+                name: "content",
+                methods: &["GET", "HEAD"],
+                path: "/v1/videos/:task_id/content",
+                body_kinds: &[BODY_NONE],
+                required_members: &[],
+                modes: &[],
+                required_driver_hooks: &["listArtifacts", "buildContentRequest"],
+                render_hook: None,
+            },
+        ],
+    },
+    HostProtocol {
+        name: PROTOCOL_OPENAI_IMAGE,
+        operations: &[
+            HostOperation {
+                name: "generate",
+                methods: &["POST"],
+                path: "/v1/images/generations",
+                body_kinds: &[BODY_JSON],
+                // Both members are required whatever the plugin claims: without
+                // a decoder there is no request to send, and without a renderer
+                // there is no answer to return. There are no modes here, so
+                // nothing can narrow the requirement away.
+                required_members: &["decodeRequest", "render"],
+                modes: &[],
+                required_driver_hooks: &[],
+                render_hook: Some("render"),
+            },
+            HostOperation {
+                name: "edit",
+                methods: &["POST"],
+                path: "/v1/images/edits",
+                body_kinds: &[BODY_JSON, BODY_MULTIPART],
+                required_members: &["decodeRequest", "render"],
+                modes: &[],
+                required_driver_hooks: &[],
+                render_hook: Some("render"),
+            },
+        ],
+    },
+];
+
+/// The host protocol serving the OpenAI Images API from a plugin
+/// (`POST /v1/images/generations` and `POST /v1/images/edits`).
+///
+/// Synchronous, unlike the Responses protocol: both operations create a task and
+/// answer once it is terminal, so there are no request forms to choose between
+/// and the renderer is plain `render` (`pkg/jsplugin/routing.go:97`).
+pub const PROTOCOL_OPENAI_IMAGE: &str = "openai_image";
+
+/// The host protocol serving the OpenAI Videos API from a plugin
+/// (`POST /v1/videos`, `GET /v1/videos/:task_id` and their content endpoint).
+pub const PROTOCOL_OPENAI_VIDEO: &str = "openai_video";
+
+/// The host protocol serving the OpenAI Responses API from a plugin
+/// (`POST /v1/responses`, `GET /v1/responses/:response_id`).
+pub const PROTOCOL_OPENAI_RESPONSES: &str = "openai_responses";
 
 /// Look up a protocol by the name a manifest claims.
 pub fn host_protocol(name: &str) -> Option<&'static HostProtocol> {
@@ -979,95 +1181,837 @@ pub fn host_protocol(name: &str) -> Option<&'static HostProtocol> {
 }
 
 /// What a manifest claims about one protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The reference accepts two spellings and so does this: the bare name
+/// (`protocols: ["openai_image"]`) for a protocol with nothing to configure, and
+/// the object form when models or request forms need narrowing
+/// (`pkg/jsplugin/routing_test.go:111,124`). Accepting only one would reject a
+/// plugin the reference loads, and the reference also *phrases its refusals*
+/// differently per spelling ("replace the bare string with ..." versus "add
+/// supports: [...]", `pkg/jsplugin/registry.go:1362`), which is why which
+/// spelling was written is remembered here rather than discarded.
+#[derive(Debug, Clone, Serialize)]
 pub struct ProtocolClaim {
     pub name: String,
     /// Models this claim covers; empty means every model the plugin claims.
     #[serde(default)]
     pub models: Vec<String>,
-    /// Which request forms the plugin serves. Empty means none are declared, and
-    /// validation will say so rather than silently serving nothing.
+    /// Which request forms the plugin serves. Only meaningful for a protocol that
+    /// has modes; a mode-less protocol must leave this undeclared.
     #[serde(default)]
     pub supports: Vec<String>,
+    /// Whether `supports` was written at all. `None` is "not declared", which is
+    /// an error for a mode-bearing protocol and is *not* the same as an empty
+    /// list (`pkg/jsplugin/registry.go:1385`).
+    #[serde(skip)]
+    pub supports_declared: bool,
+    /// Whether the claim was written as an object rather than a bare name.
+    #[serde(skip)]
+    pub object_form: bool,
 }
 
-/// Check a set of claims against the host's protocol table and the members the
-/// plugin actually exported.
+
+impl<'de> Deserialize<'de> for ProtocolClaim {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ClaimVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ClaimVisitor {
+            type Value = ProtocolClaim;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a protocol name or a protocol claim object")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(ProtocolClaim {
+                    name: value.to_string(),
+                    models: Vec::new(),
+                    supports: Vec::new(),
+                    supports_declared: false,
+                    object_form: false,
+                })
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                #[derive(Deserialize)]
+                struct Object {
+                    name: String,
+                    #[serde(default)]
+                    models: Vec<String>,
+                    #[serde(default)]
+                    supports: Option<Vec<String>>,
+                }
+                let object = Object::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ProtocolClaim {
+                    name: object.name,
+                    models: object.models,
+                    supports: object.supports.clone().unwrap_or_default(),
+                    supports_declared: object.supports.is_some(),
+                    object_form: true,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ClaimVisitor)
+    }
+}
+
+/// What a plugin's live exports actually provide.
 ///
-/// `exported` is the plugin's own list of `protocols.<name>.<member>` entries —
-/// the host asks the engine for it rather than trusting the manifest, because a
-/// manifest is a claim and an export is a fact. Each problem names the protocol
-/// and the hook: "supports sync but does not export
-/// protocols.openai_responses.renderFinal" tells an author exactly what to write,
-/// where "invalid plugin" does not. The reference phrases its equivalents the
-/// same way (`pkg/jsplugin/registry.go:464`).
+/// The host asks the engine for this rather than trusting the manifest, because
+/// a manifest is a claim and an export is a fact
+/// (`pkg/jsplugin/registry.go:432`).
+#[derive(Debug, Clone, Default)]
+pub struct PluginExports {
+    /// Callable members under `protocols.<protocol>.<member>`.
+    pub protocol_members: std::collections::BTreeMap<String, Vec<String>>,
+    /// Callable top-level exports: the driver hooks and `native` members.
+    pub top_level: Vec<String>,
+    /// Every protocol name present in the plugin's `protocols` object.
+    pub protocol_names: Vec<String>,
+}
+
+impl PluginExports {
+    fn has_member(&self, protocol: &str, member: &str) -> bool {
+        self.protocol_members
+            .get(protocol)
+            .map(|members| members.iter().any(|m| m == member))
+            .unwrap_or(false)
+    }
+}
+
+/// Render a list the way the reference does in its guidance
+/// (`pkg/jsplugin/registry.go:440`): `"a", "b"`.
+fn quoted_join(items: &[&str]) -> String {
+    quoted_join_with(items, ", ")
+}
+
+/// The same, with the reference's other separator -- `"a" or "b"` -- which it
+/// uses when listing the forms that would make an otherwise-dead hook live
+/// (`pkg/jsplugin/registry.go:464`).
+fn quoted_join_with(items: &[&str], separator: &str) -> String {
+    items
+        .iter()
+        .map(|item| format!("{item:?}"))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+/// The exports the reference refuses outright, because a host that honoured
+/// them would be a different (older) contract
+/// (`pkg/jsplugin/registry.go:499`).
+const REMOVED_EXPORTS: &[&str] = &["resolveRequest", "renderError", "renderers"];
+
+/// Check a set of claims against the host's protocol table and what the plugin
+/// actually exported.
+///
+/// Every refusal is worded the way the reference words it, because the message
+/// is the only documentation a plugin author has and the reference's tests pin
+/// the phrasing (`pkg/jsplugin/protocol_supports_test.go:35`). Each problem
+/// names the protocol and the hook: "supports sync but does not export
+/// protocols.openai_responses.renderFinal" tells an author exactly what to
+/// write, where "invalid plugin" does not.
 pub fn validate_protocol_claims(
     claims: &[ProtocolClaim],
     key: &str,
-    exported: &[String],
+    exports: &PluginExports,
 ) -> Vec<String> {
     let mut problems = Vec::new();
+
     for claim in claims {
         let Some(protocol) = host_protocol(&claim.name) else {
-            problems.push(format!(
-                "plugin {key} claims protocol {:?}, which this host does not serve",
-                claim.name
-            ));
+            // An unknown protocol cannot be judged on modes, but a `supports`
+            // list is still wrong, and the reference says so before it says the
+            // protocol is unknown (`pkg/jsplugin/registry.go:1385,1389`).
+            if claim.supports_declared {
+                problems.push(format!(
+                    "plugin {key} protocol {:?} does not define modes; supports is not allowed",
+                    claim.name
+                ));
+            } else {
+                problems.push(format!("plugin {key} protocol {:?} is unknown", claim.name));
+            }
             continue;
         };
-        if claim.supports.is_empty() {
-            problems.push(format!(
-                "plugin {key} protocol {:?} declares no supports; name the request forms it serves",
-                claim.name
-            ));
-            continue;
-        }
-        for support in &claim.supports {
-            let modes: Vec<&ProtocolMode> = protocol
-                .operations
-                .iter()
-                .flat_map(|op| op.modes.iter())
-                .filter(|mode| mode.name == support)
-                .collect();
-            if modes.is_empty() {
+
+        let modes = protocol.defined_modes();
+        let mode_names: Vec<&str> = modes.iter().map(|mode| mode.name).collect();
+
+        if !modes.is_empty() {
+            let choosing_from = quoted_join(&mode_names);
+            if !claim.supports_declared {
+                if claim.object_form {
+                    problems.push(format!(
+                        "plugin {key} protocol {:?} must declare supports; add supports: [...] choosing from {choosing_from}",
+                        claim.name
+                    ));
+                } else {
+                    problems.push(format!(
+                        "plugin {key} protocol {:?} must declare supports; replace the bare string with {{name: {:?}, supports: [...]}} choosing from {choosing_from}",
+                        claim.name, claim.name
+                    ));
+                }
+                continue;
+            }
+            if claim.supports.is_empty() {
                 problems.push(format!(
-                    "plugin {key} protocol {:?} declares supports {:?}, which is not a request form of that protocol",
-                    claim.name, support
+                    "plugin {key} protocol {:?} supports must contain at least one of {choosing_from}",
+                    claim.name
                 ));
                 continue;
             }
-            // The hook this form needs, and the members the operation it belongs
-            // to needs whichever form was claimed.
-            let mut required: Vec<&str> = Vec::new();
-            let mut hooks: Vec<&str> = Vec::new();
-            for operation in protocol.operations {
-                if operation.modes.iter().any(|m| m.name == support) {
-                    required.extend_from_slice(operation.required_members);
-                    if let Some(mode) = operation.modes.iter().find(|m| m.name == support) {
-                        hooks.push(mode.hook);
+            let mut seen: Vec<&str> = Vec::new();
+            let mut bad_mode = false;
+            for support in &claim.supports {
+                if seen.contains(&support.as_str()) {
+                    problems.push(format!(
+                        "plugin {key} protocol {:?} supports must be unique",
+                        claim.name
+                    ));
+                    bad_mode = true;
+                    break;
+                }
+                seen.push(support.as_str());
+                if !mode_names.contains(&support.as_str()) {
+                    if support == "retrieve" {
+                        problems.push(format!(
+                            "plugin {key} protocol {:?} has no mode {:?}; retrieval of a created response is always available and is never declared",
+                            claim.name, support
+                        ));
+                    } else {
+                        problems.push(format!(
+                            "plugin {key} protocol {:?} has no mode {:?}",
+                            claim.name, support
+                        ));
                     }
-                    required.extend_from_slice(operation.required_driver_hooks);
+                    bad_mode = true;
                 }
             }
-            for member in required.into_iter().chain(hooks.into_iter()) {
-                if !exported.iter().any(|e| e == member) {
+            if bad_mode {
+                continue;
+            }
+        } else if claim.supports_declared {
+            problems.push(format!(
+                "plugin {key} protocol {:?} does not define modes; supports is not allowed",
+                claim.name
+            ));
+            continue;
+        }
+
+        // Which hooks a callable protocol member must be, and which modes use
+        // each hook, so a missing hook can suggest the claim to declare instead.
+        let mut required: Vec<&str> = Vec::new();
+        let mut mode_hook_users: Vec<(&str, Vec<&str>)> = Vec::new();
+        for operation in protocol.operations {
+            for member in operation.required_members {
+                if !required.contains(member) {
+                    required.push(member);
+                }
+            }
+            for mode in operation.modes {
+                if !mode_hook_users.iter().any(|(hook, _)| *hook == mode.hook) {
+                    mode_hook_users.push((mode.hook, Vec::new()));
+                }
+                if let Some((_, users)) = mode_hook_users.iter_mut().find(|(hook, _)| *hook == mode.hook)
+                {
+                    if !users.contains(&mode.name) {
+                        users.push(mode.name);
+                    }
+                }
+                if claim.supports.iter().any(|support| support == mode.name)
+                    && !required.contains(&mode.hook)
+                {
+                    required.push(mode.hook);
+                }
+            }
+        }
+
+        for member in &required {
+            if exports.has_member(&claim.name, member) {
+                continue;
+            }
+            let users: Vec<&str> = mode_hook_users
+                .iter()
+                .find(|(hook, _)| hook == member)
+                .map(|(_, users)| users.clone())
+                .unwrap_or_default();
+            if !users.is_empty() {
+                // Which claimed form pulls this hook in, and which forms would
+                // have worked instead.
+                let mentioned = claim
+                    .supports
+                    .iter()
+                    .find(|support| users.contains(&support.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut suggested: Vec<&str> = Vec::new();
+                for mode in &modes {
+                    if exports.has_member(&claim.name, mode.hook) && !suggested.contains(&mode.name) {
+                        suggested.push(mode.name);
+                    }
+                }
+                let mut message = format!(
+                    "plugin {key} protocol {:?} supports {mentioned:?} but does not export protocols.{}.{member}; implement it",
+                    claim.name, claim.name
+                );
+                if !suggested.is_empty() {
+                    message.push_str(&format!(
+                        " or declare supports: [{}]",
+                        quoted_join(&suggested)
+                    ));
+                }
+                problems.push(message);
+            } else {
+                problems.push(format!(
+                    "plugin {key} protocol {:?} is missing hook {member:?}; implement it",
+                    claim.name
+                ));
+            }
+        }
+
+        // A mode hook that is exported but that no claimed form uses is dead
+        // weight the reference refuses, naming the forms that would use it
+        // (`pkg/jsplugin/protocol_supports_test.go:79`).
+        for (hook, users) in &mode_hook_users {
+            if required.contains(hook) {
+                continue;
+            }
+            if !exports.has_member(&claim.name, hook) {
+                continue;
+            }
+            let users: Vec<&str> = users
+                .iter()
+                .filter(|name| mode_names.contains(*name))
+                .copied()
+                .collect();
+            if users.is_empty() {
+                continue;
+            }
+            problems.push(format!(
+                "plugin {key} protocol {:?} exports protocols.{}.{hook} but no supported mode uses it; add {} to supports or remove the hook",
+                claim.name,
+                claim.name,
+                quoted_join_with(&users, " or ")
+            ));
+        }
+
+        // Driver hooks live at the top level, not under the protocol, because
+        // the adaptor calls them directly (`pkg/jsplugin/registry.go:401`).
+        for operation in protocol.operations {
+            for hook in operation.required_driver_hooks {
+                if !exports.top_level.iter().any(|name| name == hook) {
                     problems.push(format!(
-                        "plugin {key} protocol {:?} supports {:?} but does not export protocols.{}.{}; implement it or stop claiming {:?}",
-                        claim.name, support, claim.name, member, support
+                        "plugin {key} protocol {:?} is missing driver hook {hook:?}",
+                        claim.name
                     ));
                 }
             }
-            // A hook exported for a form that was not claimed is not an error --
-            // the reference allows it -- so nothing is reported for extra members.
         }
     }
+
+    // A `protocols` object the manifest never claimed is an implementation the
+    // host would never call; the reference refuses it
+    // (`pkg/jsplugin/registry.go:492`).
+    for name in &exports.protocol_names {
+        if !claims.iter().any(|claim| &claim.name == name) {
+            problems.push(format!("plugin {key} implements unclaimed protocol {name:?}"));
+        }
+    }
+
+    for removed in REMOVED_EXPORTS {
+        if exports.top_level.iter().any(|name| name == removed) {
+            problems.push(format!("plugin {key} export {removed:?} is no longer supported"));
+        }
+    }
+
     problems
+}
+/// Put each claim's `supports` in the protocol table's order.
+///
+/// The reference does this in `normalizeV1Meta` (`pkg/jsplugin/registry.go:1384`),
+/// so two manifests claiming the same forms are indistinguishable afterwards --
+/// the console shows one order and a snapshot comparison would otherwise see the
+/// same plugin as two.
+pub fn normalize_protocol_supports(claims: &mut [ProtocolClaim]) {
+    for claim in claims.iter_mut() {
+        if !claim.supports_declared {
+            continue;
+        }
+        let Some(protocol) = host_protocol(&claim.name) else {
+            continue;
+        };
+        let order: Vec<&str> = protocol.defined_modes().iter().map(|mode| mode.name).collect();
+        claim.supports.sort_by_key(|support| {
+            order
+                .iter()
+                .position(|name| name == support)
+                .unwrap_or(usize::MAX)
+        });
+    }
+}
+
+/// The two claim spellings, for callers that hold a claim they did not parse.
+///
+/// The parser keeps which spelling was written because the refusals differ
+/// per spelling; a test or a host-side caller that only has a name and a
+/// `supports` list states the spelling it means.
+impl ProtocolClaim {
+    /// A bare-name claim: `protocols: ["openai_image"]`.
+    pub fn bare(name: &str) -> Self {
+        ProtocolClaim {
+            name: name.to_string(),
+            models: Vec::new(),
+            supports: Vec::new(),
+            supports_declared: false,
+            object_form: false,
+        }
+    }
+
+    /// An object claim: `protocols: [{name: "openai_responses", supports: [...]}]`.
+    pub fn object(name: &str, supports: &[&str]) -> Self {
+        ProtocolClaim {
+            name: name.to_string(),
+            models: Vec::new(),
+            supports: supports.iter().map(|s| s.to_string()).collect(),
+            supports_declared: true,
+            object_form: true,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A plugin source in the shape the reference's fixtures use
+    /// (`pkg/jsplugin/protocol_supports_test.go:128`), so the same plugin the
+    /// reference accepts or refuses is the one tested here.
+    fn protocol_plugin_source(key: &str, models: &str, protocols: &str, exports: &str) -> String {
+        format!(
+            r#"
+export const meta = {{
+    apiVersion: 1, key: {key:?}, name: {key:?}, version: "1.0.0",
+    author: {{name: "Test"}},
+    models: {models}, fetchMode: "per_task",
+    protocols: {protocols},
+}};
+export function buildSubmitRequest() {{ return {{}}; }}
+export function parseSubmitResponse() {{ return {{}}; }}
+export function buildQueryRequest() {{ return {{}}; }}
+export function parseTaskResult() {{ return {{}}; }}
+{exports}
+"#
+        )
+    }
+
+    fn compile(key: &str, models: &str, protocols: &str, exports: &str) -> Result<PluginManifest, PluginError> {
+        let host = PluginHost::start();
+        runtime().block_on(host.load(
+            protocol_plugin_source(key, models, protocols, exports),
+            DEFAULT_CALL_TIMEOUT,
+        ))
+    }
+
+    const RESPONSES_DECODE_ONLY: &str = r#"export const protocols = {openai_responses: {
+        decodeRequest: function(ctx) { return ctx; }
+    }};"#;
+    const RESPONSES_DECODE_EVENTS: &str = r#"export const protocols = {openai_responses: {
+        decodeRequest: function(ctx) { return ctx; },
+        renderEvents: function() { return {events: [], state: null, done: false}; }
+    }};"#;
+    const RESPONSES_DECODE_FINAL: &str = r#"export const protocols = {openai_responses: {
+        decodeRequest: function(ctx) { return ctx; },
+        renderFinal: function(ctx, task) { return task; }
+    }};"#;
+    const RESPONSES_DECODE_BOTH: &str = r#"export const protocols = {openai_responses: {
+        decodeRequest: function(ctx) { return ctx; },
+        renderEvents: function() { return {events: [], state: null, done: false}; },
+        renderFinal: function(ctx, task) { return task; }
+    }};"#;
+    const VIDEO_PROTOCOL_EXPORT: &str = r#"export const protocols = {openai_video: {
+        decodeRequest: function(ctx) { return ctx; },
+        render: function(ctx, task) { return task; }
+    }};
+    export function listArtifacts() { return []; }
+    export function buildContentRequest() { return {}; }"#;
+
+    /// The host table is the contract, so its shape is worth pinning. Ported
+    /// from the reference so the two tables cannot drift
+    /// (`pkg/jsplugin/routing.go:87`).
+    #[test]
+    fn the_host_table_matches_the_reference() {
+        let names: Vec<&str> = HOST_PROTOCOLS.iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["openai_responses", "openai_video", "openai_image"]);
+        assert!(host_protocol("nope").is_none());
+
+        let responses = host_protocol(PROTOCOL_OPENAI_RESPONSES).expect("responses");
+        let create = responses
+            .operations
+            .iter()
+            .find(|op| op.name == "create")
+            .expect("create");
+        assert_eq!(create.methods, &["POST"]);
+        assert_eq!(create.path, "/v1/responses");
+        assert_eq!(create.body_kinds, &[BODY_JSON]);
+        assert_eq!(create.required_members, &["decodeRequest"]);
+        assert_eq!(
+            responses
+                .defined_modes()
+                .iter()
+                .map(|m| m.name)
+                .collect::<Vec<_>>(),
+            vec!["stream", "sync", "background"]
+        );
+        assert_eq!(
+            create.modes.iter().find(|m| m.name == "stream").unwrap().hook,
+            "renderEvents"
+        );
+        assert_eq!(
+            create.modes.iter().find(|m| m.name == "sync").unwrap().hook,
+            "renderFinal"
+        );
+        // Retrieval is host-answered and declares no members, which is what
+        // makes "retrieve" not a claimable form.
+        let retrieve = responses
+            .operations
+            .iter()
+            .find(|op| op.name == "retrieve")
+            .expect("retrieve");
+        assert_eq!(retrieve.methods, &["GET"]);
+        assert!(retrieve.required_members.is_empty());
+
+        let video = host_protocol(PROTOCOL_OPENAI_VIDEO).expect("video");
+        assert!(video.defined_modes().is_empty(), "video is mode-less");
+        let content = video
+            .operations
+            .iter()
+            .find(|op| op.name == "content")
+            .expect("content");
+        assert_eq!(content.methods, &["GET", "HEAD"]);
+        assert_eq!(
+            content.required_driver_hooks,
+            &["listArtifacts", "buildContentRequest"]
+        );
+
+        let image = host_protocol(PROTOCOL_OPENAI_IMAGE).expect("image");
+        assert!(image.defined_modes().is_empty(), "image is mode-less");
+        for operation in image.operations {
+            assert_eq!(operation.required_members, &["decodeRequest", "render"]);
+            assert_eq!(operation.render_hook, Some("render"));
+        }
+        let generate = image
+            .operations
+            .iter()
+            .find(|op| op.name == "generate")
+            .expect("generate");
+        assert_eq!(generate.methods, &["POST"]);
+        assert_eq!(generate.path, "/v1/images/generations");
+        assert_eq!(generate.body_kinds, &[BODY_JSON]);
+        let edit = image
+            .operations
+            .iter()
+            .find(|op| op.name == "edit")
+            .expect("edit");
+        assert_eq!(edit.path, "/v1/images/edits");
+        assert_eq!(edit.body_kinds, &[BODY_JSON, BODY_MULTIPART]);
+    }
+
+    /// Every refusal the reference's `TestProtocolSupportsLoadErrors` pins,
+    /// reproduced against the same fixtures
+    /// (`pkg/jsplugin/protocol_supports_test.go:35`). The wording is the
+    /// contract: a plugin author reads it and knows what to write.
+    #[test]
+    fn protocol_supports_load_errors_match_the_reference() {
+        let cases: Vec<(&str, &str, &str, &str)> = vec![
+            (
+                "bare string",
+                r#"["openai_responses"]"#,
+                RESPONSES_DECODE_BOTH,
+                r#"protocol "openai_responses" must declare supports; replace the bare string with {name: "openai_responses", supports: [...]} choosing from "stream", "sync", "background""#,
+            ),
+            (
+                "object without supports",
+                r#"[{name: "openai_responses"}]"#,
+                RESPONSES_DECODE_BOTH,
+                r#"protocol "openai_responses" must declare supports; add supports: [...] choosing from "stream", "sync", "background""#,
+            ),
+            (
+                "supports sync but only renderEvents",
+                r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+                RESPONSES_DECODE_EVENTS,
+                r#"protocol "openai_responses" supports "sync" but does not export protocols.openai_responses.renderFinal; implement it or declare supports: ["stream"]"#,
+            ),
+            (
+                "supports sync with only decodeRequest",
+                r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+                RESPONSES_DECODE_ONLY,
+                r#"protocol "openai_responses" supports "sync" but does not export protocols.openai_responses.renderFinal; implement it"#,
+            ),
+            (
+                "supports stream but also exports renderFinal",
+                r#"[{name: "openai_responses", supports: ["stream"]}]"#,
+                RESPONSES_DECODE_BOTH,
+                r#"protocol "openai_responses" exports protocols.openai_responses.renderFinal but no supported mode uses it; add "sync" or "background" to supports or remove the hook"#,
+            ),
+            (
+                "supports sync and background but also exports renderEvents",
+                r#"[{name: "openai_responses", supports: ["sync", "background"]}]"#,
+                RESPONSES_DECODE_BOTH,
+                r#"protocol "openai_responses" exports protocols.openai_responses.renderEvents but no supported mode uses it; add "stream" to supports or remove the hook"#,
+            ),
+            (
+                "empty supports",
+                r#"[{name: "openai_responses", supports: []}]"#,
+                RESPONSES_DECODE_BOTH,
+                r#"protocol "openai_responses" supports must contain at least one of "stream", "sync", "background""#,
+            ),
+            (
+                "duplicate supports",
+                r#"[{name: "openai_responses", supports: ["stream", "stream"]}]"#,
+                RESPONSES_DECODE_BOTH,
+                r#"protocol "openai_responses" supports must be unique"#,
+            ),
+            (
+                "retrieve is not a mode",
+                r#"[{name: "openai_responses", supports: ["retrieve"]}]"#,
+                RESPONSES_DECODE_BOTH,
+                r#"protocol "openai_responses" has no mode "retrieve"; retrieval of a created response is always available and is never declared"#,
+            ),
+            (
+                "openai_video forbids supports",
+                r#"[{name: "openai_video", supports: ["stream"]}]"#,
+                VIDEO_PROTOCOL_EXPORT,
+                r#"protocol "openai_video" does not define modes; supports is not allowed"#,
+            ),
+            (
+                "unknown protocol forbids supports",
+                r#"[{name: "openai_custom", supports: ["stream"]}]"#,
+                "",
+                r#"protocol "openai_custom" does not define modes; supports is not allowed"#,
+            ),
+        ];
+        for (name, protocols, exports, want) in cases {
+            let error = compile("acme", r#"["model"]"#, protocols, exports)
+                .expect_err(&format!("{name} must be refused"));
+            let text = error.to_string();
+            assert!(text.contains(want), "{name}: {text:?} does not contain {want:?}");
+        }
+    }
+
+    /// The claims the reference loads, including the mode-less protocols
+    /// (`pkg/jsplugin/protocol_supports_test.go:113`).
+    #[test]
+    fn protocol_supports_happy_paths_match_the_reference() {
+        let cases: Vec<(&str, &str, &str, &str, Vec<&str>)> = vec![
+            (
+                "stream only with renderEvents",
+                r#"["model"]"#,
+                r#"[{name: "openai_responses", supports: ["stream"]}]"#,
+                RESPONSES_DECODE_EVENTS,
+                vec!["stream"],
+            ),
+            (
+                "sync and background with renderFinal",
+                r#"["model"]"#,
+                r#"[{name: "openai_responses", supports: ["sync", "background"]}]"#,
+                RESPONSES_DECODE_FINAL,
+                vec!["sync", "background"],
+            ),
+            (
+                "all modes normalize to table order",
+                r#"["model"]"#,
+                r#"[{name: "openai_responses", supports: ["background", "stream", "sync"]}]"#,
+                RESPONSES_DECODE_BOTH,
+                vec!["stream", "sync", "background"],
+            ),
+            (
+                "openai_video object without supports",
+                r#"["gpt-5.5", "gpt-5.6"]"#,
+                r#"[{name: "openai_video", models: ["gpt-5.5"]}]"#,
+                VIDEO_PROTOCOL_EXPORT,
+                vec![],
+            ),
+            (
+                "bare openai_video",
+                r#"["model"]"#,
+                r#"["openai_video"]"#,
+                VIDEO_PROTOCOL_EXPORT,
+                vec![],
+            ),
+        ];
+        for (name, models, protocols, exports, want) in cases {
+            let manifest = compile("acme", models, protocols, exports)
+                .unwrap_or_else(|error| panic!("{name} must load: {error}"));
+            assert_eq!(manifest.protocols.len(), 1, "{name}");
+            // Order is normalized to the table's, which is what the reference's
+            // `orderProtocolSupports` does, so the same claim renders identically.
+            let got: Vec<String> = manifest.protocols[0].supports.clone();
+            let got: Vec<&str> = got.iter().map(|s| s.as_str()).collect();
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// The image protocol's refusals, against the reference's fixtures
+    /// (`pkg/jsplugin/routing_test.go:129`).
+    #[test]
+    fn the_image_protocol_demands_a_renderer_and_refuses_modes() {
+        let error = compile(
+            "image-no-render",
+            r#"["image-a"]"#,
+            r#"["openai_image"]"#,
+            r#"export const protocols = {openai_image: {decodeRequest: function(ctx) { return {kind: "submit", model: ctx.model}; }}};"#,
+        )
+        .expect_err("missing render must be refused");
+        assert!(
+            error.to_string().contains(r#"missing hook "render""#),
+            "{error}"
+        );
+
+        let error = compile(
+            "image-modes",
+            r#"["image-a"]"#,
+            r#"[{name: "openai_image", supports: ["sync"]}]"#,
+            r#"export const protocols = {openai_image: {
+                decodeRequest: function(ctx) { return {kind: "submit", model: ctx.model}; },
+                render: function(ctx, task) { return {data: []}; }
+            }};"#,
+        )
+        .expect_err("supports on a mode-less protocol must be refused");
+        assert!(error.to_string().contains("does not define modes"), "{error}");
+
+        // The claim the reference binds at both image endpoints.
+        let manifest = compile(
+            "image-ok",
+            r#"["image-a", "image-b"]"#,
+            r#"["openai_image"]"#,
+            r#"export const protocols = {openai_image: {
+                decodeRequest: function(ctx) { return {kind: "submit", model: ctx.model, requestBody: ctx.body.value}; },
+                render: function(ctx, task) { return {data: []}; }
+            }};"#,
+        )
+        .expect("a complete image plugin loads");
+        assert_eq!(manifest.protocols[0].name, "openai_image");
+        assert!(!manifest.protocols[0].supports_declared);
+    }
+
+    /// Implementations the manifest never claimed, and exports the contract has
+    /// retired, are both refused (`pkg/jsplugin/registry.go:492,499`).
+    #[test]
+    fn unclaimed_protocols_and_removed_exports_are_refused() {
+        let error = compile(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            r#"export const protocols = {
+                openai_responses: { decodeRequest: function(){return {};}, renderFinal: function(){return {};} },
+                made_up: { decodeRequest: function(){return {};} }
+            };"#,
+        )
+        .expect_err("an unclaimed protocol must be refused");
+        assert!(
+            error.to_string().contains("implements unclaimed protocol"),
+            "{error}"
+        );
+
+        for removed in ["resolveRequest", "renderError", "renderers"] {
+            let error = compile(
+                "acme",
+                r#"["model"]"#,
+                r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+                &format!(
+                    r#"export const protocols = {{openai_responses: {{
+                        decodeRequest: function(){{return {{}};}},
+                        renderFinal: function(){{return {{}};}}
+                    }}}};
+                    export function {removed}() {{ return {{}}; }}"#
+                ),
+            )
+            .expect_err("a retired export must be refused");
+            assert!(
+                error.to_string().contains("is no longer supported"),
+                "{removed}: {error}"
+            );
+        }
+    }
+
+    /// A driver hook the protocol's content operation needs is a top-level
+    /// export, not a protocol member, and its absence has its own message
+    /// (`pkg/jsplugin/registry.go:401`).
+    #[test]
+    fn a_missing_driver_hook_names_itself() {
+        let error = compile(
+            "acme-video",
+            r#"["model"]"#,
+            r#"["openai_video"]"#,
+            r#"export const protocols = {openai_video: {
+                decodeRequest: function(ctx) { return ctx; },
+                render: function(ctx, task) { return task; }
+            }};"#,
+        )
+        .expect_err("missing artifact hooks must be refused");
+        let text = error.to_string();
+        assert!(text.contains(r#"missing driver hook "listArtifacts""#), "{text}");
+        assert!(
+            text.contains(r#"missing driver hook "buildContentRequest""#),
+            "{text}"
+        );
+    }
+
+    /// The claims the validator sees directly, including the shapes a parsed
+    /// manifest cannot produce.
+    #[test]
+    fn validate_reports_every_problem_it_finds() {
+        // A declaration and a factual export disagreeing is one problem per
+        // (claimed form, missing member), so an author who fixes one claim still
+        // sees the other.
+        let exports = PluginExports {
+            protocol_members: [(
+                "openai_responses".to_string(),
+                Vec::<String>::new(),
+            )]
+            .into_iter()
+            .collect(),
+            top_level: Vec::new(),
+            protocol_names: vec!["openai_responses".to_string()],
+        };
+        let problems = validate_protocol_claims(
+            &[ProtocolClaim::object(
+                "openai_responses",
+                &["stream", "sync"],
+            )],
+            "acme",
+            &exports,
+        );
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        for member in ["decodeRequest", "renderEvents", "renderFinal"] {
+            assert!(
+                problems.iter().any(|p| p.contains(member)),
+                "{member} missing from {problems:?}"
+            );
+        }
+        assert!(validate_protocol_claims(
+            &[ProtocolClaim::object("openai_responses", &["stream", "sync"])],
+            "acme",
+            &PluginExports {
+                protocol_members: [(
+                    "openai_responses".to_string(),
+                    vec![
+                        "decodeRequest".to_string(),
+                        "renderEvents".to_string(),
+                        "renderFinal".to_string()
+                    ],
+                )]
+                .into_iter()
+                .collect(),
+                top_level: Vec::new(),
+                protocol_names: vec!["openai_responses".to_string()],
+            },
+        )
+        .is_empty());
+    }
     /// A plugin in the shape the reference actually writes them: an ES module
     /// exporting `meta` and `protocols`
     /// (`pkg/jsplugin/protocol_supports_test.go:13`).
@@ -1268,8 +2212,13 @@ mod tests {
             "#;
             for (label, source, want) in [
                 ("missing member", MISSING, "renderEvents"),
-                ("unknown protocol", UNKNOWN, "does not serve"),
-                ("no supports", NO_SUPPORTS, "declares no supports"),
+                // The reference judges an unknown protocol's `supports` before it
+                // says the protocol is unknown, so that is the message here too
+                // (`pkg/jsplugin/registry.go:1385,1389`).
+                ("unknown protocol", UNKNOWN, "does not define modes"),
+                // An empty list is not the same as an omitted one: the reference
+                // demands at least one form (`pkg/jsplugin/registry.go:1368`).
+                ("no supports", NO_SUPPORTS, "supports must contain at least one of"),
             ] {
                 let error = host
                     .load(source.to_string(), DEFAULT_CALL_TIMEOUT)
@@ -1364,62 +2313,4 @@ mod tests {
         });
     }
 
-    /// The host table is the contract, so its shape is worth pinning.
-    #[test]
-    fn the_host_serves_the_responses_protocol() {
-        let protocol = host_protocol("openai_responses").expect("known protocol");
-        assert!(host_protocol("nope").is_none());
-
-        let create = protocol
-            .operations
-            .iter()
-            .find(|op| op.name == "create")
-            .expect("create operation");
-        assert_eq!(create.method, "POST");
-        assert_eq!(create.path, "/v1/responses");
-        assert_eq!(create.required_members, &["decodeRequest"]);
-        // Streaming and non-streaming are different hooks, which is the whole
-        // reason this protocol needs a plugin at all.
-        assert_eq!(
-            create.modes.iter().find(|m| m.name == "stream").unwrap().hook,
-            "renderEvents"
-        );
-        assert_eq!(
-            create.modes.iter().find(|m| m.name == "sync").unwrap().hook,
-            "renderFinal"
-        );
-
-        // Validation reports one problem per (claimed form, missing member), so
-        // an author who drops one claim still sees the other.
-        let problems = validate_protocol_claims(
-            &[ProtocolClaim {
-                name: "openai_responses".into(),
-                models: Vec::new(),
-                supports: vec!["stream".into(), "sync".into()],
-            }],
-            "acme",
-            &[],
-        );
-        assert_eq!(problems.len(), 4, "{problems:?}");
-        for member in ["decodeRequest", "renderEvents", "renderFinal"] {
-            assert!(
-                problems.iter().any(|p| p.contains(member)),
-                "{member} missing from {problems:?}"
-            );
-        }
-        assert!(validate_protocol_claims(
-            &[ProtocolClaim {
-                name: "openai_responses".into(),
-                models: Vec::new(),
-                supports: vec!["stream".into(), "sync".into()],
-            }],
-            "acme",
-            &[
-                "decodeRequest".into(),
-                "renderEvents".into(),
-                "renderFinal".into()
-            ],
-        )
-        .is_empty());
-    }
 }
