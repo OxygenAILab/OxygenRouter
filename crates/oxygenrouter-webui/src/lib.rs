@@ -8,6 +8,7 @@ pub mod embed;
 pub mod model_list;
 pub mod proxy;
 mod state;
+pub mod task_transport;
 
 pub use proxy::fallback_handler;
 pub use state::AppState;
