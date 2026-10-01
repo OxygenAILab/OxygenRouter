@@ -35,7 +35,8 @@ mod routing;
 mod task;
 
 pub use task::{
-    parse_absolute_url, replace_private_task_id, status_is_terminal, validate_request_url,
+    build_request_body, parse_absolute_url, replace_private_task_id, status_is_terminal,
+    validate_request_url, OutboundBody, ResolvedFile, DEFAULT_MAX_INLINE_FILE_BYTES,
     QueryContext, RequestDescriptor, RequestPart, SimpleUrl, SubmitOutcome, TaskResult, TaskView,
     UpstreamKind, STATUS_FAILURE, STATUS_IN_PROGRESS, STATUS_NOT_START, STATUS_QUEUED,
     STATUS_SUBMITTED, STATUS_SUCCESS, STATUS_UNKNOWN,
@@ -43,6 +44,7 @@ pub use task::{
 
 pub use routing::{
     endpoint_index_key, file_reference, normalize_route_method, normalize_route_path,
+    parse_file_reference,
     protocol_has_modes, required_modes, unsupported_form_message, BodyFile, BodyKind,
     EndpointClaim, EndpointIndex, ProtocolBinding, ProtocolContext, RequestContext,
 };

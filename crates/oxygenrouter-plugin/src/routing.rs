@@ -195,6 +195,37 @@ fn file_to_value(file: &BodyFile) -> serde_json::Value {
     })
 }
 
+/// Resolve a file reference back to the field and file index it names, the
+/// reference's `ParseFileReference` (`pkg/jsplugin/routing.go:261`).
+///
+/// The index suffix is only accepted when it is the canonical decimal spelling,
+/// so `request_file:image[]#02` is refused while `#2` is accepted -- a reference
+/// is a name a plugin writes back verbatim, and two spellings of one index would
+/// make a mismatch look like a missing file.
+pub fn parse_file_reference(reference: &str) -> Option<(String, usize)> {
+    let rest = reference.strip_prefix("request_file:")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let (field, suffix) = match rest.split_once('#') {
+        Some((field, suffix)) => (field, Some(suffix)),
+        None => (rest, None),
+    };
+    if field.is_empty() {
+        return None;
+    }
+    match suffix {
+        None => Some((field.to_string(), 0)),
+        Some(suffix) => {
+            let index: usize = suffix.parse().ok()?;
+            if index.to_string() != suffix {
+                return None;
+            }
+            Some((field.to_string(), index))
+        }
+    }
+}
+
 /// A request plus the protocol coordinates a plugin's hooks are keyed by.
 #[derive(Debug, Clone)]
 pub struct ProtocolContext {
