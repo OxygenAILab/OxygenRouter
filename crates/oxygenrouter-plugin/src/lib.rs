@@ -36,13 +36,14 @@ mod task;
 mod task_flow;
 
 pub use task_flow::{
-    build_outbound_request, build_query_request, interpret_submit, interpret_task_result, poll_once,
-    send_submit, validate_descriptor, FlowError, HttpOutcome, OutboundRequest, PollRound,
-    PollSettlement, PollTask, SubmitAnswer, TaskFlowContext, TaskTransport, TransportFuture,
+    apply_image_inline, build_outbound_request, build_query_request, interpret_submit,
+    interpret_task_result, plan_image_encoding, poll_once, send_submit, validate_descriptor,
+    FlowError, HttpOutcome, ImageInline, OutboundRequest, PollRound, PollSettlement, PollTask,
+    SubmitAnswer, TaskFlowContext, TaskTransport, TransportFuture,
 };
 
 pub use task::{
-    build_request_body, classify_poll_http, decide_poll, is_timed_out, known_status,
+    build_request_body, classify_poll_http, image_base64, decide_poll, is_timed_out, known_status,
     parse_absolute_url, poll_failure_reason, replace_private_task_id, settle_plan,
     status_is_in_flight, status_is_terminal, terminal_refund_decision, validate_request_url,
     OutboundBody, PollClass, PollDecision, ResolvedFile, SettlePlan, DEFAULT_MAX_INLINE_FILE_BYTES,
@@ -651,6 +652,17 @@ enum Call {
         input: String,
         reply: mpsc::Sender<Result<String, PluginError>>,
     },
+    /// A top-level export, which is where the driver hooks live
+    /// (`pkg/jsplugin/registry.go:337`). A separate variant rather than a flag on
+    /// `Hook`, because the two resolve through different objects and a caller that
+    /// confused them would get a misleading "no such member".
+    Export {
+        key: String,
+        hook: String,
+        /// JSON-encoded argument list.
+        input: String,
+        reply: mpsc::Sender<Result<String, PluginError>>,
+    },
 }
 
 /// Handle to the engine thread.
@@ -732,11 +744,19 @@ impl PluginHost {
 
     /// Call one hook with the exact argument list its contract states.
     ///
-    /// A plugin's hooks are not uniform: `buildQueryRequest(ctx)` takes one
-    /// argument, `parseSubmitResponse(ctx, response)` two, and
-    /// `parseTaskResult(ctx, body, response)` three
-    /// (`relay/channel/task/jsplugin/adaptor.go:492,607,777`). The host must pass
-    /// the arity the reference passes, so the caller states it.
+    /// A plugin's hooks are not uniform, and neither is where they live:
+    ///
+    /// * a *driver* hook (`buildSubmitRequest`, `parseSubmitResponse`,
+    ///   `parseTaskResult`, `buildQueryRequest`, ...) is an ordinary top-level
+    ///   export, and the reference calls it that way (`pkg/jsplugin/registry.go:337`);
+    /// * a *protocol* hook (`decodeRequest`, `render`, `renderFinal`,
+    ///   `renderEvents`) is a member of the plugin's `protocols` object for that
+    ///   protocol (`registry.go:468`).
+    ///
+    /// The arity is the caller's to state, because the reference's differ:
+    /// `buildQueryRequest(ctx)` takes one argument, `parseSubmitResponse(ctx,
+    /// response)` two, and `parseTaskResult(ctx, body, response)` three
+    /// (`relay/channel/task/jsplugin/adaptor.go:492,607,777`).
     pub async fn call_hook_args(
         &self,
         key: &str,
@@ -744,7 +764,36 @@ impl PluginHost {
         args: &[serde_json::Value],
         timeout: Duration,
     ) -> Result<serde_json::Value, PluginError> {
+        if DRIVER_HOOKS.contains(&hook) {
+            return self.call_export_args(key, hook, args, timeout).await;
+        }
         self.call_with_args(key, hook, args, timeout).await
+    }
+
+    /// Call a top-level export, with the timeout wrapper a public entry point
+    /// needs.
+    async fn call_export_args(
+        &self,
+        key: &str,
+        hook: &str,
+        args: &[serde_json::Value],
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Call::Export {
+                key: key.to_string(),
+                hook: hook.to_string(),
+                input: serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string()),
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostStopped)?;
+        let raw = await_reply(reply_rx, timeout).await?;
+        serde_json::from_str(&raw).map_err(|error| PluginError::Hook {
+            key: key.to_string(),
+            hook: hook.to_string(),
+            message: format!("hook returned a value that is not JSON: {error}"),
+        })
     }
 
     /// Send one call and decode the JSON it returned.
@@ -822,6 +871,16 @@ fn engine_loop(rx: mpsc::Receiver<Call>) {
                 let args: Vec<serde_json::Value> =
                     serde_json::from_str(&input).unwrap_or_else(|_| vec![serde_json::Value::Null]);
                 let _ = reply.send(engine.call_member(&key, &hook, &args));
+            }
+            Call::Export {
+                key,
+                hook,
+                input,
+                reply,
+            } => {
+                let args: Vec<serde_json::Value> =
+                    serde_json::from_str(&input).unwrap_or_else(|_| vec![serde_json::Value::Null]);
+                let _ = reply.send(engine.call_export(&key, &hook, &args));
             }
         }
     }
@@ -1179,6 +1238,9 @@ impl Engine {
         hook: &str,
         args: &[serde_json::Value],
     ) -> Result<String, PluginError> {
+        // `key` may be the plugin's own key or a protocol name; either resolves to
+        // the same plugin, because a driver hook lives on the module.
+
         let Some((module, plugin_key)) = self
             .loaded
             .get(key)
@@ -1347,11 +1409,13 @@ impl Engine {
                 message: describe(&error),
             })?;
         let Some(callable) = function.as_callable() else {
-            // Not a protocol member, so it is a driver hook: the reference calls
-            // those as ordinary top-level exports (`pkg/jsplugin/registry.go:337`),
-            // and this host resolves both names through one entry point so the
-            // caller does not have to know which kind it is holding.
-            return self.call_export(&plugin_key, member, args);
+            return Err(PluginError::Hook {
+                key: key.to_string(),
+                hook: member.to_string(),
+                message: format!(
+                    "plugin {plugin_key} has no protocol member {member:?} for {key:?}; implement it under protocols.{key}"
+                ),
+            });
         };
         self.invoke(callable, key, member, args)
     }
@@ -2177,6 +2241,27 @@ pub fn normalize_protocol_supports(claims: &mut [ProtocolClaim]) {
         });
     }
 }
+
+/// The hooks that live as top-level exports rather than under `protocols`.
+///
+/// One list, because two places depend on it: the load-time check, and the call
+/// routing above. A hook in this list is called as an export; anything else is a
+/// protocol member.
+pub const DRIVER_HOOKS: &[&str] = &[
+    HOOK_BUILD_SUBMIT_REQUEST,
+    HOOK_PARSE_SUBMIT_RESPONSE,
+    HOOK_PARSE_SUBMIT_EVENT,
+    HOOK_PARSE_SUBMIT_EVENT_DELTA,
+    HOOK_BUILD_QUERY_REQUEST,
+    HOOK_PARSE_TASK_RESULT,
+    HOOK_BUILD_BATCH_QUERY_REQUEST,
+    HOOK_PARSE_BATCH_RESULT,
+    HOOK_LIST_ARTIFACTS,
+    HOOK_BUILD_CONTENT_REQUEST,
+    HOOK_EXTRACT_USAGE,
+    HOOK_EXTRACT_USAGE_ON_SUBMIT,
+    HOOK_EXTRACT_USAGE_ON_COMPLETE,
+];
 
 /// The driver hook names, as the reference spells them.
 ///

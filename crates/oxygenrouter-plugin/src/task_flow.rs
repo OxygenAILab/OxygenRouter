@@ -143,8 +143,14 @@ impl From<PluginError> for FlowError {
 pub enum SubmitAnswer {
     /// There is upstream work to poll.
     Pending(SubmitOutcome),
-    /// The upstream answered already, so there is nothing to poll.
-    Immediate(TaskResult),
+    /// The upstream answered already, so there is nothing to poll. `BodyKind` is
+    /// the response a renderer replaced, which the host may still rewrite for a
+    /// client that asked for a different encoding
+    /// (`controller/plugin_protocol_image.go:147`).
+    Immediate {
+        result: TaskResult,
+        body: serde_json::Value,
+    },
 }
 
 /// The coordinates a plugin's hooks are called with.
@@ -166,6 +172,12 @@ pub struct TaskFlowContext {
     pub files: Vec<ResolvedFile>,
     pub max_inline_bytes: u64,
     pub timeout: Duration,
+    /// The request the client sent, after the plugin's decoder normalized it. A
+    /// host-owned decision such as `response_format` is read from here, because it
+    /// is the caller's instruction rather than the vendor's dialect.
+    pub request_body: serde_json::Value,
+    /// The host's clock, for the `created` field a renderer may leave out.
+    pub created_at: i64,
 }
 
 /// Validate a descriptor before anything is sent.
@@ -268,7 +280,7 @@ pub async fn interpret_submit(
     descriptor: &RequestDescriptor,
     context: &TaskFlowContext,
     request_context: serde_json::Value,
-    outcome: &HttpOutcome,
+    outcome: &mut HttpOutcome,
 ) -> Result<SubmitAnswer, FlowError> {
     let streaming = descriptor.response_type_or_default() == "sse";
     if !streaming && outcome.is_event_stream() {
@@ -315,7 +327,16 @@ pub async fn interpret_submit(
         return Err(FlowError::fatal("plugin returned an empty taskId"));
     }
     match submission.immediate.clone() {
-        Some(immediate) => Ok(SubmitAnswer::Immediate(immediate)),
+        Some(immediate) => {
+            // What the upstream answered, before the render hook shapes it. The
+            // host's own encoding decision is applied to the hook's *output*
+            // (`controller/plugin_protocol_image.go:147`), so the caller reports
+            // the raw body and the caller-side rewrite happens in the host.
+            Ok(SubmitAnswer::Immediate {
+                result: immediate,
+                body: outcome.body_for_hook(),
+            })
+        }
         None => Ok(SubmitAnswer::Pending(submission)),
     }
 }
@@ -617,6 +638,118 @@ fn plugin_state_of(result: Option<&TaskResult>) -> Option<serde_json::Value> {
         .filter(|state| !state.is_null())
 }
 
+/// The host-owned part of an image answer, planned rather than performed.
+///
+/// Two things a client may ask for that a *plugin* is not in a position to know,
+/// because they are host policy rather than vendor dialect:
+///
+/// * `created` is the host's own clock, filled when the plugin left it out
+///   (`controller/plugin_protocol_image.go:138`);
+/// * `response_format: "b64_json"` inlines each image, and the reference does that
+///   *after* the render hook has run -- so a plugin renders upstream URLs and the
+///   host decides what the caller receives (`:147`).
+///
+/// Fetching belongs to the transport that already exists rather than here, so this
+/// only says what to fetch and where it goes. `response_json_format` is the shape
+/// the answer uses, which decides whether the images sit in a `data` array (the
+/// images API) or at a success/failure pair (the responses API).
+pub fn plan_image_encoding(
+    body: &mut serde_json::Value,
+    response_format: Option<&str>,
+    created_at: i64,
+) -> Vec<ImageInline> {
+    let Some(object) = body.as_object_mut() else {
+        return Vec::new();
+    };
+    // `created` is host-owned and only filled when the plugin did not state one:
+    // a plugin that knows the upstream's timestamp keeps it.
+    object
+        .entry("created".to_string())
+        .or_insert_with(|| serde_json::json!(created_at));
+
+    if response_format != Some("b64_json") {
+        return Vec::new();
+    }
+    let Some(data) = object.get("data").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    let mut plan = Vec::new();
+    for (index, entry) in data.iter().enumerate() {
+        let Some(item) = entry.as_object() else {
+            continue;
+        };
+        let url = item
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        // An image the plugin already inlined is left alone, and so is an entry
+        // with no URL to fetch.
+        if url.trim().is_empty() || item.contains_key("b64_json") {
+            continue;
+        }
+        plan.push(ImageInline {
+            index,
+            url,
+            mime_hint: item
+                .get("mime_type")
+                .and_then(|value| value.as_str())
+                .map(String::from),
+        });
+    }
+    plan
+}
+
+/// One image the host should inline, and where in the answer it belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInline {
+    /// Position in the answer's `data` array.
+    pub index: usize,
+    pub url: String,
+    /// A mime type the plugin stated, when it stated one.
+    pub mime_hint: Option<String>,
+}
+
+/// Place a fetched image into the answer, keeping the URL beside it.
+///
+/// The URL is kept on purpose: a client that asked for base64 can still tell which
+/// upstream artifact it received, and a fetch failure leaves the answer usable
+/// rather than failing the request (`controller/plugin_protocol_image.go:154`).
+pub fn apply_image_inline(
+    body: &mut serde_json::Value,
+    inline: &ImageInline,
+    mime_type: &str,
+    encoded: &str,
+) -> bool {
+    let Some(item) = body
+        .get_mut("data")
+        .and_then(|value| value.as_array_mut())
+        .and_then(|data| data.get_mut(inline.index))
+        .and_then(|entry| entry.as_object_mut())
+    else {
+        return false;
+    };
+    // The entry may have moved on since the plan was made, so the URL is checked
+    // again: filling the wrong image would be worse than not filling it.
+    if item.get("url").and_then(|value| value.as_str()) != Some(inline.url.as_str()) {
+        return false;
+    }
+    item.insert(
+        "b64_json".to_string(),
+        serde_json::Value::String(encoded.to_string()),
+    );
+    item.entry("mime_type".to_string())
+        .or_insert_with(|| {
+            serde_json::Value::String(
+                inline
+                    .mime_hint
+                    .clone()
+                    .unwrap_or_else(|| mime_type.to_string()),
+            )
+        });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +807,8 @@ mod tests {
             files: Vec::new(),
             max_inline_bytes: 0,
             timeout: DEFAULT_CALL_TIMEOUT,
+            request_body: serde_json::Value::Null,
+            created_at: 1_700_000_000,
         }
     }
 
@@ -835,7 +970,7 @@ mod tests {
             &descriptor,
             &ctx,
             serde_json::json!({ "model": "acme-video" }),
-            &outcome,
+            &mut outcome.clone(),
         )
         .await
         .expect("interpret");
@@ -860,13 +995,19 @@ mod tests {
         )
         .await
         .expect("load");
-        let answer = interpret_submit(&host, &descriptor, &ctx, serde_json::json!({}), &outcome)
+        let answer = interpret_submit(&host, &descriptor, &ctx, serde_json::json!({}), &mut outcome.clone())
             .await
             .expect("interpret");
         match answer {
-            SubmitAnswer::Immediate(result) => {
+            SubmitAnswer::Immediate { result, body } => {
                 assert_eq!(result.status, STATUS_SUCCESS);
                 assert_eq!(result.url, "https://cdn/1.png");
+                // The raw upstream body travels with the result, because the
+                // host's own encoding decision is applied to the renderer's
+                // *output* rather than to this -- and it is what the renderer is
+                // shown as the task's data.
+                assert_eq!(body["status"], "queued");
+                assert_eq!(body["id"], "vendor-1");
             }
             other => panic!("expected an immediate result, got {other:?}"),
         }
@@ -908,7 +1049,7 @@ mod tests {
             &descriptor,
             &ctx,
             serde_json::json!({}),
-            &json_outcome(200, "{}"),
+            &mut json_outcome(200, "{}"),
         )
         .await
         .expect_err("must refuse");
@@ -929,7 +1070,7 @@ mod tests {
             &descriptor,
             &ctx,
             serde_json::json!({}),
-            &json_outcome(200, "{}"),
+            &mut json_outcome(200, "{}"),
         )
         .await
         .expect_err("must refuse");
@@ -946,7 +1087,7 @@ mod tests {
             headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
             body: b"data: {}\n\n".to_vec(),
         };
-        let error = interpret_submit(&host, &descriptor, &ctx, serde_json::json!({}), &sse)
+        let error = interpret_submit(&host, &descriptor, &ctx, serde_json::json!({}), &mut sse.clone())
             .await
             .expect_err("must refuse");
         assert!(
@@ -975,7 +1116,7 @@ mod tests {
             &sse_descriptor,
             &streaming,
             serde_json::json!({}),
-            &json_outcome(500, "{}"),
+            &mut json_outcome(500, "{}"),
         )
         .await
         .expect_err("must refuse");

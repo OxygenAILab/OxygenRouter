@@ -1222,6 +1222,34 @@ impl Database {
         rows.collect()
     }
 
+    /// The manifest of a plugin's active build.
+    ///
+    /// `None` when the plugin is unknown or has no active version, which is the
+    /// same state the routing index treats as "not serving anything".
+    pub fn plugin_manifest(&self, key: &str) -> SqliteResult<Option<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let active: Option<String> = conn
+            .query_row(
+                "SELECT active_version FROM plugin_state WHERE key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(version) = active else {
+            return Ok(None);
+        };
+        let manifest: Option<String> = conn
+            .query_row(
+                "SELECT manifest FROM plugin_versions WHERE key=?1 AND version=?2",
+                params![key, version],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(manifest.map(|text| {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+        }))
+    }
+
     pub fn delete_plugin_version(&self, key: &str, version: &str) -> SqliteResult<usize> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;

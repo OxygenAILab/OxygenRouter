@@ -849,6 +849,11 @@ fn encode_file_placeholder(
     )))
 }
 
+/// Standard base64, for a caller that has to inline bytes the host fetched.
+pub fn image_base64(bytes: &[u8]) -> String {
+    base64_encode(bytes)
+}
+
 /// Standard base64, which is the encoding the reference's placeholders produce
 /// (`adaptor.go:428`) and the one a data URL requires.
 fn base64_encode(bytes: &[u8]) -> String {

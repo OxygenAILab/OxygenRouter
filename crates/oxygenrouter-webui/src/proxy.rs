@@ -1291,23 +1291,42 @@ struct PluginInvocation<'a> {
     body: &'a [u8],
 }
 
-/// Run one plugin-backed request: decode, dispatch, render.
+/// The channel a task flow talks to, and the credential that rides with it.
+///
+/// A task is bound to one channel for its whole life, not re-picked per poll: the
+/// upstream knows the task by an id it issued to *that* channel, so asking a
+/// different one about it would be asking a stranger.
+fn select_task_channel(state: &AppState, model: &str) -> Option<oxygenrouter_core::Channel> {
+    state
+        .db
+        .get_enabled_channels()
+        .ok()?
+        .into_iter()
+        .filter(|channel| {
+            channel.model_list.is_empty()
+                || channel
+                    .model_list
+                    .iter()
+                    .any(|listed| listed == model || listed == "*")
+        })
+        .max_by_key(|channel| (channel.priority, channel.weight))
+}
+
+/// Run one plugin-backed request: decode, submit, and (when the upstream answers
+/// at once) render.
 ///
 /// This is what makes a plugin a *bridge* rather than a filter. The plugin states
-/// the upstream request through `decodeRequest`; the host dispatches exactly that
-/// to the selected channel; the plugin renders the result back into the shape the
-/// client asked for. Nothing about the client's dialect is interpreted here, which
-/// is the point: it is how the Responses API can be served with its own semantics
-/// instead of a fixed adapter's approximation.
+/// the upstream request through `decodeRequest`; the host performs exactly that;
+/// the plugin renders the result back into the shape the client asked for.
+/// Nothing about the client's dialect is interpreted here, which is the point: it
+/// is how the Responses API can be served with its own semantics instead of a
+/// fixed adapter's approximation.
 ///
-/// The render half is **not implemented yet**, and that is enforced rather than
-/// approximated. Every protocol the host serves is `fetchMode: per_task`: the
-/// decode step produces a *task submission*, the host has to persist the task,
-/// poll it to a terminal state, and only then is there a task view for the plugin
-/// to render (`controller/plugin_protocol.go:925`, `plugin_protocol_image.go:125`).
-/// This instance has no task store, so the host refuses the request with a reason
-/// it can stand behind instead of dispatching an upstream call whose result it
-/// could neither settle nor shape.
+/// An upstream that answers *immediately* is rendered here and now, which is the
+/// whole of the synchronous image protocol. An upstream that returns a task id is
+/// persisted and answered with a task handle, because the work outlives the
+/// request: a client that gave up must not cancel billable work, and the task is
+/// polled to a terminal state by `poll_tasks_once` rather than inside this call.
 async fn plugin_bridge(
     state: std::sync::Arc<AppState>,
     invocation: PluginInvocation<'_>,
@@ -1317,7 +1336,7 @@ async fn plugin_bridge(
     let protocol = binding.protocol;
     let plugin_key = binding.plugin_key.clone();
 
-    let (_, context_value) = match build_protocol_context(
+    let (protocol_context, context_value) = match build_protocol_context(
         invocation.headers,
         invocation.body,
         client_path,
@@ -1436,22 +1455,521 @@ async fn plugin_bridge(
         );
     }
 
-    // The task subsystem the render half needs does not exist yet. Naming it here
-    // keeps the gap visible in production logs and in the console's error, rather
-    // than looking like an upstream fault.
-    let _ = state;
-    let _ = binding.operation.render_hook;
-    json_error(
-        StatusCode::NOT_IMPLEMENTED,
-        &format!(
-            "plugin {plugin_key:?} serves {protocol} through the task bridge, which this instance \
-             does not implement yet: the request decoded correctly, but there is no task store to \
-             persist, poll or settle the upstream work, and no task view to render the response from"
-        ),
+    // The channel owns the upstream and the credential, so a task without one has
+    // nowhere to go. This is the same refusal the relay path makes, worded for a
+    // task so an operator knows it is a channel gap and not a plugin bug.
+    let Some(channel) = select_task_channel(&state, &binding.model) else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!(
+                "no enabled channel serves {:?}, so plugin {plugin_key:?} has no upstream to submit to",
+                binding.model
+            ),
+        );
+    };
+
+    let flow_context = oxygenrouter_plugin::TaskFlowContext {
+        plugin_key: plugin_key.clone(),
+        model: binding.model.clone(),
+        base_url: channel.base_url.clone(),
+        authorization: task_authorization(&channel),
+        allowed_hosts: allowed_hosts_of(&state, &plugin_key),
+        submit_response_types: submit_response_types_of(&state, &plugin_key),
+        files: match resolve_request_files(invocation.headers, invocation.body).await {
+            Ok(files) => files,
+            Err(reason) => return json_error(StatusCode::BAD_REQUEST, &reason),
+        },
+        max_inline_bytes: oxygenrouter_plugin::DEFAULT_MAX_INLINE_FILE_BYTES,
+        timeout: PLUGIN_TIMEOUT,
+        // The request as the client sent it: `response_format` is the caller's
+        // instruction, not part of any vendor's dialect.
+        request_body: decoded
+            .get("requestBody")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        created_at: Utc::now().timestamp(),
+    };
+
+    // The descriptor is what the plugin wants sent; the guard checks it before a
+    // socket exists, so a plugin cannot point the channel credential anywhere the
+    // operator did not allow.
+    let descriptor = match build_submit_descriptor(
+        &state,
+        &plugin_key,
+        &flow_context,
+        &binding.model,
+        &decoded,
     )
+    .await
+    {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return json_error(
+                if error.retryable {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                &error.message,
+            )
+        }
+    };
+
+    let transport = match task_transport(&state) {
+        Ok(transport) => transport,
+        Err(reason) => return json_error(StatusCode::BAD_GATEWAY, &reason),
+    };
+    let request = match oxygenrouter_plugin::build_outbound_request(&descriptor, &flow_context) {
+        Ok(request) => request,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.message),
+    };
+    let requested_at = Instant::now();
+    let mut outcome = match oxygenrouter_plugin::send_submit(&transport, request).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log_request(
+                state.as_ref(),
+                invocation.headers,
+                "POST",
+                client_path,
+                Some(binding.model.clone()),
+                Some(channel.id.clone()),
+                None,
+                Some(StatusCode::BAD_GATEWAY.as_u16()),
+                Some(error.message.clone()),
+                requested_at.elapsed().as_millis() as i64,
+            );
+            return json_error(StatusCode::BAD_GATEWAY, &error.message);
+        }
+    };
+
+    match oxygenrouter_plugin::interpret_submit(
+        &state.plugins,
+        &descriptor,
+        &flow_context,
+        context_value,
+        &mut outcome,
+    )
+    .await
+    {
+        Ok(oxygenrouter_plugin::SubmitAnswer::Immediate { result, body }) => {
+            render_immediate(
+                &state,
+                &binding,
+                &protocol_context,
+                &flow_context,
+                &result,
+                body,
+            )
+            .await
+        }
+        Ok(oxygenrouter_plugin::SubmitAnswer::Pending(submission)) => {
+            persist_task(
+                &state,
+                &binding,
+                &channel,
+                &flow_context,
+                &submission,
+            )
+        }
+        Err(error) => json_error(
+            if error.retryable {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            &error.message,
+        ),
+    }
 }
 
-/// Render a limit rejection in the OpenAI error shape./// Render a limit rejection in the OpenAI error shape.
+/// The credential a task's upstream request carries, as an `Authorization` value.
+///
+/// A channel key is a bearer token by convention. A channel that needs something
+/// else states it in its own headers, which the descriptor may already carry.
+fn task_authorization(channel: &oxygenrouter_core::Channel) -> Option<String> {
+    let key = channel.api_key.trim();
+    if key.is_empty() {
+        None
+    } else if key.to_ascii_lowercase().starts_with("bearer ") {
+        Some(key.to_string())
+    } else {
+        Some(format!("Bearer {key}"))
+    }
+}
+
+/// The hosts a plugin's descriptors may address, from its own stored manifest.
+///
+/// Read from the manifest rather than from the live host, because the manifest is
+/// what the operator approved when they enabled the plugin.
+fn allowed_hosts_of(state: &AppState, plugin_key: &str) -> Vec<String> {
+    manifest_strings(state, plugin_key, "allowedHosts")
+}
+
+/// The submission encodings a plugin declared it can parse.
+fn submit_response_types_of(state: &AppState, plugin_key: &str) -> Vec<String> {
+    let declared = manifest_strings(state, plugin_key, "submitResponseTypes");
+    if declared.is_empty() {
+        vec!["json".to_string()]
+    } else {
+        declared
+    }
+}
+
+/// A string list from a plugin's active manifest.
+fn manifest_strings(state: &AppState, plugin_key: &str, field: &str) -> Vec<String> {
+    let Some(manifest) = state.db.plugin_manifest(plugin_key).ok().flatten() else {
+        return Vec::new();
+    };
+    manifest
+        .get(field)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The uploaded files a request carried, resolved to their bytes.
+///
+/// A plugin addresses a file by the reference its context showed it, so the host
+/// has to be able to hand back the content that reference names. The bytes cannot
+/// be derived from the reference, so the body is read again here -- once, and only
+/// for a multipart request.
+async fn resolve_request_files(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<Vec<oxygenrouter_plugin::ResolvedFile>, String> {
+    if request_content_type(headers) != "multipart/form-data" {
+        return Ok(Vec::new());
+    }
+    let Some(boundary) = multipart_boundary(headers) else {
+        return Ok(Vec::new());
+    };
+    let mut multipart = multer::Multipart::new(body_stream(body), boundary);
+    let mut files: Vec<oxygenrouter_plugin::ResolvedFile> = Vec::new();
+    let mut per_field: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| format!("multipart body could not be read: {error}"))?
+    {
+        let Some(filename) = field.file_name().map(String::from) else {
+            // A text field's content is already in the context; the parser still
+            // has to consume it to reach the next part.
+            let _ = field.bytes().await;
+            continue;
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        let mime_type = field
+            .content_type()
+            .map(|mime| mime.to_string())
+            .unwrap_or_default();
+        let index = {
+            let slot = per_field.entry(name.clone()).or_insert(0);
+            let index = *slot;
+            *slot += 1;
+            index
+        };
+        let reference = oxygenrouter_plugin::file_reference(&name, index);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|error| format!("multipart field {name:?} could not be read: {error}"))?;
+        files.push(oxygenrouter_plugin::ResolvedFile {
+            reference,
+            field: name,
+            filename,
+            mime_type,
+            bytes: bytes.to_vec(),
+        });
+    }
+    Ok(files)
+}
+
+/// Ask the plugin what to send, and check it before a socket exists.
+///
+/// The body the decoder produced is passed *into* `buildSubmitRequest` as
+/// `requestBody`, which is the reference's contract (`adaptor.go:1302`): it is the
+/// normalized request the plugin asked to send, and the hook decides how to shape
+/// it. Replacing the descriptor's own body with it instead would discard whatever
+/// routing the hook does -- the vendor's own envelope, an action, a mode -- and
+/// send the client's raw payload where the upstream expects something else.
+async fn build_submit_descriptor(
+    state: &AppState,
+    plugin_key: &str,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    resolved_model: &str,
+    decoded: &serde_json::Value,
+) -> Result<oxygenrouter_plugin::RequestDescriptor, oxygenrouter_plugin::FlowError> {
+    let request_body = decoded
+        .get("requestBody")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let descriptor = call_build_submit(state, plugin_key, flow_context, &request_body).await?;
+    oxygenrouter_plugin::validate_descriptor(&descriptor, resolved_model, flow_context)?;
+    Ok(descriptor)
+}
+
+/// Call `buildSubmitRequest`, the hook that states the upstream request.
+async fn call_build_submit(
+    state: &AppState,
+    plugin_key: &str,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    request_body: &serde_json::Value,
+) -> Result<oxygenrouter_plugin::RequestDescriptor, oxygenrouter_plugin::FlowError> {
+    let value = state
+        .plugins
+        .call_hook_args(
+            plugin_key,
+            oxygenrouter_plugin::HOOK_BUILD_SUBMIT_REQUEST,
+            &[serde_json::json!({
+                "model": flow_context.model,
+                "baseUrl": flow_context.base_url,
+                // What the plugin's decoder normalized, which the hook shapes
+                // into the vendor's own envelope (`adaptor.go:1302`).
+                "requestBody": request_body,
+            })],
+            flow_context.timeout,
+        )
+        .await
+        .map_err(|error| oxygenrouter_plugin::FlowError::fatal(error.to_string()))?;
+    serde_json::from_value(value).map_err(|error| {
+        oxygenrouter_plugin::FlowError::fatal(format!(
+            "buildSubmitRequest returned an unusable shape: {error}"
+        ))
+    })
+}
+
+/// The transport a task flow sends through, built from the instance's own SSRF
+/// policy so the network guard is the operator's rather than a default.
+fn task_transport(state: &AppState) -> Result<crate::task_transport::ReqwestTaskTransport, String> {
+    crate::task_transport::ReqwestTaskTransport::new(None, state.fetch_policy())
+}
+
+/// Render an upstream's immediate answer.
+///
+/// An immediate answer is the synchronous case: there is nothing to poll, so the
+/// plugin's render hook shapes the response now.
+async fn render_immediate(
+    state: &AppState,
+    binding: &oxygenrouter_plugin::ProtocolBinding,
+    protocol_context: &oxygenrouter_plugin::ProtocolContext,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    result: &oxygenrouter_plugin::TaskResult,
+    upstream_body: serde_json::Value,
+) -> Response {
+    let Some(hook) = binding.operation.render_hook else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "this operation declares no render hook",
+        );
+    };
+    let now = Utc::now().timestamp();
+    // The view a renderer sees is deliberately narrow: the task's lifecycle and
+    // the plugin's own data, never a credential (`service/task_plugin_view.go:11`).
+    // For an immediate answer there is no stored task yet, so the "task" is made
+    // from the upstream's own answer, which is what a synchronous plugin's renderer
+    // reads (`controller/plugin_protocol_image.go:113,125`).
+    let mut data = upstream_body;
+    if let Some(object) = data.as_object_mut() {
+        object
+            .entry("url".to_string())
+            .or_insert_with(|| serde_json::json!(result.url));
+    }
+    let view = oxygenrouter_plugin::TaskView::build(
+        &result.task_id,
+        &binding.plugin_key,
+        if result.status.is_empty() {
+            oxygenrouter_plugin::STATUS_SUCCESS
+        } else {
+            &result.status
+        },
+        &result.progress,
+        &result.reason,
+        now,
+        now,
+        now,
+        data,
+        "",
+    );
+
+    let mut rendered = match state
+        .plugins
+        .call_hook_args(
+            &binding.plugin_key,
+            hook,
+            &[
+                protocol_context.js_value(),
+                serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
+            ],
+            PLUGIN_TIMEOUT,
+        )
+        .await
+    {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "plugin {:?} could not render the response: {error}",
+                    binding.plugin_key
+                ),
+            )
+        }
+    };
+
+    // The host's own encoding decision, applied to what the renderer produced:
+    // `created` is the host's clock, and `b64_json` is the host inlining whichever
+    // URLs the renderer returned (`controller/plugin_protocol_image.go:138,147`).
+    let response_format = flow_context
+        .request_body
+        .get("response_format")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let plan = oxygenrouter_plugin::plan_image_encoding(
+        &mut rendered,
+        response_format.as_deref(),
+        flow_context.created_at,
+    );
+    if !plan.is_empty() {
+        match task_transport(state) {
+            Ok(transport) => {
+                for inline in plan {
+                    match fetch_image(&transport, &inline.url).await {
+                        Ok((mime_type, bytes)) => {
+                            let encoded = oxygenrouter_plugin::image_base64(&bytes);
+                            oxygenrouter_plugin::apply_image_inline(
+                                &mut rendered,
+                                &inline,
+                                &mime_type,
+                                &encoded,
+                            );
+                        }
+                        // The reference keeps the URL and carries on, so one
+                        // unfetchable image does not fail the whole request
+                        // (`controller/plugin_protocol_image.go:158`).
+                        Err(reason) => eprintln!(
+                            "[OxygenRouter] image inline skipped for {}: {reason}",
+                            inline.url
+                        ),
+                    }
+                }
+            }
+            Err(reason) => eprintln!("[OxygenRouter] image inline skipped: {reason}"),
+        }
+    }
+    (StatusCode::OK, axum::Json(rendered)).into_response()
+}
+
+/// Fetch an image the host is about to inline.
+///
+/// The same transport, and therefore the same guards, as any other task request:
+/// an upstream that answers with an internal URL must not be able to make the
+/// gateway fetch that address on the caller's behalf.
+async fn fetch_image(
+    transport: &crate::task_transport::ReqwestTaskTransport,
+    url: &str,
+) -> Result<(String, Vec<u8>), String> {
+    use oxygenrouter_plugin::TaskTransport;
+    let outcome = transport
+        .execute(oxygenrouter_plugin::OutboundRequest {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: None,
+            // An image host is not the upstream that holds the channel
+            // credential, so the credential stays behind.
+            authorization: None,
+        })
+        .await?;
+    if !outcome.is_success() {
+        return Err(format!("image answered {}", outcome.status));
+    }
+    let mime_type = outcome
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("application/octet-stream")
+                .trim()
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok((mime_type, outcome.body))
+}
+
+/// Store a task whose upstream work has just started, and answer with its handle.
+///
+/// The answer carries the public task id, because that is what a client polls and
+/// what a renderer will be given. The private half -- the upstream id and the
+/// plugin's own state -- is stored beside it and never leaves.
+fn persist_task(
+    state: &AppState,
+    binding: &oxygenrouter_plugin::ProtocolBinding,
+    channel: &oxygenrouter_core::Channel,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    submission: &oxygenrouter_plugin::SubmitOutcome,
+) -> Response {
+    let now = Utc::now();
+    let task_id = format!("task_{}", Uuid::new_v4().simple());
+    let record = oxygenrouter_core::TaskRecord {
+        id: Uuid::new_v4().to_string(),
+        task_id: task_id.clone(),
+        platform: binding.plugin_key.clone(),
+        user_id: String::new(),
+        channel_id: channel.id.clone(),
+        api_key_id: String::new(),
+        action: String::new(),
+        model: flow_context.model.clone(),
+        upstream_model: flow_context.model.clone(),
+        status: oxygenrouter_plugin::STATUS_SUBMITTED.to_string(),
+        progress: oxygenrouter_plugin::PROGRESS_SUBMITTED.to_string(),
+        fail_reason: String::new(),
+        created_at: now,
+        updated_at: now,
+        submit_time: Some(now),
+        start_time: None,
+        finish_time: None,
+        data: submission.task_data.clone(),
+        private: oxygenrouter_core::TaskPrivate {
+            upstream_task_id: submission.task_id.clone(),
+            plugin_state: submission.state.clone(),
+            // The credential is stored so a later poll can authenticate without
+            // the client being present, and it lives only in the private half.
+            credential: flow_context.authorization.clone().unwrap_or_default(),
+            request_snapshot: serde_json::json!({
+                "model": flow_context.model,
+                "baseUrl": flow_context.base_url,
+            }),
+        },
+    };
+    if let Err(error) = state.db.upsert_task(&record) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("the task could not be stored: {error}"),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "taskId": task_id,
+            "status": oxygenrouter_plugin::STATUS_SUBMITTED,
+            "upstreamTaskId": submission.task_id,
+        })),
+    )
+        .into_response()
+}
+
+/// Render a limit rejection in the OpenAI error shape.
 fn limit_error_response(error: oxygenrouter_proxy::limits::LimitError) -> Response {
     let message = match error {
         oxygenrouter_proxy::limits::LimitError::RateLimited { retry_after_secs } => {
