@@ -26,6 +26,14 @@ pub mod totp;
 pub use config::{APP_CONFIG, load_config, save_config};
 pub use db::{ApiKeyResolutionError, ChannelSelector, Database, DEFAULT_MIN_PASSWORD_LEN};
 pub use models::*;
+
+/// The task lifecycle literals, shared by the store, the poller and the plugin
+/// contract, so all three compare against the same strings.
+pub use oxygenrouter_plugin::{
+    STATUS_FAILURE, STATUS_IN_PROGRESS, STATUS_NOT_START, STATUS_QUEUED, STATUS_SUBMITTED,
+    STATUS_SUCCESS, STATUS_UNKNOWN,
+};
+
 pub use options::{
     find_schema, validate as validate_option, OptionKind, OptionSchema, OptionSection, OPTION_SCHEMA,
 };

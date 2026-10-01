@@ -32,6 +32,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 mod routing;
+mod task;
+
+pub use task::{
+    parse_absolute_url, replace_private_task_id, status_is_terminal, validate_request_url,
+    QueryContext, RequestDescriptor, RequestPart, SimpleUrl, SubmitOutcome, TaskResult, TaskView,
+    UpstreamKind, STATUS_FAILURE, STATUS_IN_PROGRESS, STATUS_NOT_START, STATUS_QUEUED,
+    STATUS_SUBMITTED, STATUS_SUCCESS, STATUS_UNKNOWN,
+};
 
 pub use routing::{
     endpoint_index_key, file_reference, normalize_route_method, normalize_route_path,

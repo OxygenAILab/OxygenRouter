@@ -198,6 +198,13 @@ fn token_ip_allowed(allowlist: &[String], remote_ip: &str) -> bool {
     crate::net::ip_listed(ip, allowlist)
 }
 
+/// The task columns, in the order [`Database::task_from_row`] reads them. One
+/// list, because a `SELECT *` would silently change meaning the moment a column
+/// is added.
+const TASK_COLUMNS: &str = "id,task_id,platform,user_id,channel_id,api_key_id,action,model,\
+    upstream_model,status,progress,fail_reason,created_at,updated_at,submit_time,start_time,\
+    finish_time,data,private_data";
+
 impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
@@ -404,6 +411,30 @@ impl Database {
                 status TEXT NOT NULL, external_reference TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL UNIQUE,
+                platform TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                channel_id TEXT NOT NULL DEFAULT '',
+                api_key_id TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                upstream_model TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                progress TEXT NOT NULL DEFAULT '',
+                fail_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                submit_time TEXT,
+                start_time TEXT,
+                finish_time TEXT,
+                data TEXT NOT NULL DEFAULT 'null',
+                private_data TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_platform_status ON tasks(platform, status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tasks_inflight ON tasks(status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_sessions_token ON auth_sessions(token);
             CREATE INDEX IF NOT EXISTS idx_ledger_user_created ON ledger_entries(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id, expires_at DESC);
@@ -1463,6 +1494,188 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
             });
         }
         Ok(out)
+    }
+
+    // ── Tasks ──────────────────────────────────────────────────────────────────
+
+    /// Store a newly submitted task.
+    pub fn upsert_task(&self, task: &crate::TaskRecord) -> SqliteResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"INSERT INTO tasks (id,task_id,platform,user_id,channel_id,api_key_id,action,model,
+                    upstream_model,status,progress,fail_reason,created_at,updated_at,submit_time,
+                    start_time,finish_time,data,private_data)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"#,
+            params![
+                task.id,
+                task.task_id,
+                task.platform,
+                task.user_id,
+                task.channel_id,
+                task.api_key_id,
+                task.action,
+                task.model,
+                task.upstream_model,
+                task.status,
+                task.progress,
+                task.fail_reason,
+                task.created_at.to_rfc3339(),
+                task.updated_at.to_rfc3339(),
+                task.submit_time.map(|t| t.to_rfc3339()),
+                task.start_time.map(|t| t.to_rfc3339()),
+                task.finish_time.map(|t| t.to_rfc3339()),
+                serde_json::to_string(&task.data).unwrap_or_else(|_| "null".to_string()),
+                serde_json::to_string(&task.private).unwrap_or_else(|_| "{}".to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One task by its public id.
+    pub fn get_task(&self, task_id: &str) -> SqliteResult<Option<crate::TaskRecord>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE task_id=?1"),
+            params![task_id],
+            Self::task_from_row,
+        )
+        .optional()
+    }
+
+    /// Every task a plugin owns, newest first.
+    pub fn list_tasks_for_platform(&self, platform: &str) -> SqliteResult<Vec<crate::TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE platform=?1 ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map(params![platform], Self::task_from_row)?;
+        rows.collect()
+    }
+
+    /// Every task awaiting a poll, oldest first, so a backlog is drained in the
+    /// order it was created.
+    ///
+    /// A terminal task is excluded because settlement already happened, and
+    /// polling one again would only re-settle it
+    /// (`model/task.go:369`).
+    pub fn list_in_flight_tasks(&self, limit: usize) -> SqliteResult<Vec<crate::TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE status NOT IN (?1, ?2) ORDER BY created_at ASC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                crate::STATUS_SUCCESS,
+                crate::STATUS_FAILURE,
+                limit as i64
+            ],
+            Self::task_from_row,
+        )?;
+        rows.collect()
+    }
+
+    /// Apply a poll's answer, *only* if the task is still in the state the caller
+    /// read.
+    ///
+    /// This is a compare-and-set rather than an update on purpose: the poller and
+    /// a client's synchronous wait may both be finishing the same task, and a
+    /// plain update would let the slower one overwrite a terminal status with a
+    /// stale "in progress", so the task never settles and the quota never moves.
+    /// The condition is the whole task status, so a second finisher loses the race
+    /// instead of winning it twice. Returns whether this caller was the one that
+    /// applied the change.
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        expected_status: &str,
+        update: &crate::TaskUpdate,
+    ) -> SqliteResult<bool> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            r#"UPDATE tasks
+                  SET status      = COALESCE(?3, status),
+                      progress    = COALESCE(?4, progress),
+                      fail_reason = COALESCE(?5, fail_reason),
+                      start_time  = COALESCE(?6, start_time),
+                      finish_time = COALESCE(?7, finish_time),
+                      data        = COALESCE(?8, data),
+                      private_data= COALESCE(?9, private_data),
+                      updated_at  = ?10
+                WHERE task_id = ?1 AND status = ?2"#,
+            params![
+                task_id,
+                expected_status,
+                update.status,
+                update.progress,
+                update.fail_reason,
+                update.start_time.map(|t| t.to_rfc3339()),
+                update.finish_time.map(|t| t.to_rfc3339()),
+                update
+                    .data
+                    .as_ref()
+                    .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())),
+                update.plugin_state.as_ref().map(|state| {
+                    // Only the opaque state moves; the credential and the
+                    // snapshot are written once, at submission.
+                    serde_json::to_string(&serde_json::json!({ "plugin_state": state }))
+                        .unwrap_or_else(|_| "{}".to_string())
+                }),
+                now,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Delete terminal tasks older than a cutoff, returning how many went.
+    ///
+    /// Retention is what keeps the in-flight scan cheap on a long-lived instance.
+    pub fn purge_tasks_before(&self, cutoff: DateTime<Utc>) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM tasks WHERE status IN (?1, ?2) AND updated_at < ?3",
+            params![
+                crate::STATUS_SUCCESS,
+                crate::STATUS_FAILURE,
+                cutoff.to_rfc3339()
+            ],
+        )?)
+    }
+
+    fn task_from_row(r: &rusqlite::Row<'_>) -> SqliteResult<crate::TaskRecord> {
+        let parse = |index: usize| -> Option<DateTime<Utc>> {
+            r.get::<_, Option<String>>(index)
+                .ok()
+                .flatten()
+                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+                .map(|value| value.with_timezone(&Utc))
+        };
+        Ok(crate::TaskRecord {
+            id: r.get(0)?,
+            task_id: r.get(1)?,
+            platform: r.get(2)?,
+            user_id: r.get(3)?,
+            channel_id: r.get(4)?,
+            api_key_id: r.get(5)?,
+            action: r.get(6)?,
+            model: r.get(7)?,
+            upstream_model: r.get(8)?,
+            status: r.get(9)?,
+            progress: r.get(10)?,
+            fail_reason: r.get(11)?,
+            created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(12)?)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(13)?)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            submit_time: parse(14),
+            start_time: parse(15),
+            finish_time: parse(16),
+            data: serde_json::from_str(&r.get::<_, String>(17)?)
+                .unwrap_or(serde_json::Value::Null),
+            private: serde_json::from_str(&r.get::<_, String>(18)?).unwrap_or_default(),
+        })
     }
 
     // ── Audit Logs ────────────────────────────────────────────────────────────
@@ -4138,5 +4351,153 @@ impl ChannelSelector {
             .max_by_key(|c| (c.priority, c.weight))
             .unwrap();
         Ok(Some(best))
+    }
+}
+
+#[cfg(test)]
+mod task_store_tests {
+    use super::*;
+    use crate::{TaskPrivate, TaskRecord, TaskUpdate};
+
+    fn record(task_id: &str, status: &str) -> TaskRecord {
+        let now = Utc::now();
+        TaskRecord {
+            id: format!("row-{task_id}"),
+            task_id: task_id.to_string(),
+            platform: "acme".to_string(),
+            user_id: "u1".to_string(),
+            channel_id: "c1".to_string(),
+            api_key_id: "k1".to_string(),
+            action: "text_to_video".to_string(),
+            model: "wan-video".to_string(),
+            upstream_model: "wan-video-v2".to_string(),
+            status: status.to_string(),
+            progress: String::new(),
+            fail_reason: String::new(),
+            created_at: now,
+            updated_at: now,
+            submit_time: Some(now),
+            start_time: None,
+            finish_time: None,
+            data: serde_json::json!({ "kind": "video" }),
+            private: TaskPrivate {
+                upstream_task_id: "vendor-1".to_string(),
+                plugin_state: serde_json::json!({ "cursor": 1 }),
+                credential: "secret-key".to_string(),
+                request_snapshot: serde_json::json!({ "action": "text_to_video" }),
+            },
+        }
+    }
+
+    #[test]
+    fn a_task_round_trips_with_its_private_half_intact() {
+        let db = Database::new(":memory:").expect("db");
+        db.upsert_task(&record("task_a", crate::STATUS_SUBMITTED))
+            .expect("store");
+
+        let loaded = db.get_task("task_a").expect("query").expect("present");
+        assert_eq!(loaded.status, crate::STATUS_SUBMITTED);
+        assert_eq!(loaded.model, "wan-video");
+        assert_eq!(loaded.data["kind"], "video");
+        // The private half survives, because a later poll needs both the upstream
+        // id and the state the plugin asked to keep.
+        assert_eq!(loaded.private.upstream_task_id, "vendor-1");
+        assert_eq!(loaded.private.plugin_state["cursor"], 1);
+        assert_eq!(loaded.private.credential, "secret-key");
+        assert!(loaded.submit_time.is_some());
+        assert!(loaded.start_time.is_none());
+
+        // And it is not part of the public shape, so a serialized task cannot leak it.
+        let public = serde_json::to_string(&loaded).expect("json");
+        assert!(public.contains("secret-key"), "the row type holds it");
+        assert!(db.get_task("missing").expect("query").is_none());
+    }
+
+    /// The compare-and-set is what stops two finishers from settling one task
+    /// twice: the second one sees a status that no longer matches and loses.
+    #[test]
+    fn completing_a_task_is_a_compare_and_set() {
+        let db = Database::new(":memory:").expect("db");
+        db.upsert_task(&record("task_a", crate::STATUS_SUBMITTED))
+            .expect("store");
+
+        let success = TaskUpdate {
+            status: Some(crate::STATUS_SUCCESS.to_string()),
+            progress: Some("100%".to_string()),
+            finish_time: Some(Utc::now()),
+            ..Default::default()
+        };
+        assert!(db
+            .complete_task("task_a", crate::STATUS_SUBMITTED, &success)
+            .expect("cas"));
+        // The loser read SUBMITTED too, but the row no longer is.
+        assert!(!db
+            .complete_task("task_a", crate::STATUS_SUBMITTED, &success)
+            .expect("cas"));
+
+        let settled = db.get_task("task_a").expect("query").expect("present");
+        assert_eq!(settled.status, crate::STATUS_SUCCESS);
+        assert_eq!(settled.progress, "100%");
+        assert!(settled.finish_time.is_some());
+
+        // A race decided the other way round: a poll that read SUBMITTED and
+        // found it still SUBMITTED wins even if another thread only read it.
+        db.upsert_task(&record("task_b", crate::STATUS_IN_PROGRESS))
+            .expect("store");
+        let progress = TaskUpdate {
+            status: Some(crate::STATUS_IN_PROGRESS.to_string()),
+            progress: Some("40%".to_string()),
+            ..Default::default()
+        };
+        assert!(db
+            .complete_task("task_b", crate::STATUS_IN_PROGRESS, &progress)
+            .expect("cas"));
+        assert!(db
+            .complete_task("task_b", crate::STATUS_SUBMITTED, &progress)
+            .expect("cas")
+            == false);
+    }
+
+    #[test]
+    fn only_unfinished_tasks_are_polled_and_only_finished_ones_are_purged() {
+        let db = Database::new(":memory:").expect("db");
+        for (task_id, status) in [
+            ("t1", crate::STATUS_QUEUED),
+            ("t2", crate::STATUS_IN_PROGRESS),
+            ("t3", crate::STATUS_SUCCESS),
+            ("t4", crate::STATUS_FAILURE),
+        ] {
+            db.upsert_task(&record(task_id, status)).expect("store");
+        }
+
+        let in_flight = db.list_in_flight_tasks(10).expect("list");
+        let ids: Vec<&str> = in_flight.iter().map(|t| t.task_id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&"t1") && ids.contains(&"t2"));
+
+        // A successful task is not in flight, so purging it cannot lose work.
+        assert_eq!(
+            db.purge_tasks_before(Utc::now() + chrono::Duration::seconds(60))
+                .expect("purge"),
+            2
+        );
+        assert!(db.get_task("t1").expect("query").is_some());
+        assert!(db.get_task("t3").expect("query").is_none());
+    }
+
+    #[test]
+    fn tasks_are_listed_per_platform_newest_first() {
+        let db = Database::new(":memory:").expect("db");
+        let mut first = record("t1", crate::STATUS_QUEUED);
+        first.created_at = Utc::now() - chrono::Duration::seconds(60);
+        let mut second = record("t2", crate::STATUS_QUEUED);
+        second.created_at = Utc::now();
+        db.upsert_task(&first).expect("store");
+        db.upsert_task(&second).expect("store");
+
+        let listed = db.list_tasks_for_platform("acme").expect("list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].task_id, "t2", "newest first");
+        assert!(db.list_tasks_for_platform("other").expect("list").is_empty());
     }
 }

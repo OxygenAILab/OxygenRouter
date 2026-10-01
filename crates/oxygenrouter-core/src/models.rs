@@ -979,6 +979,94 @@ pub struct PaymentOrder {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A submitted task the host owns: persisted so it survives a restart, polled
+/// until it is terminal, and settled exactly once.
+///
+/// The lifecycle mirrors the reference's `Task` (`model/task.go:50`), with the
+/// private half kept in its own struct so a console listing cannot leak it by
+/// accident: the public shape has no field for the credential or the upstream id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub id: String,
+    /// The public id a client polls by, and the one a renderer sees.
+    pub task_id: String,
+    /// The plugin key that owns this task. Also the platform a route resolves
+    /// through, which is why it is the key and not the display name.
+    pub platform: String,
+    /// The owning user, or empty for a deployment with no accounts.
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub channel_id: String,
+    /// The local token the task was submitted with, so the console can attribute
+    /// the spend and a retrieve can check the caller owns the task.
+    #[serde(default)]
+    pub api_key_id: String,
+    /// The sub-operation the plugin asked for, mirrored onto the task because a
+    /// poll answers about it.
+    #[serde(default)]
+    pub action: String,
+    /// The client-facing model, which is what a quota was quoted for.
+    pub model: String,
+    /// The upstream model actually addressed, when a descriptor rewrote it.
+    #[serde(default)]
+    pub upstream_model: String,
+    pub status: String,
+    #[serde(default)]
+    pub progress: String,
+    #[serde(default)]
+    pub fail_reason: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub submit_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub start_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finish_time: Option<DateTime<Utc>>,
+    /// What the plugin's `parseSubmitResponse` stored for its own later polls.
+    #[serde(default)]
+    pub data: serde_json::Value,
+    /// `private_data.example`
+    pub private: TaskPrivate,
+}
+
+/// The half of a task a plugin may never read back and a listing never shows.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TaskPrivate {
+    /// The id the upstream knows this task by, which is opaque to a client.
+    #[serde(default)]
+    pub upstream_task_id: String,
+    /// Opaque state the plugin asked the host to keep between polls
+    /// (`adaptor.go:1042`).
+    #[serde(default)]
+    pub plugin_state: serde_json::Value,
+    /// The credential this task was submitted with, so a later poll can
+    /// authenticate without the client being present.
+    #[serde(default)]
+    pub credential: String,
+    /// A metadata snapshot the plugin's query hooks read
+    /// (`adaptor.go:1279`).
+    #[serde(default)]
+    pub request_snapshot: serde_json::Value,
+}
+
+/// What changed on a task since it was read.
+///
+/// One struct for both an update and a compare-and-set, because the two would
+/// otherwise drift: the status a poll writes is the status the settle decision
+/// reads, and they must be the same value.
+#[derive(Debug, Clone, Default)]
+pub struct TaskUpdate {
+    pub status: Option<String>,
+    pub progress: Option<String>,
+    pub fail_reason: Option<String>,
+    pub start_time: Option<DateTime<Utc>>,
+    pub finish_time: Option<DateTime<Utc>>,
+    pub data: Option<serde_json::Value>,
+    pub plugin_state: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthenticatedUser {
     pub user: User,

@@ -1689,6 +1689,7 @@ dependencies = [
  "chrono",
  "hmac",
  "once_cell",
+ "oxygenrouter-plugin",
  "parking_lot",
  "rand_core 0.6.4",
  "rusqlite",
