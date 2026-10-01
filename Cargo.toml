@@ -22,3 +22,21 @@ rust-version = "1.75"
 
 [workspace.metadata.release]
 sign-commit = true
+
+# The development host is disk- and pagefile-constrained: a full-debug build of
+# the dependency graph costs gigabytes on C:, and rustc mmapping that much
+# metadata fails with "the paging file is too small" before it can even compile.
+# Line tables keep panic locations and `backtrace` frames useful while cutting
+# what rustc must map, and dependencies need no debug info at all because they
+# are not the code under test.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false
