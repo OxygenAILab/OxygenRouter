@@ -39,6 +39,137 @@ pub use routing::{
     EndpointClaim, EndpointIndex, ProtocolBinding, ProtocolContext, RequestContext,
 };
 
+/// Whether a version string is semver, by the reference's pattern
+/// (`pkg/jsplugin/registry.go:40`): a release triple with optional pre-release
+/// and build metadata.
+fn is_semver(version: &str) -> bool {
+    let (core, rest) = match version.split_once('+') {
+        Some((core, build)) => {
+            if build.is_empty() || !build.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                return false;
+            }
+            (core, true)
+        }
+        None => (version, false),
+    };
+    let _ = rest;
+    let core = match core.split_once('-') {
+        Some((core, pre)) => {
+            if pre.is_empty()
+                || !pre
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                return false;
+            }
+            core
+        }
+        None => core,
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts.iter().all(|part| {
+        !part.is_empty()
+            && part.chars().all(|c| c.is_ascii_digit())
+            && (part == &"0" || !part.starts_with('0'))
+    })
+}
+
+/// Whether a string is an absolute HTTP(S) URL with a host.
+fn is_absolute_http_url(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return false;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !host.is_empty() && !host.contains('@')
+}
+
+/// Whether a string is an absolute HTTPS URL with a host and no credentials,
+/// which is what a plugin's `website` must be
+/// (`pkg/jsplugin/registry.go:1207`).
+fn is_https_url(value: &str) -> bool {
+    match value.split_once("://") {
+        Some((scheme, rest)) => {
+            scheme.eq_ignore_ascii_case("https")
+                && !rest.is_empty()
+                && !rest.split(['/', '?', '#']).next().unwrap_or("").contains('@')
+                && !value.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+        }
+        None => false,
+    }
+}
+
+/// Validate locale-keyed display copy, the reference's `validateLocalizedText`
+/// (`pkg/jsplugin/registry.go:2046`).
+fn validate_localized_text(
+    text: &LocalizedText,
+    name: &str,
+    max_chars: usize,
+) -> Result<(), PluginError> {
+    if text.0.is_empty() {
+        return Ok(());
+    }
+    if text.0.len() > MAX_LOCALIZED_LOCALES {
+        return Err(PluginError::Load(format!(
+            "plugin meta {name} must not exceed {MAX_LOCALIZED_LOCALES} locales"
+        )));
+    }
+    let mut canonical: Vec<String> = Vec::new();
+    for (locale, value) in &text.0 {
+        if !is_locale_tag(locale) {
+            return Err(PluginError::Load(format!(
+                "plugin meta {name} has invalid locale {locale:?}"
+            )));
+        }
+        let canonical_locale = locale.to_ascii_lowercase();
+        if canonical.contains(&canonical_locale) {
+            return Err(PluginError::Load(format!(
+                "plugin meta {name} has duplicate locale {canonical_locale:?}"
+            )));
+        }
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(PluginError::Load(format!(
+                "plugin meta {name} value for {locale:?} must be a non-empty string"
+            )));
+        }
+        if trimmed.chars().any(|c| c.is_control()) {
+            return Err(PluginError::Load(format!(
+                "plugin meta {name} value for {locale:?} must not contain control characters"
+            )));
+        }
+        if trimmed.chars().count() > max_chars {
+            return Err(PluginError::Load(format!(
+                "plugin meta {name} must not exceed {max_chars} characters"
+            )));
+        }
+        canonical.push(canonical_locale);
+    }
+    Ok(())
+}
+
+/// Whether a string is a locale tag by the reference's pattern
+/// (`pkg/jsplugin/registry.go:41`): two or three letters, then
+/// dash-separated alphanumeric subtags.
+fn is_locale_tag(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if !(first.len() == 2 || first.len() == 3) || !first.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    parts.all(|part| {
+        (2..=8).contains(&part.len()) && part.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 /// The manifest API version this host understands.
 ///
 /// Mirrors the reference's `APIVersion1` (`pkg/jsplugin/registry.go:29`), so a
@@ -58,6 +189,8 @@ pub enum PluginError {
     UnsupportedApiVersion { found: u32, expected: u32 },
     #[error("plugin key {0:?} is not a valid identifier")]
     BadKey(String),
+    #[error("plugin meta has unknown field {0:?}")]
+    UnknownMetaField(String),
     #[error("plugin source did not run: {0}")]
     Load(String),
     #[error("plugin {key:?} has no hook {hook:?}")]
@@ -74,55 +207,37 @@ pub enum PluginError {
     HostStopped,
 }
 
-/// One routing mode a plugin declares.
-///
-/// The reference groups hooks under named "modes" (`pkg/jsplugin/registry.go`),
-/// so a mode says which platform it serves and which hook it implements.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginMode {
-    pub name: String,
-    /// Which hook this mode implements, e.g. `convertRequest`.
-    pub hook: String,
-    /// Protocols the mode serves, when it declares any.
-    #[serde(default)]
-    pub supports: Vec<String>,
-}
-
 /// A plugin's declared metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginManifest {
-    #[serde(rename = "apiVersion")]
-    pub api_version: u32,
-    /// Canonical identifier; the reference restricts it to
-    /// `^[a-z0-9][a-z0-9_-]*$` and at most 30 characters.
-    pub key: String,
+///
+/// The field set is the reference's `Meta` (`pkg/jsplugin/registry.go:86`) minus
+/// the usage/pricing half, which belongs to the billing work:
+/// `requiredCapabilities`, `submitResponseTypes`, `sortPriority`, `website`,
+/// `apiVersion`, `key`, `name`, `icon`, `description`, `version`, `author`,
+/// `baseUrl`, `channelTypes`, `models`, `fetchMode`, `allowedHosts`,
+/// `upstreams`, `routes`, `protocols`.
+///
+/// A routing mode a manifest declares. The reference keeps this on the *route*
+/// (`Route.Type` / `Decode` / `Render`), not on the meta, so a mode is an entry
+/// in [`PluginRoute`] rather than a separate list -- an extra list would be a
+/// field the reference refuses as unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PluginRoute {
+    pub method: String,
+    pub path: String,
+    /// `submit`, `query` or `dynamic` (`pkg/jsplugin/routing.go:19`).
+    #[serde(rename = "type", default)]
+    pub kind: String,
     #[serde(default)]
-    pub name: String,
+    pub action: String,
+    /// The `native` export that decodes the request.
     #[serde(default)]
-    pub version: String,
+    pub decode: String,
+    /// The `native` export that renders the response.
     #[serde(default)]
-    pub description: String,
-    /// The models this plugin serves. Required, and at least one, because a
-    /// binding names the model it serves: a plugin that declares none is bound
-    /// to no endpoint at all (`pkg/jsplugin/registry.go:1287`).
-    #[serde(default)]
-    pub models: Vec<String>,
-    /// How the host collects this plugin's upstream work: `per_task` (one poll
-    /// per task) or `batch` (`pkg/jsplugin/registry.go:1284`). Required, because
-    /// the two demand different hooks, but read leniently so a manifest that
-    /// omits it gets the reference's own message rather than a serde error.
-    #[serde(rename = "fetchMode", default)]
-    pub fetch_mode: String,
-    /// Who wrote it. The name is required, and the reference's fixtures always
-    /// carry one (`pkg/jsplugin/registry.go:1257`).
-    #[serde(default)]
-    pub author: PluginAuthor,
-    #[serde(default)]
-    pub modes: Vec<PluginMode>,
-    /// Protocols this plugin claims to serve. Validated against the host's table
-    /// and against what the source actually exports.
-    #[serde(default)]
-    pub protocols: Vec<ProtocolClaim>,
+    pub render: String,
+    /// The path parameter naming the task id, for a query route.
+    #[serde(rename = "taskIdParam", default)]
+    pub task_id_param: String,
 }
 
 /// A plugin's author, as the reference models it (`pkg/jsplugin/registry.go:177`).
@@ -138,7 +253,208 @@ pub struct PluginAuthor {
 pub const FETCH_MODE_PER_TASK: &str = "per_task";
 pub const FETCH_MODE_BATCH: &str = "batch";
 
+/// The submission response encodings a plugin may declare. The default is `json`
+/// and `sse` is the only other one (`pkg/jsplugin/registry.go:1084`).
+pub const SUBMIT_TYPES: &[&str] = &["json", "sse"];
+
+/// A capability the host either has or does not. Only these two exist, and a
+/// manifest asking for anything else is refused (`pkg/jsplugin/json_state.go:16`).
+pub const CAPABILITY_JSON_CLONE: &str = "json-clone@1";
+pub const CAPABILITY_SUBMIT_SSE_DELTA: &str = "submit-sse-delta@1";
+pub const CAPABILITIES: &[&str] = &[CAPABILITY_JSON_CLONE, CAPABILITY_SUBMIT_SSE_DELTA];
+
+/// Upstream kinds a driver may address besides its own vendor
+/// (`pkg/jsplugin/registry.go:117`).
+pub const UPSTREAM_VENDOR: &str = "vendor";
+pub const UPSTREAM_NEW_API: &str = "new_api";
+
+/// The longest `description` value, in characters
+/// (`pkg/jsplugin/registry.go:33`).
+pub const MAX_DESCRIPTION_CHARS: usize = 512;
+/// The longest `icon` value, in characters (`pkg/jsplugin/registry.go:1245`).
+pub const MAX_ICON_CHARS: usize = 128;
+/// The most locales one localized string may carry
+/// (`pkg/jsplugin/registry.go:32`).
+pub const MAX_LOCALIZED_LOCALES: usize = 16;
+
+/// Display copy, locale-keyed.
+///
+/// Plugin source may write a bare string, which normalizes to `{"en": "..."}`,
+/// or a map, which must include `en` (`pkg/jsplugin/registry.go:48,60`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct LocalizedText(pub std::collections::BTreeMap<String, String>);
+
+impl LocalizedText {
+    /// The English text, which every localized string is required to carry.
+    pub fn english(&self) -> &str {
+        self.0.get("en").map(String::as_str).unwrap_or("")
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalizedText {
+    /// Either spelling the reference accepts: a bare string, normalized to
+    /// `{"en": <text>}`, or an object of locales
+    /// (`pkg/jsplugin/registry.go:60`).
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = LocalizedText;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string or an object of locales")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                let mut map = std::collections::BTreeMap::new();
+                map.insert("en".to_string(), value.to_string());
+                Ok(LocalizedText(map))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let object: std::collections::BTreeMap<String, String> =
+                    serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(LocalizedText(object))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LocalizedText(std::collections::BTreeMap::new()))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Every field name a manifest may carry. Anything else is refused, because a
+/// silently dropped field is exactly how a manifest's `models` went missing
+/// before: the plugin loaded, looked healthy, and bound nothing
+/// (`pkg/jsplugin/registry.go:1006`).
+pub const META_FIELDS: &[&str] = &[
+    "requiredCapabilities",
+    "submitResponseTypes",
+    "sortPriority",
+    "website",
+    "apiVersion",
+    "key",
+    "name",
+    "icon",
+    "description",
+    "version",
+    "author",
+    "baseUrl",
+    "channelTypes",
+    "channelType",
+    "compatibleChannelTypes",
+    "models",
+    "fetchMode",
+    "allowedHosts",
+    "upstreams",
+    "routes",
+    "protocols",
+    "usageSchema",
+    "usageExamples",
+    "usageProfiles",
+    "auth",
+    "endpoints",
+    "submitPaths",
+    "actions",
+];
+
+/// A plugin's declared metadata.
+///
+/// `Deserialize` is derived for the field-by-field read; entry is through
+/// [`PluginManifest::from_meta`], which refuses unknown fields first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginManifest {
+    #[serde(rename = "apiVersion")]
+    pub api_version: u32,
+    /// Canonical identifier; the reference restricts it to
+    /// `^[a-z0-9][a-z0-9_-]*$` and at most 30 characters.
+    pub key: String,
+    pub name: String,
+    pub version: String,
+    /// Display copy, locale-keyed.
+    #[serde(default)]
+    pub description: LocalizedText,
+    /// The models this plugin serves. Required, and at least one, because a
+    /// binding names the model it serves: a plugin that declares none is bound
+    /// to no endpoint at all (`pkg/jsplugin/registry.go:1287`).
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// How the host collects this plugin's upstream work.
+    #[serde(rename = "fetchMode")]
+    pub fetch_mode: String,
+    /// The submission response encodings this plugin can parse.
+    #[serde(rename = "submitResponseTypes", default)]
+    pub submit_response_types: Vec<String>,
+    /// Capabilities the host must have for this plugin to serve
+    /// (`pkg/jsplugin/registry.go:1183`).
+    #[serde(rename = "requiredCapabilities")]
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    /// Who wrote it. The name is required
+    /// (`pkg/jsplugin/registry.go:1257`).
+    #[serde(default)]
+    pub author: PluginAuthor,
+    /// A LobeHub icon name or short text; a URL or data URI is refused
+    /// (`pkg/jsplugin/registry.go:1239`).
+    #[serde(default)]
+    pub icon: String,
+    /// The plugin's own site, when it has one.
+    #[serde(default)]
+    pub website: String,
+    /// The upstream base URL the plugin's hooks build against.
+    #[serde(rename = "baseUrl")]
+    #[serde(default)]
+    pub base_url: String,
+    /// Upstream hosts the plugin's descriptors may address
+    /// (`pkg/jsplugin/registry.go:1235`).
+    #[serde(rename = "allowedHosts")]
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Upstream kinds this driver speaks besides its own vendor
+    /// (`pkg/jsplugin/registry.go:1194`).
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    /// Native routes the plugin serves. Retained as-is: binding them is the
+    /// native-route work, and a route the host cannot yet serve is still the
+    /// plugin's declaration to make, which the reference also validates
+    /// (`pkg/jsplugin/registry.go:1331`).
+    #[serde(default)]
+    pub routes: Vec<PluginRoute>,
+    /// Protocols this plugin claims to serve.
+    #[serde(default)]
+    pub protocols: Vec<ProtocolClaim>,
+}
+
 impl PluginManifest {
+    /// Parse a manifest from its `meta` object, refusing unknown fields first.
+    ///
+    /// The reference checks the field set before it reads anything
+    /// (`pkg/jsplugin/registry.go:1004`), because a manifest with a field this
+    /// host does not understand is a manifest it cannot promise to honour.
+    pub fn from_meta(value: &serde_json::Value) -> Result<Self, PluginError> {
+        let object = value.as_object().ok_or_else(|| {
+            PluginError::BadManifest("plugin meta must be an object".to_string())
+        })?;
+        for field in object.keys() {
+            if !META_FIELDS.contains(&field.as_str()) {
+                return Err(PluginError::UnknownMetaField(field.clone()));
+            }
+        }
+        let mut manifest: PluginManifest = serde_json::from_value(value.clone())
+            .map_err(|error| PluginError::BadManifest(error.to_string()))?;
+        if manifest.submit_response_types.is_empty() {
+            manifest.submit_response_types = vec![SUBMIT_TYPES[0].to_string()];
+        }
+        Ok(manifest)
+    }
+
     /// Validate the fields the host relies on.
     fn validate(&self) -> Result<(), PluginError> {
         // The reference asks this first, before any other field
@@ -168,13 +484,125 @@ impl PluginManifest {
                 "plugin meta author name is required".to_string(),
             ));
         }
+        if self.author.url.trim() != "" {
+            let url = self.author.url.trim();
+            if !(url.starts_with("http://") || url.starts_with("https://"))
+                || url.split_once("://").map(|(_, rest)| rest).unwrap_or("").is_empty()
+            {
+                return Err(PluginError::Load(
+                    "plugin meta author url must be an absolute HTTP(S) URL".to_string(),
+                ));
+            }
+        }
+        // The version is semver, and the reference says `must be semver` rather
+        // than naming the pattern (`pkg/jsplugin/registry.go:1281`).
+        if !is_semver(&self.version) {
+            return Err(PluginError::Load(
+                "plugin meta version must be semver".to_string(),
+            ));
+        }
+        // An icon is a LobeHub name or short text. Shipping an image means
+        // shipping an `icon.svg`, not inlining bytes in the manifest
+        // (`pkg/jsplugin/registry.go:1239`).
+        let icon = self.icon.trim();
+        if icon.starts_with("data:") || icon.contains("://") {
+            return Err(PluginError::Load(
+                "plugin meta icon must be a LobeHub icon name or text; ship an image logo as an \
+                 icon.svg or icon.png file next to plugin.js instead"
+                    .to_string(),
+            ));
+        }
+        if icon.chars().count() > MAX_ICON_CHARS {
+            return Err(PluginError::Load(format!(
+                "plugin meta icon must not exceed {MAX_ICON_CHARS} characters"
+            )));
+        }
+        if icon.chars().any(|c| c.is_control()) {
+            return Err(PluginError::Load(
+                "plugin meta icon must not contain control characters".to_string(),
+            ));
+        }
+        validate_localized_text(&self.description, "description", MAX_DESCRIPTION_CHARS)?;
+        if !self.website.trim().is_empty() && !is_https_url(self.website.trim()) {
+            return Err(PluginError::Load(
+                "plugin meta website must be an absolute HTTPS URL without credentials".to_string(),
+            ));
+        }
+        if self.base_url.trim() != "" && !is_absolute_http_url(self.base_url.trim()) {
+            return Err(PluginError::Load(
+                "plugin meta baseUrl must be an absolute HTTP(S) URL".to_string(),
+            ));
+        }
+        // Capabilities have to exist, be unique, and be satisfiable together
+        // (`pkg/jsplugin/registry.go:1183`).
+        let mut seen_capabilities: Vec<&str> = Vec::new();
+        for capability in &self.required_capabilities {
+            if !CAPABILITIES.contains(&capability.as_str())
+                || seen_capabilities.contains(&capability.as_str())
+            {
+                return Err(PluginError::Load(format!(
+                    "unsupported or duplicate required capability {capability:?}"
+                )));
+            }
+            if capability == CAPABILITY_SUBMIT_SSE_DELTA
+                && !self.submit_response_types.iter().any(|kind| kind == "sse")
+            {
+                return Err(PluginError::Load(format!(
+                    "{CAPABILITY_SUBMIT_SSE_DELTA} requires submitResponseTypes to include sse"
+                )));
+            }
+            seen_capabilities.push(capability.as_str());
+        }
+        // Upstream kinds are only the two the reference knows, and only once each
+        // (`pkg/jsplugin/registry.go:1194`).
+        let mut seen_upstreams: Vec<&str> = Vec::new();
+        for kind in &self.upstreams {
+            if !(kind == UPSTREAM_VENDOR || kind == UPSTREAM_NEW_API)
+                || seen_upstreams.contains(&kind.as_str())
+            {
+                return Err(PluginError::Load(format!(
+                    "unsupported or duplicate upstream kind {kind:?}"
+                )));
+            }
+            seen_upstreams.push(kind.as_str());
+        }
+        // Submission encodings: unique, and only the two that exist
+        // (`pkg/jsplugin/registry.go:1084`).
+        let mut seen_submit: Vec<&str> = Vec::new();
+        for kind in &self.submit_response_types {
+            if !SUBMIT_TYPES.contains(&kind.as_str()) || seen_submit.contains(&kind.as_str()) {
+                return Err(PluginError::Load(format!(
+                    "invalid or duplicate submitResponseTypes value {kind:?}"
+                )));
+            }
+            seen_submit.push(kind.as_str());
+        }
+        // Native routes the plugin declares are validated even though this host
+        // does not bind them yet: a manifest the reference accepts must load here
+        // (`pkg/jsplugin/registry.go:1331`).
+        let mut route_keys: Vec<String> = Vec::new();
+        for route in &self.routes {
+            if normalize_route_method(&route.method).is_none() {
+                return Err(PluginError::Load(format!(
+                    "plugin route method {:?} is not one of GET, POST, PUT, PATCH, DELETE",
+                    route.method
+                )));
+            }
+            if let Err(reason) = normalize_route_path(&route.path) {
+                return Err(PluginError::Load(reason));
+            }
+            let key = format!("{} {}", route.method, route.path);
+            if route_keys.contains(&key) {
+                return Err(PluginError::Load(format!(
+                    "plugin meta routes contain duplicate route {} {}",
+                    route.method, route.path
+                )));
+            }
+            route_keys.push(key);
+        }
         Ok(())
     }
 
-    /// True when the manifest declares a mode implementing `hook`.
-    pub fn implements(&self, hook: &str) -> bool {
-        self.modes.iter().any(|mode| mode.hook == hook)
-    }
 }
 
 /// The reference's `pluginKeyPattern`, transcribed.
@@ -497,7 +925,13 @@ impl Engine {
         };
 
         manifest.validate()?;
-        let problems = validate_protocol_claims(&manifest.protocols, &manifest.key, &exports);
+        let mut problems =
+            validate_required_hooks(&manifest, &exports);
+        problems.extend(validate_protocol_claims(
+            &manifest.protocols,
+            &manifest.key,
+            &exports,
+        ));
         if !problems.is_empty() {
             return Err(PluginError::Load(problems.join("; ")));
         }
@@ -531,10 +965,8 @@ impl Engine {
                 let json = value
                     .to_json(&mut self.context)
                     .map_err(|error| PluginError::BadManifest(describe(&error)))?;
-                serde_json::from_value(
-                    serde_json::to_value(json).unwrap_or(serde_json::Value::Null),
-                )
-                .map_err(|error| PluginError::BadManifest(error.to_string()))
+                let value = serde_json::to_value(json).unwrap_or(serde_json::Value::Null);
+                PluginManifest::from_meta(&value)
             }
             _ => Err(PluginError::Load(
                 "module must export `meta`".to_string(),
@@ -560,7 +992,9 @@ impl Engine {
                 "plugin neither exported `meta` nor called register(manifest)".to_string(),
             ));
         }
-        serde_json::from_str(&raw).map_err(|error| PluginError::BadManifest(error.to_string()))
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| PluginError::BadManifest(error.to_string()))?;
+        PluginManifest::from_meta(&value)
     }
 
     /// The plugin's `protocols` object, from a module export or the global a
@@ -1621,6 +2055,60 @@ pub fn normalize_protocol_supports(claims: &mut [ProtocolClaim]) {
     }
 }
 
+/// The top-level exports every plugin must have, and the two extra ones a
+/// `batch` plugin needs instead of `buildQueryRequest`
+/// (`pkg/jsplugin/registry.go:324,332`).
+///
+/// This is the check that would have caught the missing `models` field the same
+/// way the unknown-field refusal now does: a plugin that loads but cannot be
+/// called is worse than one that fails to load.
+pub fn validate_required_hooks(manifest: &PluginManifest, exports: &PluginExports) -> Vec<String> {
+    let mut required: Vec<&str> = vec!["buildSubmitRequest", "parseSubmitResponse", "parseTaskResult"];
+    // A plugin that accepts an SSE submission must parse one event at a time,
+    // and which hook depends on whether it asked for the delta capability.
+    if manifest.submit_response_types.iter().any(|kind| kind == "sse") {
+        if manifest
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SUBMIT_SSE_DELTA)
+        {
+            required.push("parseSubmitEventDelta");
+        } else {
+            required.push("parseSubmitEvent");
+        }
+    }
+    if manifest.fetch_mode == FETCH_MODE_BATCH {
+        required.push("buildBatchQueryRequest");
+        required.push("parseBatchResult");
+    } else {
+        required.push("buildQueryRequest");
+    }
+
+    let mut problems = Vec::new();
+    for hook in &required {
+        if !exports.top_level.iter().any(|name| name == hook) {
+            problems.push(format!(
+                "plugin {} is missing required export {hook:?}",
+                manifest.key
+            ));
+        }
+    }
+    // The two artifact hooks are optional, but only together: the content
+    // endpoint needs both to answer anything (`pkg/jsplugin/registry.go:364`).
+    let lists = exports.top_level.iter().any(|name| name == "listArtifacts");
+    let builds = exports
+        .top_level
+        .iter()
+        .any(|name| name == "buildContentRequest");
+    if lists != builds {
+        problems.push(format!(
+            "plugin {} must export listArtifacts and buildContentRequest together",
+            manifest.key
+        ));
+    }
+    problems
+}
+
 /// The two claim spellings, for callers that hold a claim they did not parse.
 ///
 /// The parser keeps which spelling was written because the refusals differ
@@ -2028,6 +2516,304 @@ export function parseTaskResult() {{ return {{}}; }}
         );
     }
 
+    /// A manifest field this host does not understand is refused, because a
+    /// silently dropped field is how a manifest's `models` went missing before:
+    /// the plugin loaded, looked healthy, and bound nothing
+    /// (`pkg/jsplugin/registry.go:1004`).
+    #[test]
+    fn an_unknown_manifest_field_is_refused_by_name() {
+        let error = compile(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .expect("the reference's own meta must load");
+        assert_eq!(error.key, "acme");
+
+        let host = PluginHost::start();
+        let source = protocol_plugin_source(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        // A field the reference has never heard of either.
+        .replace("protocols:", "madeUpField: 1, protocols:");
+        let error = runtime()
+            .block_on(host.load(source, DEFAULT_CALL_TIMEOUT))
+            .expect_err("an unknown field must be refused");
+        let text = error.to_string();
+        assert!(text.contains("unknown field"), "{text}");
+        assert!(text.contains("madeUpField"), "{text}");
+    }
+
+    /// The top-level exports every plugin must have. This is the check the
+    /// reference makes per manifest shape (`pkg/jsplugin/registry.go:324,332`),
+    /// and the one that would have caught a plugin that loads but cannot be
+    /// called.
+    #[test]
+    fn the_required_driver_hooks_are_demanded_by_name() {
+        let host = PluginHost::start();
+        let source = protocol_plugin_source(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .replace("export function parseTaskResult() { return {}; }", "");
+        let error = runtime()
+            .block_on(host.load(source, DEFAULT_CALL_TIMEOUT))
+            .expect_err("a missing driver hook must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains(r#"missing required export "parseTaskResult""#),
+            "{text}"
+        );
+
+        // A `batch` fetch mode needs a different pair of hooks than `per_task`.
+        let batch = protocol_plugin_source(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .replace(r#"fetchMode: "per_task""#, r#"fetchMode: "batch""#);
+        let error = runtime()
+            .block_on(host.load(batch, DEFAULT_CALL_TIMEOUT))
+            .expect_err("a batch plugin needs its own hooks");
+        let text = error.to_string();
+        assert!(text.contains("buildBatchQueryRequest"), "{text}");
+        assert!(text.contains("parseBatchResult"), "{text}");
+        // The per-task hook it did export is not demanded instead.
+        assert!(!text.contains("buildQueryRequest"), "{text}");
+    }
+
+    /// An SSE submission needs an event parser, and which one depends on whether
+    /// the plugin asked for the delta capability
+    /// (`pkg/jsplugin/registry.go:325`).
+    #[test]
+    fn an_sse_submission_demands_the_event_parser_it_asked_for() {
+        let host = PluginHost::start();
+        let sse = protocol_plugin_source(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .replace(
+            r#"fetchMode: "per_task""#,
+            r#"fetchMode: "per_task", submitResponseTypes: ["sse"]"#,
+        );
+        let error = runtime()
+            .block_on(host.load(sse.clone(), DEFAULT_CALL_TIMEOUT))
+            .expect_err("an SSE plugin needs an event parser");
+        assert!(
+            error.to_string().contains("parseSubmitEvent"),
+            "{error}"
+        );
+
+        // Asking for the delta capability switches which hook is required, and a
+        // plugin that asks for it must also accept SSE.
+        let delta = sse.replace(
+            r#"submitResponseTypes: ["sse"]"#,
+            r#"submitResponseTypes: ["sse"], requiredCapabilities: ["submit-sse-delta@1"]"#,
+        );
+        let error = runtime()
+            .block_on(host.load(delta, DEFAULT_CALL_TIMEOUT))
+            .expect_err("the delta capability needs its own hook");
+        assert!(
+            error.to_string().contains("parseSubmitEventDelta"),
+            "{error}"
+        );
+
+        // A capability the host does not have is refused, and so is asking for
+        // one twice.
+        for (capabilities, want) in [
+            (r#"["nope@1"]"#, "unsupported or duplicate required capability"),
+            (
+                r#"["json-clone@1", "json-clone@1"]"#,
+                "unsupported or duplicate required capability",
+            ),
+            (r#"["submit-sse-delta@1"]"#, "requires submitResponseTypes to include sse"),
+        ] {
+            let source = protocol_plugin_source(
+                "acme",
+                r#"["model"]"#,
+                r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+                RESPONSES_DECODE_FINAL,
+            )
+            .replace(
+                r#"fetchMode: "per_task""#,
+                &format!(r#"fetchMode: "per_task", requiredCapabilities: {capabilities}"#),
+            );
+            let error = runtime()
+                .block_on(PluginHost::start().load(source, DEFAULT_CALL_TIMEOUT))
+                .expect_err("a bad capability list must be refused");
+            assert!(error.to_string().contains(want), "{error}");
+        }
+    }
+
+    /// The manifest checks the reference makes on its own fields: a semver
+    /// version, a usable icon, an HTTPS website, a valid upstream kind, and
+    /// locale-keyed copy that is well formed.
+    #[test]
+    fn the_manifest_field_rules_match_the_reference() {
+        fn refusal(replace_from: &str, replace_to: &str) -> String {
+            let source = protocol_plugin_source(
+                "acme",
+                r#"["model"]"#,
+                r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+                RESPONSES_DECODE_FINAL,
+            )
+            .replace(replace_from, replace_to);
+            runtime()
+                .block_on(PluginHost::start().load(source, DEFAULT_CALL_TIMEOUT))
+                .expect_err("must be refused")
+                .to_string()
+        }
+
+        // A version is semver, and the reference says so in those words.
+        assert!(refusal(r#"version: "1.0.0""#, r#"version: "1.0""#)
+            .contains("version must be semver"));
+        assert!(refusal(r#"version: "1.0.0""#, r#"version: "01.0.0""#)
+            .contains("version must be semver"));
+
+        // An icon is a name or short text, never an inlined image.
+        assert!(
+            refusal(r#"author: {name: "Test"}"#, r#"author: {name: "Test"}, icon: "https://x/y.png""#)
+                .contains("icon must be a LobeHub icon name")
+        );
+        assert!(refusal(
+            r#"author: {name: "Test"}"#,
+            &format!(r#"author: {{name: "Test"}}, icon: "{}""#, "x".repeat(200))
+        )
+        .contains("icon must not exceed"));
+
+        // A website must be HTTPS and credential-free.
+        assert!(refusal(r#"author: {name: "Test"}"#, r#"author: {name: "Test"}, website: "http://x/""#)
+            .contains("website must be an absolute HTTPS URL"));
+        assert!(
+            refusal(r#"author: {name: "Test"}"#, r#"author: {name: "Test"}, website: "https://u:p@x/""#)
+                .contains("website must be an absolute HTTPS URL")
+        );
+
+        // An upstream kind is one of two, and only once each.
+        assert!(refusal(r#"author: {name: "Test"}"#, r#"author: {name: "Test"}, upstreams: ["nope"]"#)
+            .contains("unsupported or duplicate upstream kind"));
+        assert!(refusal(
+            r#"author: {name: "Test"}"#,
+            r#"author: {name: "Test"}, upstreams: ["new_api", "new_api"]"#
+        )
+        .contains("unsupported or duplicate upstream kind"));
+
+        // Display copy is locale-keyed, must include a usable `en`, and has a
+        // length ceiling (`pkg/jsplugin/registry.go:2046`).
+        // The locale pattern is `^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$`, so a
+        // one-letter tag and an underscored one are both invalid while an unusual
+        // but well-formed tag such as `zz` is accepted
+        // (`pkg/jsplugin/registry.go:41`).
+        assert!(refusal(r#"name: "acme""#, r#"name: "acme", description: {e: "hi"}"#)
+            .contains("description has invalid locale"));
+        assert!(refusal(r#"name: "acme""#, r#"name: "acme", description: {en_US: "hi"}"#)
+            .contains("description has invalid locale"));
+        let odd = protocol_plugin_source(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .replace(
+            r#"name: "acme""#,
+            r#"name: "acme", description: {zz: "hi", en: "hi"}"#,
+        );
+        runtime()
+            .block_on(PluginHost::start().load(odd, DEFAULT_CALL_TIMEOUT))
+            .expect("a well-formed locale tag is accepted whatever the language");
+        assert!(refusal(r#"name: "acme""#, r#"name: "acme", description: {"en": "  "}"#)
+            .contains("must be a non-empty string"));
+
+        // The author is required, and its url, when present, must be absolute.
+        assert!(refusal(r#"author: {name: "Test"}"#, r#"author: {name: "  "}"#)
+            .contains("author name is required"));
+        assert!(
+            refusal(r#"author: {name: "Test"}"#, r#"author: {name: "Test", url: "nope"}"#)
+                .contains("author url must be an absolute HTTP(S) URL")
+        );
+
+        // A bare-string description is accepted and normalized to `en`, which is
+        // what the reference's own `UnmarshalJSON` does
+        // (`pkg/jsplugin/registry.go:60`).
+        let manifest = compile(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .expect("a bare description loads");
+        assert!(manifest.description.english().is_empty(), "this fixture declares none");
+
+        let described = protocol_plugin_source(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .replace(
+            r#"name: "acme""#,
+            r#"name: "acme", description: "a demo plugin""#,
+        );
+        let manifest = runtime()
+            .block_on(PluginHost::start().load(described, DEFAULT_CALL_TIMEOUT))
+            .expect("a bare string description is the reference's own spelling");
+        assert_eq!(manifest.description.english(), "a demo plugin");
+    }
+
+    /// A route the plugin declares is validated even though this host does not
+    /// bind native routes yet, because a manifest the reference accepts must load
+    /// here (`pkg/jsplugin/registry.go:1331`).
+    #[test]
+    fn declared_routes_are_validated() {
+        fn refusal(routes: &str) -> String {
+            let source = protocol_plugin_source(
+                "acme",
+                r#"["model"]"#,
+                r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+                RESPONSES_DECODE_FINAL,
+            )
+            .replace(r#"fetchMode: "per_task""#, &format!(r#"fetchMode: "per_task", routes: {routes}"#));
+            runtime()
+                .block_on(PluginHost::start().load(source, DEFAULT_CALL_TIMEOUT))
+                .expect_err("must be refused")
+                .to_string()
+        }
+
+        assert!(refusal(r#"[{method: "BREW", path: "/x"}]"#).contains("route method"));
+        assert!(refusal(r#"[{method: "POST", path: "x"}]"#).contains("must start with /"));
+        assert!(refusal(r#"[{method: "POST", path: "/a/:1x"}]"#).contains("invalid parameter"));
+        assert!(
+            refusal(r#"[{method: "POST", path: "/a"}, {method: "POST", path: "/a"}]"#)
+                .contains("duplicate route")
+        );
+
+        // A well-formed route list loads.
+        let good = protocol_plugin_source(
+            "acme",
+            r#"["model"]"#,
+            r#"[{name: "openai_responses", supports: ["sync"]}]"#,
+            RESPONSES_DECODE_FINAL,
+        )
+        .replace(
+            r#"fetchMode: "per_task""#,
+            r#"fetchMode: "per_task", routes: [{method: "POST", path: "/apiary/jobs", type: "submit", decode: "decode", render: "render"}]"#,
+        );
+        let manifest = runtime()
+            .block_on(PluginHost::start().load(good, DEFAULT_CALL_TIMEOUT))
+            .expect("a valid route loads");
+        assert_eq!(manifest.routes.len(), 1);
+        assert_eq!(manifest.routes[0].kind, "submit");
+    }
+
     /// The claims the validator sees directly, including the shapes a parsed
     /// manifest cannot produce.
     #[test]
@@ -2105,6 +2891,10 @@ export function parseTaskResult() {{ return {{}}; }}
                 }
             }
         };
+        export function buildSubmitRequest() { return {}; }
+        export function parseSubmitResponse() { return {}; }
+        export function buildQueryRequest() { return {}; }
+        export function parseTaskResult() { return {}; }
     "#;
 
     /// A plain script is accepted too: `register(meta)` plus a `protocols` value.
@@ -2117,6 +2907,10 @@ export function parseTaskResult() {{ return {{}}; }}
             decodeRequest: function (ctx) { return ctx; },
             renderFinal: function (ctx, task) { return task; }
         } };
+        function buildSubmitRequest() { return {}; }
+        function parseSubmitResponse() { return {}; }
+        function buildQueryRequest() { return {}; }
+        function parseTaskResult() { return {}; }
     "#;
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -2368,6 +3162,10 @@ export function parseTaskResult() {{ return {{}}; }}
                     decodeRequest: function () { while (true) {} },
                     renderFinal: function () { while (true) {} }
                 } };
+                export function buildSubmitRequest() { return {}; }
+                export function parseSubmitResponse() { return {}; }
+                export function buildQueryRequest() { return {}; }
+                export function parseTaskResult() { return {}; }
             "#;
             host.load(SPINNING.to_string(), DEFAULT_CALL_TIMEOUT)
                 .await

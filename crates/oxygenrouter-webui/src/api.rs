@@ -3544,7 +3544,6 @@ async fn upload_task_plugin(
                     enabled: false,
                     active_version: Some(input.version.clone()),
                     versions: vec![input.version.clone()],
-                    hooks: Vec::new(),
                     protocols: Vec::new(),
                     updated_at: Utc::now(),
                 });

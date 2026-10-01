@@ -1288,6 +1288,22 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
         .unwrap_or_default()
 }
 
+    /// A manifest's display copy, in English.
+    ///
+    /// The field is locale-keyed and its source may be a bare string, which the
+    /// reference normalizes to `{"en": ...}` (`pkg/jsplugin/registry.go:60`).
+    fn manifest_description(manifest: &serde_json::Value) -> String {
+        match manifest.get("description") {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(serde_json::Value::Object(map)) => map
+                .get("en")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        }
+    }
+
     /// The protocols a stored manifest claims, with the narrowing each declared.
     ///
     /// A bare name claims every declared model and no request forms; the object
@@ -1394,24 +1410,11 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
                 version: active_version.clone(),
                 description: manifest
                     .as_ref()
-                    .and_then(|m| m.get("description"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                    .map(Self::manifest_description)
+                    .unwrap_or_default(),
                 enabled: state.as_ref().map(|s| s.enabled).unwrap_or(false),
                 active_version,
                 versions: versions.into_iter().map(|p| p.version).collect(),
-                hooks: manifest
-                    .as_ref()
-                    .and_then(|m| m.get("modes"))
-                    .and_then(|v| v.as_array())
-                    .map(|modes| {
-                        modes
-                            .iter()
-                            .filter_map(|m| m.get("hook").and_then(|h| h.as_str()).map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
                 protocols: manifest
                     .as_ref()
                     .map(Self::claimed_protocol_names)
@@ -3844,7 +3847,6 @@ mod tests {
         assert_eq!(listed[0].active_version.as_deref(), Some("1.1.0"));
         assert_eq!(listed[0].name, "Demo Two");
         assert_eq!(listed[0].version.as_deref(), Some("1.1.0"));
-        assert_eq!(listed[0].hooks, vec!["convertRequest".to_string()]);
         assert_eq!(db.get_plugin_state("demo").unwrap().unwrap().enabled, true);
 
         // Deleting the active build clears the activation rather than leaving a
