@@ -1262,6 +1262,32 @@ impl Database {
         .optional()
     }
 
+/// The protocol names a stored manifest claims.
+///
+/// Both spellings the reference accepts are read: a bare name and a claim object
+/// (`pkg/jsplugin/routing_test.go:111,124`). Reading only the object form listed
+/// every mode-less claim as absent, which is what the console's protocol column
+/// and the routing lookup both depend on.
+pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String> {
+    manifest
+        .get("protocols")
+        .and_then(|v| v.as_array())
+        .map(|claims| {
+            claims
+                .iter()
+                .filter_map(|claim| match claim {
+                    serde_json::Value::String(name) => Some(name.clone()),
+                    serde_json::Value::Object(_) => claim
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(String::from),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
     /// Every plugin the instance knows about, for the console listing.
     ///
     /// The keys come from the union of versions and state, so a plugin uploaded
@@ -1342,16 +1368,7 @@ impl Database {
                     .unwrap_or_default(),
                 protocols: manifest
                     .as_ref()
-                    .and_then(|m| m.get("protocols"))
-                    .and_then(|v| v.as_array())
-                    .map(|claims| {
-                        claims
-                            .iter()
-                            .filter_map(|c| {
-                                c.get("name").and_then(|n| n.as_str()).map(String::from)
-                            })
-                            .collect()
-                    })
+                    .map(Self::claimed_protocol_names)
                     .unwrap_or_default(),
                 updated_at: state.map(|s| s.updated_at).unwrap_or_else(Utc::now),
             });
