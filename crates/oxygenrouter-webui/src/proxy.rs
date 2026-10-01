@@ -120,7 +120,44 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         // --- Models --------------------------------------------------------
         .route("/v1/models", any(list_models))
         .route("/v1/models/:model", any(models_get_or_delete))
+        // --- Tasks ---------------------------------------------------------
+        // The read surfaces a task plugin needs: the generic task id, and the
+        // video and response aliases the reference publishes for the same rows
+        // (`router/task-router.go:24`, `router/video-router.go:30`,
+        // `controller/plugin_protocol.go:948`).
+        .route("/v1/tasks/:key", any(task_read))
+        .route("/v1/videos/:task_id", any(task_read))
+        .route("/v1/video/generations/:task_id", any(task_read))
+        .route("/v1/responses/:response_id", any(responses_read))
         .with_state(state)
+}
+
+/// A task read by its public id.
+async fn task_read(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    task_read_response(&state, &task_id)
+}
+
+/// A response read, which is the same task under the Responses API's own id.
+///
+/// The reference publishes a `resp_` prefix and stores the task under `task_`, so
+/// the translation is a prefix swap and nothing else
+/// (`controller/plugin_protocol.go:959`). An id without the prefix is refused
+/// rather than guessed at, because guessing would turn a typo into a lookup for
+/// whatever task happens to share the rest of the string.
+async fn responses_read(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(response_id): axum::extract::Path<String>,
+) -> Response {
+    let Some(rest) = response_id.strip_prefix("resp_") else {
+        return not_found_response(
+            "bad_prefix",
+            &format!("a response id must start with \"resp_\"; got {response_id:?}"),
+        );
+    };
+    task_read_response(&state, &format!("task_{rest}"))
 }
 
 pub async fn fallback_handler(request: Request) -> Response {
@@ -1964,6 +2001,254 @@ fn persist_task(
             "taskId": task_id,
             "status": oxygenrouter_plugin::STATUS_SUBMITTED,
             "upstreamTaskId": submission.task_id,
+        })),
+    )
+        .into_response()
+}
+
+/// How many tasks one poll tick examines.
+///
+/// Bounded on purpose: a tick that walked an unbounded backlog would hold a
+/// worker for as long as the upstreams are slow, and the next tick would be late.
+/// A backlog larger than this drains over successive ticks, oldest first, which is
+/// the order `list_in_flight_tasks` returns.
+pub const TASK_POLL_BATCH: usize = 32;
+
+/// One poll tick: every in-flight task gets exactly one poll attempt.
+///
+/// The decisions belong to `poll_once`; this is where their verdicts reach the
+/// store. Completion is a compare-and-set against the status that was read, so a
+/// client's synchronous wait and this loop cannot both settle one task, and a
+/// task that changed underneath is simply left for the next tick.
+pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usize, usize) {
+    let Ok(tasks) = state.db.list_in_flight_tasks(TASK_POLL_BATCH) else {
+        return (0, 0);
+    };
+    if tasks.is_empty() {
+        return (0, 0);
+    }
+    let timeout_secs = task_timeout_secs(state);
+    let mut polled = 0;
+    let mut advanced = 0;
+
+    for task in tasks {
+        // A task whose channel is gone cannot be polled at all, and failing it
+        // would blame the upstream for an operator's edit. It is left alone; the
+        // timeout above is what eventually reclaims it.
+        let Some(channel) = state
+            .db
+            .get_channel(&task.channel_id)
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let Ok(transport) = task_transport(state) else {
+            continue;
+        };
+        let flow_context = oxygenrouter_plugin::TaskFlowContext {
+            plugin_key: task.platform.clone(),
+            model: task.model.clone(),
+            base_url: channel.base_url.clone(),
+            // The credential stored with the task, because the client that
+            // submitted it is not present to supply one.
+            authorization: None,
+            allowed_hosts: allowed_hosts_of(state, &task.platform),
+            submit_response_types: submit_response_types_of(state, &task.platform),
+            files: Vec::new(),
+            max_inline_bytes: 0,
+            timeout: PLUGIN_TIMEOUT,
+            request_body: serde_json::Value::Null,
+            created_at: task.created_at.timestamp(),
+        };
+        let authorization = task_authorization(&channel);
+        let flow_context = oxygenrouter_plugin::TaskFlowContext {
+            authorization: task
+                .private
+                .credential
+                .trim()
+                .is_empty()
+                .then_some(authorization)
+                .flatten(),
+            ..flow_context
+        };
+
+        let poll_task = oxygenrouter_plugin::PollTask {
+            task_id: task.task_id.clone(),
+            status: task.status.clone(),
+            upstream_task_id: task.private.upstream_task_id.clone(),
+            action: task.action.clone(),
+            model: task.model.clone(),
+            upstream_model: task.upstream_model.clone(),
+            created_at: task.created_at.timestamp(),
+            data: task.data.clone(),
+            state: task.private.plugin_state.clone(),
+        };
+        let settlement = oxygenrouter_plugin::poll_once(
+            &state.plugins,
+            &transport,
+            &flow_context,
+            &poll_task,
+            now,
+            timeout_secs,
+            false,
+        )
+        .await;
+        polled += 1;
+
+        if settlement.round == oxygenrouter_plugin::PollRound::Retried
+            || settlement.round == oxygenrouter_plugin::PollRound::Refused
+        {
+            if let Some(reason) = &settlement.reason {
+                eprintln!(
+                    "[OxygenRouter] task {} poll {}: {reason}",
+                    task.task_id,
+                    match settlement.round {
+                        oxygenrouter_plugin::PollRound::Retried => "failed",
+                        _ => "was refused",
+                    }
+                );
+            }
+            continue;
+        }
+
+        let finish_time = matches!(
+            settlement.round,
+            oxygenrouter_plugin::PollRound::Settled | oxygenrouter_plugin::PollRound::Failed
+        )
+        .then(Utc::now);
+        let update = oxygenrouter_core::TaskUpdate {
+            status: settlement.status.clone(),
+            progress: settlement.progress.clone(),
+            fail_reason: settlement.reason.clone(),
+            start_time: None,
+            finish_time,
+            data: None,
+            plugin_state: None,
+        };
+        match state
+            .db
+            .complete_task(&task.task_id, &settlement.expected_status, &update)
+        {
+            Ok(true) => advanced += 1,
+            // Somebody else got there first: the client's own wait, or the
+            // previous tick. Either way this loop must not settle it twice.
+            Ok(false) => continue,
+            Err(error) => {
+                eprintln!("[OxygenRouter] task {} could not be updated: {error}", task.task_id);
+                continue;
+            }
+        }
+
+        // The plugin's opaque poll state is merged rather than written as a
+        // column, because the private half also holds the upstream id and the
+        // credential -- replacing it wholesale would strand the next poll.
+        if let Some(state_value) = &settlement.plugin_state {
+            if let Err(error) = state
+                .db
+                .merge_task_plugin_state(&task.task_id, state_value)
+            {
+                eprintln!(
+                    "[OxygenRouter] task {} poll state could not be stored: {error}",
+                    task.task_id
+                );
+            }
+        }
+
+        if let Some(plan) = settlement.settle {
+            report_settlement(&task, plan);
+        }
+    }
+    (polled, advanced)
+}
+
+/// Say what a terminal task's quota should do.
+///
+/// Named rather than silent, because the reservation half is not wired yet: a
+/// task is submitted without a pre-consume, so there is nothing to settle or
+/// refund. Saying so out loud is the difference between a known gap and a silent
+/// one -- a `SettleWithUsage` verdict in this log is a real instruction that
+/// nothing is acting on.
+fn report_settlement(task: &oxygenrouter_core::TaskRecord, plan: oxygenrouter_plugin::SettlePlan) {
+    match plan {
+        oxygenrouter_plugin::SettlePlan::Refund => println!(
+            "[OxygenRouter] task {} finished as {} and owes a refund",
+            task.task_id, task.status
+        ),
+        oxygenrouter_plugin::SettlePlan::KeepReservation => {}
+        oxygenrouter_plugin::SettlePlan::SettleWithUsage => eprintln!(
+            "[OxygenRouter] task {} reported usage, but no quota was reserved at submit, \
+             so there is nothing to settle against it",
+            task.task_id
+        ),
+    }
+}
+
+/// How long a task may live before it is failed and refunded.
+///
+/// `0` disables the rule, matching the reference's "no timeout configured".
+fn task_timeout_secs(state: &AppState) -> i64 {
+    state
+        .db
+        .get_setting("TaskTimeoutSeconds")
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(0)
+}
+
+/// Answer a task read: the stored task's public shape, or a reason it is absent.
+///
+/// The reference distinguishes five reasons a read fails
+/// (`controller/task.go:167,253`: a malformed id, a task that does not exist, a
+/// task whose plugin is no longer installed, a task whose plugin no longer claims
+/// the protocol, and a task whose result was deliberately discarded). A caller
+/// debugging a 404 needs to know which one it hit, so they are not collapsed.
+pub fn task_read_response(state: &AppState, task_id: &str) -> Response {
+    let Some(task) = state.db.get_task(task_id).ok().flatten() else {
+        return not_found_response(
+            "missing",
+            &format!("no task {task_id:?} on this instance"),
+        );
+    };
+    // The plugin has to still be able to render this task; a plugin that was
+    // removed or disabled leaves a task that nothing can shape.
+    if state.db.plugin_manifest(&task.platform).ok().flatten().is_none() {
+        return not_found_response(
+            "no_plugin",
+            &format!(
+                "task {task_id:?} belongs to plugin {:?}, which is no longer installed or enabled",
+                task.platform
+            ),
+        );
+    }
+    let view = oxygenrouter_plugin::TaskView::build(
+        &task.task_id,
+        &task.platform,
+        &task.status,
+        &task.progress,
+        &task.fail_reason,
+        task.created_at.timestamp(),
+        task.updated_at.timestamp(),
+        task.finish_time.map(|at| at.timestamp()).unwrap_or(0),
+        task.data.clone(),
+        &task.private.upstream_task_id,
+    );
+    (StatusCode::OK, axum::Json(view)).into_response()
+}
+
+/// A read failure in the reference's OpenAI error shape
+/// (`controller/plugin_protocol.go`'s `writeTaskPluginResponseNotFound`).
+fn not_found_response(code: &str, message: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "type": "invalid_request_error",
+            }
         })),
     )
         .into_response()

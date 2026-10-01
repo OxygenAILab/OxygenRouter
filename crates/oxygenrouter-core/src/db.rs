@@ -1628,8 +1628,7 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
                       start_time  = COALESCE(?6, start_time),
                       finish_time = COALESCE(?7, finish_time),
                       data        = COALESCE(?8, data),
-                      private_data= COALESCE(?9, private_data),
-                      updated_at  = ?10
+                      updated_at  = ?9
                 WHERE task_id = ?1 AND status = ?2"#,
             params![
                 task_id,
@@ -1643,16 +1642,50 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
                     .data
                     .as_ref()
                     .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())),
-                update.plugin_state.as_ref().map(|state| {
-                    // Only the opaque state moves; the credential and the
-                    // snapshot are written once, at submission.
-                    serde_json::to_string(&serde_json::json!({ "plugin_state": state }))
-                        .unwrap_or_else(|_| "{}".to_string())
-                }),
                 now,
             ],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Merge a plugin's poll state into a task's private half.
+    ///
+    /// A separate call rather than a column of the update above, because the
+    /// private half is not one value: it also holds the upstream task id and the
+    /// credential, and a column write would replace all three with whichever one
+    /// the caller happened to have. A live run showed exactly that -- after one
+    /// poll the upstream id was gone, so the next poll had nothing to ask about.
+    ///
+    /// Safe as a read-modify-write because the caller has just won the
+    /// compare-and-set on this task's status, which makes it the only writer for
+    /// this transition.
+    pub fn merge_task_plugin_state(
+        &self,
+        task_id: &str,
+        state: &serde_json::Value,
+    ) -> SqliteResult<()> {
+        let conn = self.conn.lock();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT private_data FROM tasks WHERE task_id=?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        let mut private: serde_json::Value =
+            serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(object) = private.as_object_mut() else {
+            return Ok(());
+        };
+        object.insert("plugin_state".to_string(), state.clone());
+        conn.execute(
+            "UPDATE tasks SET private_data=?2, updated_at=?3 WHERE task_id=?1",
+            params![task_id, private.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     /// Delete terminal tasks older than a cutoff, returning how many went.
@@ -4511,6 +4544,43 @@ mod task_store_tests {
         );
         assert!(db.get_task("t1").expect("query").is_some());
         assert!(db.get_task("t3").expect("query").is_none());
+    }
+
+    /// A poll's own state is merged, not written over the private half.
+    ///
+    /// The regression this pins was found live: `complete_task` wrote the whole
+    /// private half as `{"plugin_state": ...}`, so one poll erased the upstream
+    /// task id and the credential and the next poll had nothing to ask about.
+    #[test]
+    fn a_poll_merges_its_state_without_losing_the_private_half() {
+        let db = Database::new(":memory:").expect("db");
+        db.upsert_task(&record("task_a", crate::STATUS_SUBMITTED))
+            .expect("store");
+
+        let update = TaskUpdate {
+            status: Some(crate::STATUS_IN_PROGRESS.to_string()),
+            progress: Some("40%".to_string()),
+            plugin_state: Some(serde_json::json!({ "cursor": 99 })),
+            ..Default::default()
+        };
+        assert!(db
+            .complete_task("task_a", crate::STATUS_SUBMITTED, &update)
+            .expect("cas"));
+        // The CAS itself writes only public fields, so the private half is intact
+        // even before the merge.
+        let after_cas = db.get_task("task_a").expect("query").expect("present");
+        assert_eq!(after_cas.private.upstream_task_id, "vendor-1");
+        assert_eq!(after_cas.private.credential, "secret-key");
+        assert_eq!(after_cas.private.plugin_state["cursor"], 1);
+
+        db.merge_task_plugin_state("task_a", &serde_json::json!({ "cursor": 99 }))
+            .expect("merge");
+        let merged = db.get_task("task_a").expect("query").expect("present");
+        assert_eq!(merged.private.upstream_task_id, "vendor-1");
+        assert_eq!(merged.private.credential, "secret-key");
+        assert_eq!(merged.private.request_snapshot["action"], "text_to_video");
+        assert_eq!(merged.private.plugin_state["cursor"], 99);
+        assert_eq!(merged.status, crate::STATUS_IN_PROGRESS);
     }
 
     #[test]

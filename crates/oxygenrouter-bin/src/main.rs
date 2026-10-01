@@ -216,6 +216,48 @@ async fn main() {
         });
     }
 
+    // Task polling. A plugin-backed protocol is `fetchMode: per_task`: the
+    // submission stores a task and the work finishes upstream, so something has to
+    // ask. This is that something, and it is the reason a task bridge is worth
+    // having rather than a synchronous call with a long timeout.
+    //
+    // The wait is sliced and the interval is re-read on every tick, for the same
+    // reason the retention and model-sync tasks above do it: a single long sleep
+    // would read the interval before sleeping, so shortening it would take effect
+    // only after the old, longer one elapsed.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            // A one-second floor, because a zero or negative interval would spin.
+            let tick = std::time::Duration::from_secs(1);
+            let mut ticker = tokio::time::interval(tick);
+            let mut last_run: Option<std::time::Instant> = None;
+            loop {
+                ticker.tick().await;
+                let seconds = state
+                    .db
+                    .get_setting("TaskPollIntervalSeconds")
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                    .filter(|value| *value >= 1)
+                    .unwrap_or(5);
+                let due = last_run
+                    .map(|last| last.elapsed() >= std::time::Duration::from_secs(seconds))
+                    .unwrap_or(true);
+                if !due {
+                    continue;
+                }
+                last_run = Some(std::time::Instant::now());
+                let now = chrono::Utc::now().timestamp();
+                let (polled, advanced) = oxygenrouter_webui::proxy::poll_tasks_once(&state, now).await;
+                if advanced > 0 {
+                    println!("[OxygenRouter] tasks: {advanced} of {polled} polled tasks advanced");
+                }
+            }
+        });
+    }
+
     // Usage summary flush. `DataExportEnabled` promises "Aggregate usage into
     // quota_data for analytics"; the counters live in memory on the relay path and
     // are written out here, so a busy gateway pays one transaction every few
