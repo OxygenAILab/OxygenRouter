@@ -151,6 +151,31 @@ impl BillingSession {
         self
     }
 
+    /// Rebuild a session around a reservation made by an earlier one.
+    ///
+    /// A task outlives the session that reserved for it, so the settlement that
+    /// happens later has to reconstruct the reservation before it can move a
+    /// delta. Without this, a fresh session's `refund` hands back zero and a
+    /// failed task silently keeps the caller's money (`refund` reads the
+    /// session's own `pre_consumed`, not the database).
+    ///
+    /// The stored amount is the whole truth the session needs: `refund` returns
+    /// exactly this much, and `settle(actual)` moves only `actual - reserved`.
+    pub fn restored(
+        token_account: String,
+        funding_account: String,
+        is_playground: bool,
+        reserved: i64,
+    ) -> Self {
+        let session = Self::new(token_account, funding_account, is_playground);
+        let reserved = reserved.max(0);
+        session.pre_consumed.store(reserved, Ordering::SeqCst);
+        if !is_playground {
+            session.token_consumed.store(reserved, Ordering::SeqCst);
+        }
+        session
+    }
+
     pub fn is_trusted(&self) -> bool {
         self.trusted
     }
@@ -416,6 +441,36 @@ mod tests {
         s.refund(&store).unwrap();
         assert_eq!(store.balance("wallet"), 10_000);
         assert_eq!(store.balance("token"), 10_000);
+    }
+
+    /// A session rebuilt from a stored reservation can return it: this is the
+    /// path a failed task takes, where the original session is long gone.
+    #[test]
+    fn a_restored_session_refunds_the_reservation_it_did_not_make() {
+        let store = MemStore::new(&[("token", 9_400), ("wallet", 9_400)]);
+        let restored = BillingSession::restored("token".into(), "wallet".into(), false, 600);
+        restored.refund(&store).unwrap();
+        assert_eq!(store.balance("token"), 10_000);
+        assert_eq!(store.balance("wallet"), 10_000);
+    }
+
+    /// And settling moves only the difference, never the whole charge again:
+    /// the reservation was already taken before this session existed.
+    #[test]
+    fn a_restored_session_settles_only_the_difference() {
+        // Overestimate: 900 reserved, 300 actual, 600 returned.
+        let store = MemStore::new(&[("token", 9_100), ("wallet", 9_100)]);
+        let restored = BillingSession::restored("token".into(), "wallet".into(), false, 900);
+        restored.settle(&store, 300).unwrap();
+        assert_eq!(store.balance("token"), 9_700);
+        assert_eq!(store.balance("wallet"), 9_700);
+
+        // Underestimate: 400 reserved, 750 actual, 350 more taken.
+        let store = MemStore::new(&[("token", 9_600), ("wallet", 9_600)]);
+        let restored = BillingSession::restored("token".into(), "wallet".into(), false, 400);
+        restored.settle(&store, 750).unwrap();
+        assert_eq!(store.balance("token"), 9_250);
+        assert_eq!(store.balance("wallet"), 9_250);
     }
 
     #[test]

@@ -3028,11 +3028,7 @@ fn refund_task_quota(state: &AppState, billing: &oxygenrouter_core::TaskBilling)
     let funding = task_funding(billing);
     match state.billing.refund(
         state.billing_store.as_ref(),
-        &oxygenrouter_billing::BillingSession::new(
-            billing.key_id.clone(),
-            billing.user_id.clone(),
-            false,
-        ),
+        &task_session(billing),
         &billing.key_id,
         &billing.user_id,
         &funding,
@@ -3046,6 +3042,21 @@ fn refund_task_quota(state: &AppState, billing: &oxygenrouter_core::TaskBilling)
             billing.key_id
         ),
     }
+}
+
+/// Rebuild the session a stored task's reservation belongs to.
+///
+/// The reservation outlives the request session that made it, so a later refund
+/// or settle has to carry the reserved amount back into the session. A fresh
+/// session has no memory of the pre-consume, and its `refund` would hand back
+/// zero -- a failed task keeping the caller's money.
+fn task_session(billing: &oxygenrouter_core::TaskBilling) -> oxygenrouter_billing::BillingSession {
+    oxygenrouter_billing::BillingSession::restored(
+        billing.key_id.clone(),
+        billing.user_id.clone(),
+        false,
+        billing.reserved_micros,
+    )
 }
 
 /// The funding source a stored task settles against.
