@@ -1948,6 +1948,7 @@ async fn plugin_bridge(
         authorization: task_authorization(&channel),
         allowed_hosts: allowed_hosts_of(&state, &plugin_key),
         submit_response_types: submit_response_types_of(&state, &plugin_key),
+        required_capabilities: manifest_strings(&state, &plugin_key, "requiredCapabilities"),
         files: match resolve_request_files(invocation.headers, invocation.body).await {
             Ok(files) => files,
             Err(reason) => return json_error(StatusCode::BAD_REQUEST, &reason),
@@ -2772,6 +2773,7 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
             authorization: None,
             allowed_hosts: allowed_hosts_of(state, &task.platform),
             submit_response_types: submit_response_types_of(state, &task.platform),
+            required_capabilities: manifest_strings(state, &task.platform, "requiredCapabilities"),
             files: Vec::new(),
             max_inline_bytes: 0,
             timeout: PLUGIN_TIMEOUT,

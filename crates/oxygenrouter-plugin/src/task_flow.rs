@@ -22,9 +22,10 @@ use crate::task::{
     build_request_body, validate_request_url, OutboundBody, RequestDescriptor, ResolvedFile,
     SubmitOutcome, TaskResult,
 };
+use crate::submit_stream::read_submit_events;
 use crate::{
-    PluginError, PluginHost, HOOK_BUILD_QUERY_REQUEST, HOOK_PARSE_SUBMIT_RESPONSE,
-    HOOK_PARSE_TASK_RESULT,
+    PluginError, PluginHost, CAPABILITY_SUBMIT_SSE_DELTA, HOOK_BUILD_QUERY_REQUEST,
+    HOOK_PARSE_SUBMIT_RESPONSE, HOOK_PARSE_TASK_RESULT,
 };
 
 /// One outbound request, fully formed: the host only has to send it.
@@ -168,6 +169,10 @@ pub struct TaskFlowContext {
     pub allowed_hosts: Vec<String>,
     /// The submission encodings the plugin declared it can parse.
     pub submit_response_types: Vec<String>,
+    /// The capabilities the plugin required at load time. The delta encoding
+    /// is the one the submit-stream reader has to know about, because it
+    /// selects which per-event hook the plugin exports.
+    pub required_capabilities: Vec<String>,
     /// Files the request carried, resolved to their bytes.
     pub files: Vec<ResolvedFile>,
     pub max_inline_bytes: u64,
@@ -295,11 +300,41 @@ pub async fn interpret_submit(
         });
     }
 
+    // An SSE submission is read through the plugin's per-event parser; what it
+    // accumulates is the `body` the response parser then sees, exactly as if
+    // the upstream had answered one JSON document (`submit_stream.go:21`).
+    let body = if streaming {
+        if !outcome.is_event_stream() {
+            return Err(FlowError::fatal(
+                "expected a text/event-stream submit response",
+            ));
+        }
+        let delta = context
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SUBMIT_SSE_DELTA);
+        match read_submit_events(
+            host,
+            &context.plugin_key,
+            delta,
+            &request_context,
+            &outcome.body,
+            context.timeout,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(message) => return Err(FlowError::fatal(message)),
+        }
+    } else {
+        outcome.body_for_hook()
+    };
+
     let parsed = host
         .call_hook_args(
             &context.plugin_key,
             HOOK_PARSE_SUBMIT_RESPONSE,
-            &[request_context, submission_input(outcome)],
+            &[request_context, submission_input(outcome, body.clone())],
             context.timeout,
         )
         .await;
@@ -334,7 +369,7 @@ pub async fn interpret_submit(
             // the raw body and the caller-side rewrite happens in the host.
             Ok(SubmitAnswer::Immediate {
                 result: immediate,
-                body: outcome.body_for_hook(),
+                body,
             })
         }
         None => Ok(SubmitAnswer::Pending(submission)),
@@ -343,7 +378,7 @@ pub async fn interpret_submit(
 
 /// The second argument to `parseSubmitResponse`: the status, the headers and the
 /// body, because a plugin decides from all three (`adaptor.go:492`).
-fn submission_input(outcome: &HttpOutcome) -> serde_json::Value {
+fn submission_input(outcome: &HttpOutcome, body: serde_json::Value) -> serde_json::Value {
     let mut headers = serde_json::Map::new();
     for (name, value) in &outcome.headers {
         let entry = headers
@@ -356,7 +391,7 @@ fn submission_input(outcome: &HttpOutcome) -> serde_json::Value {
     serde_json::json!({
         "statusCode": outcome.status,
         "headers": headers,
-        "body": outcome.body_for_hook(),
+        "body": body,
     })
 }
 
@@ -804,6 +839,7 @@ mod tests {
             authorization: Some("Bearer channel-key".to_string()),
             allowed_hosts: vec!["cdn.vendor.example".to_string()],
             submit_response_types: vec!["json".to_string()],
+            required_capabilities: Vec::new(),
             files: Vec::new(),
             max_inline_bytes: 0,
             timeout: DEFAULT_CALL_TIMEOUT,
@@ -1121,6 +1157,319 @@ mod tests {
         .await
         .expect_err("must refuse");
         assert!(!error.retryable, "an accepted stream is not retried");
+        });
+    }
+
+    /// A plugin that answers a submission with an event stream is read through
+    /// its own per-event parser, and what it accumulates is the body its
+    /// response parser sees -- the ported contract from
+    /// `relay/channel/task/jsplugin/adaptor_test.go:1681`.
+    #[test]
+    fn an_sse_submission_is_read_through_the_plugins_event_parser() {
+        runtime().block_on(async {
+            const SOURCE: &str = r#"
+                export const meta = {apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-video"], fetchMode:"per_task",
+                    submitResponseTypes:["json","sse"], protocols:["openai_video"]};
+                export function buildSubmitRequest(ctx) {
+                    return {url: ctx.baseUrl + "/compile", responseType: ctx.requestBody.responseType || "sse"};
+                }
+                export function parseSubmitEvent(ctx, event, previous) {
+                    const chunk = JSON.parse(event.data);
+                    if (chunk.error) throw new Error("provider stream failure");
+                    if (chunk.badState) return {state:null};
+                    if (chunk.largeState) return {state:{document:"x".repeat(1048577)},done:chunk.complete === true};
+                    if (chunk.escapedState) return {state:{document:String.fromCharCode(0).repeat(200000)},done:true};
+                    if (chunk.resetState) return {state:{document:"",units:0},done:true};
+                    const state = Object.assign({}, previous || {document:"",units:0});
+                    state.document += chunk.part || "";
+                    if (chunk.units !== undefined) state.units = chunk.units;
+                    state.event = event.event; state.id = event.id;
+                    return {state:state,done:chunk.complete === true};
+                }
+                export function parseSubmitResponse(ctx, response) {
+                    return {taskId:"vendor-document", taskData: response.body, immediate:{status:"SUCCESS"}};
+                }
+                export function buildQueryRequest() { return {url:"https://api.vendor.example/query"}; }
+                export function parseTaskResult() { return {status:"SUCCESS"}; }
+                export const protocols = {openai_video: {
+                    decodeRequest: function(ctx) { return {kind:"submit", model: ctx.model}; },
+                    render: function(ctx, task) { return task; }
+                }};
+                export function listArtifacts() { return []; }
+                export function buildContentRequest() { return {}; }
+            "#;
+            let host = PluginHost::start();
+            host.load(SOURCE.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+
+            let mut ctx = context();
+            ctx.submit_response_types = vec!["json".to_string(), "sse".to_string()];
+            let mut descriptor = new_descriptor("https://api.vendor.example/compile");
+            descriptor.response_type = "sse".to_string();
+
+            let sse = |content_type: &str, body: Vec<u8>| HttpOutcome {
+                status: 200,
+                headers: vec![("content-type".to_string(), content_type.to_string())],
+                body,
+            };
+            let cases: Vec<(&str, &str, Vec<u8>, bool)> = vec![
+                (
+                    "multiline and CRLF",
+                    "text/event-stream; charset=utf-8",
+                    b": heartbeat\r\nid: doc-1\r\nevent: update\r\ndata: {\"part\":\r\ndata: \"hello\",\"units\":2}\r\n\r\ndata: {\"part\":\"world\",\"units\":3,\"complete\":true}\n\n".to_vec(),
+                    true,
+                ),
+                (
+                    "zero actual units",
+                    "text/event-stream",
+                    b"data: {\"part\":\"free\",\"units\":0,\"complete\":true}\n\n".to_vec(),
+                    true,
+                ),
+                (
+                    "premature EOF",
+                    "text/event-stream",
+                    b"data: {\"part\":\"partial\"}\n\n".to_vec(),
+                    false,
+                ),
+                (
+                    "unterminated event",
+                    "text/event-stream",
+                    b"data: {\"complete\":true}".to_vec(),
+                    false,
+                ),
+                (
+                    "provider error",
+                    "text/event-stream",
+                    b"data: {\"error\":true}\n\n".to_vec(),
+                    false,
+                ),
+                (
+                    "invalid hook result",
+                    "text/event-stream",
+                    b"data: {\"badState\":true}\n\n".to_vec(),
+                    false,
+                ),
+                (
+                    "state limit",
+                    "text/event-stream",
+                    b"data: {\"largeState\":true}\n\n".to_vec(),
+                    false,
+                ),
+                (
+                    "intermediate state limit",
+                    "text/event-stream",
+                    b"data: {\"largeState\":true}\n\ndata: {\"resetState\":true}\n\n".to_vec(),
+                    false,
+                ),
+                (
+                    "escaped state limit",
+                    "text/event-stream",
+                    b"data: {\"escapedState\":true}\n\n".to_vec(),
+                    false,
+                ),
+                (
+                    "event limit",
+                    "text/event-stream",
+                    format!("data: {}\n\n", "x".repeat(1 << 20)).into_bytes(),
+                    false,
+                ),
+                ("wrong response type", "application/json", b"{}".to_vec(), false),
+            ];
+            for (name, content_type, body, valid) in cases {
+                let mut outcome = sse(content_type, body);
+                let answer = interpret_submit(
+                    &host,
+                    &descriptor,
+                    &ctx,
+                    serde_json::json!({}),
+                    &mut outcome,
+                )
+                .await;
+                if !valid {
+                    let error = answer.expect_err(name);
+                    assert!(!error.retryable, "{name}: an accepted stream is not retried");
+                    continue;
+                }
+                let SubmitAnswer::Immediate { body, .. } = answer.expect(name) else {
+                    panic!("{name}: expected an immediate answer");
+                };
+                if name == "zero actual units" {
+                    assert_eq!(body["units"], 0, "{name}");
+                } else {
+                    assert_eq!(
+                        body,
+                        serde_json::json!({"document":"helloworld","units":3,"event":"message","id":"doc-1"}),
+                        "{name}"
+                    );
+                }
+            }
+
+            // A descriptor that never declared SSE refuses an event stream
+            // outright: the two sides disagree about the encoding.
+            let json_descriptor = new_descriptor("https://api.vendor.example/compile");
+            let error = interpret_submit(
+                &host,
+                &json_descriptor,
+                &ctx,
+                serde_json::json!({}),
+                &mut sse("text/event-stream", b"data: {}\n\n".to_vec()),
+            )
+            .await
+            .expect_err("undeclared stream");
+            assert!(
+                error.message.contains("unexpected SSE response"),
+                "{}",
+                error.message
+            );
+            assert!(!error.retryable);
+
+            // A streaming descriptor whose upstream answered JSON is refused
+            // after acceptance, so a retry could pay twice.
+            let error = interpret_submit(
+                &host,
+                &descriptor,
+                &ctx,
+                serde_json::json!({}),
+                &mut sse("application/json", b"{}".to_vec()),
+            )
+            .await
+            .expect_err("not a stream");
+            assert!(
+                error.message.contains("expected a text/event-stream"),
+                "{}",
+                error.message
+            );
+            assert!(!error.retryable);
+        });
+    }
+
+    /// The delta capability's events carry only changes and control state; the
+    /// host owns the accumulated result and its budget
+    /// (`relay/channel/task/jsplugin/adaptor_test.go:1814`).
+    #[test]
+    fn an_sse_delta_submission_accumulates_changes() {
+        runtime().block_on(async {
+            const SOURCE: &str = r#"
+                export const meta = {apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-video"], fetchMode:"per_task",
+                    submitResponseTypes:["json","sse"], requiredCapabilities:["submit-sse-delta@1"],
+                    protocols:["openai_video"]};
+                export function buildSubmitRequest(ctx) {
+                    return {url: ctx.baseUrl + "/compile", responseType: "sse"};
+                }
+                export function parseSubmitEventDelta(ctx, event, previous) {
+                    if (previous && previous.document !== undefined) throw new Error("full result leaked into control state");
+                    const chunk = JSON.parse(event.data);
+                    let changes = chunk.changes;
+                    if (chunk.largeResult) changes = [{op:"set",path:[],value:{document:"x".repeat(1048577)}}];
+                    if (chunk.resetAfterLarge) changes.push({op:"set",path:[],value:{document:"",units:0}});
+                    const result = {changes:changes, state:{events:(previous ? previous.events : 0)+1}, done:chunk.complete === true};
+                    if (chunk.largeControl) result.state = {text:"x".repeat(65537)};
+                    if (chunk.extra) result.extra = true;
+                    return result;
+                }
+                export function parseSubmitResponse(ctx, response) {
+                    return {taskId:"vendor-document", taskData: response.body, immediate:{status:"SUCCESS"}};
+                }
+                export function buildQueryRequest() { return {url:"https://api.vendor.example/query"}; }
+                export function parseTaskResult() { return {status:"SUCCESS"}; }
+                export const protocols = {openai_video: {
+                    decodeRequest: function(ctx) { return {kind:"submit", model: ctx.model}; },
+                    render: function(ctx, task) { return task; }
+                }};
+                export function listArtifacts() { return []; }
+                export function buildContentRequest() { return {}; }
+            "#;
+            let host = PluginHost::start();
+            host.load(SOURCE.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+
+            let mut ctx = context();
+            ctx.submit_response_types = vec!["json".to_string(), "sse".to_string()];
+            ctx.required_capabilities = vec![CAPABILITY_SUBMIT_SSE_DELTA.to_string()];
+            let mut descriptor = new_descriptor("https://api.vendor.example/compile");
+            descriptor.response_type = "sse".to_string();
+
+            const FIRST: &str = r#"{"changes":[{"op":"set","path":[],"value":{"document":"hello","units":2}}]}"#;
+            const LAST: &str = r#"{"changes":[{"op":"appendText","path":["document"],"value":"world"},{"op":"set","path":["units"],"value":0}],"complete":true}"#;
+            let stream = |frames: &[&str]| {
+                let mut body = String::new();
+                for frame in frames {
+                    body.push_str("data: ");
+                    body.push_str(frame);
+                    body.push_str("\n\n");
+                }
+                HttpOutcome {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
+                    body: body.into_bytes(),
+                }
+            };
+            let cases: Vec<(&str, Vec<&str>, &str)> = vec![
+                ("control state and zero usage", vec![FIRST, LAST], ""),
+                (
+                    "oversized intermediate result",
+                    vec![r#"{"largeResult":true}"#, LAST],
+                    "size",
+                ),
+                (
+                    "oversized operation before reset",
+                    vec![r#"{"largeResult":true,"resetAfterLarge":true,"complete":true}"#],
+                    "size",
+                ),
+                (
+                    "control state limit",
+                    vec![FIRST, r#"{"changes":[],"largeControl":true,"complete":true}"#],
+                    "control state",
+                ),
+                (
+                    "missing changes",
+                    vec![r#"{"complete":true}"#],
+                    "changes",
+                ),
+                (
+                    "extra result fields",
+                    vec![FIRST, r#"{"changes":[],"extra":true,"complete":true}"#],
+                    "only changes, state and done",
+                ),
+                (
+                    "unfinished delta stream",
+                    vec![FIRST],
+                    "ended before the plugin reported completion",
+                ),
+            ];
+            for (name, frames, expected_error) in cases {
+                let mut outcome = stream(&frames);
+                let answer = interpret_submit(
+                    &host,
+                    &descriptor,
+                    &ctx,
+                    serde_json::json!({}),
+                    &mut outcome,
+                )
+                .await;
+                if expected_error.is_empty() {
+                    let SubmitAnswer::Immediate { body, .. } = answer.expect(name) else {
+                        panic!("{name}: expected an immediate answer");
+                    };
+                    assert_eq!(
+                        body,
+                        serde_json::json!({"document":"helloworld","units":0}),
+                        "{name}"
+                    );
+                    continue;
+                }
+                let error = answer.expect_err(name);
+                assert!(
+                    error.message.contains(expected_error),
+                    "{name}: {}",
+                    error.message
+                );
+                assert!(!error.retryable, "{name}: an accepted stream is not retried");
+            }
         });
     }
 
