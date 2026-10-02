@@ -4632,6 +4632,9 @@ mod task_store_tests {
             group: "default".to_string(),
             model: "acme-video".to_string(),
             reserved_micros: 4321,
+            base_micros: 4000,
+            quota_micros: 4321,
+            other_ratios: vec![1.08025],
             from_subscription: true,
             subscription_id: "sub-1".to_string(),
             settled: false,
@@ -4652,6 +4655,9 @@ mod task_store_tests {
         let loaded = db.get_task("task_bill").expect("query").expect("present");
         let billing = loaded.private.billing.expect("billing record");
         assert_eq!(billing.reserved_micros, 4321);
+        assert_eq!(billing.base_micros, 4000);
+        assert_eq!(billing.quota_micros, 4321);
+        assert_eq!(billing.other_ratios, vec![1.08025]);
         assert_eq!(billing.key_id, "key-1");
         assert!(billing.from_subscription);
         assert_eq!(billing.subscription_id, "sub-1");

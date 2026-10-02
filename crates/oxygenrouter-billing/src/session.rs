@@ -260,6 +260,43 @@ impl BillingSession {
         Ok(effective)
     }
 
+    /// Add to an existing reservation, for a price that grew after the first
+    /// reservation was taken (a plugin's submit-time usage adjustment).
+    ///
+    /// Same order and rollback as [`Self::pre_consume`]: the hard-floored token
+    /// account first, the funding account behind it, and a funding refusal gives
+    /// the token account its quota back so a failed top-up leaves no trace.
+    pub fn reserve_more(&self, store: &dyn QuotaStore, delta: i64) -> Result<i64, BillingError> {
+        if delta <= 0
+            || self.settled.load(Ordering::SeqCst)
+            || self.refunded.load(Ordering::SeqCst)
+        {
+            return Ok(0);
+        }
+        if !self.is_playground {
+            if !store.try_reserve(&self.token_account, delta)? {
+                return Err(BillingError::InsufficientBalance {
+                    needed: delta,
+                    available: -1,
+                });
+            }
+            self.token_consumed.fetch_add(delta, Ordering::SeqCst);
+        }
+        let funded = store.try_reserve(&self.funding_account, delta)?;
+        if !funded {
+            if !self.is_playground {
+                self.token_consumed.fetch_sub(delta, Ordering::SeqCst);
+                store.credit(&self.token_account, delta)?;
+            }
+            return Err(BillingError::InsufficientBalance {
+                needed: delta,
+                available: -1,
+            });
+        }
+        self.pre_consumed.fetch_add(delta, Ordering::SeqCst);
+        Ok(delta)
+    }
+
     /// Settle at the actual charge. Idempotent.
     pub fn settle(&self, store: &dyn QuotaStore, actual_quota: i64) -> Result<(), BillingError> {
         if self.settled.swap(true, Ordering::SeqCst) {
@@ -471,6 +508,34 @@ mod tests {
         restored.settle(&store, 750).unwrap();
         assert_eq!(store.balance("token"), 9_250);
         assert_eq!(store.balance("wallet"), 9_250);
+    }
+
+    /// A submit-time price increase tops the reservation up, and a later settle
+    /// still moves only the difference against the *whole* reservation.
+    #[test]
+    fn reserve_more_adds_to_an_existing_reservation() {
+        // The 400 the restored session remembers has already left the accounts.
+        let store = MemStore::new(&[("token", 9_600), ("wallet", 9_600)]);
+        let s = BillingSession::restored("token".into(), "wallet".into(), false, 400);
+        assert_eq!(s.reserve_more(&store, 350).unwrap(), 350);
+        assert_eq!(store.balance("token"), 9_250);
+        assert_eq!(store.balance("wallet"), 9_250);
+        assert_eq!(s.pre_consumed(), 750);
+        s.settle(&store, 750).unwrap();
+        assert_eq!(store.balance("wallet"), 9_250);
+    }
+
+    /// When the funding account cannot cover the increase, the token account's
+    /// share is given back, so a refused top-up reserves nothing.
+    #[test]
+    fn reserve_more_rolls_back_when_funding_refuses() {
+        let store = MemStore::new(&[("token", 10_000), ("wallet", 100)]);
+        let s = BillingSession::restored("token".into(), "wallet".into(), false, 0);
+        let error = s.reserve_more(&store, 500).unwrap_err();
+        assert!(matches!(error, BillingError::InsufficientBalance { .. }));
+        assert_eq!(store.balance("token"), 10_000);
+        assert_eq!(store.balance("wallet"), 100);
+        assert_eq!(s.pre_consumed(), 0);
     }
 
     #[test]

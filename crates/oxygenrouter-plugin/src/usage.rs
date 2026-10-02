@@ -10,10 +10,13 @@
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use crate::{UsageFieldSchema, MAX_IMAGE_N, MAX_TASK_DURATION_SECONDS};
+use crate::{
+    PluginError, PluginHost, UsageFieldSchema, MAX_IMAGE_N, MAX_TASK_DURATION_SECONDS,
+};
 
 /// A usage fact's declared shape is the only thing that decides how it is
 /// validated.
@@ -98,6 +101,100 @@ pub fn billable_tokens(result: &crate::task::TaskResult) -> i64 {
         result.completion_tokens
     };
     crate::task::TaskResult::positive_int(tokens)
+}
+
+/// The ratios a usage hook's facts imply for billing
+/// (`relay/channel/task/jsplugin/adaptor.go:1445`).
+///
+/// Only positive numbers are ratios, a declared number is one, and an
+/// undeclared numeric fact stays usable but is bounded by the largest canonical
+/// task limit so a plugin cannot name its own price.
+pub fn validated_usage_ratios(
+    facts: &Value,
+    schema: &UsageSchema,
+) -> Result<(Value, BTreeMap<String, f64>), String> {
+    let Some(object) = facts.as_object() else {
+        return Err("plugin usage hook must return an object".to_string());
+    };
+    let mut normalized = Map::new();
+    let mut ratios = BTreeMap::new();
+    for (key, value) in object {
+        normalized.insert(key.clone(), value.clone());
+        if let Some(field) = schema.get(key) {
+            let number = validate_usage_value(value, field)?;
+            if field.kind == "number" {
+                normalized.insert(key.clone(), number_value(number));
+                if number > 0.0 {
+                    ratios.insert(key.clone(), number);
+                }
+            }
+            continue;
+        }
+        let Some(number) = usage_number(value) else {
+            continue;
+        };
+        let limit = canonical_usage_limit(key).unwrap_or(MAX_TASK_DURATION_SECONDS);
+        validate_usage_number_limit(number, limit)?;
+        normalized.insert(key.clone(), number_value(number));
+        if number > 0.0 {
+            ratios.insert(key.clone(), number);
+        }
+    }
+    Ok((Value::Object(normalized), ratios))
+}
+
+/// Call a usage-ratio hook (`extractUsage` for the estimate,
+/// `extractUsageOnSubmit` after the upstream answers) and answer with the
+/// ratios it implies.
+///
+/// `None` means "no adjustment": the hook is absent, failed, or reported an
+/// invalid shape. The reference logs and carries on rather than failing the
+/// request (`adaptor.go:1378`).
+pub async fn extract_usage_ratios(
+    host: &PluginHost,
+    plugin_key: &str,
+    hook: &str,
+    context: &Value,
+    args: &[Value],
+    schema: &UsageSchema,
+    timeout: Duration,
+) -> Option<BTreeMap<String, f64>> {
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(context.clone());
+    call_args.extend_from_slice(args);
+    let facts = match host
+        .call_hook_args(plugin_key, hook, &call_args, timeout)
+        .await
+    {
+        Ok(facts) => facts,
+        Err(PluginError::NoSuchHook { .. }) => return None,
+        Err(error) => {
+            eprintln!("[OxygenRouter] plugin {plugin_key} {hook} failed: {error}");
+            return None;
+        }
+    };
+    if facts.is_null() {
+        return None;
+    }
+    match validated_usage_ratios(&facts, schema) {
+        Ok((_, ratios)) => Some(ratios),
+        Err(reason) => {
+            eprintln!("[OxygenRouter] plugin {plugin_key} rejected invalid {hook} facts: {reason}");
+            None
+        }
+    }
+}
+
+/// The product of a ratio set, skipping the identity and anything that is not a
+/// usable ratio (`price.rs`'s `apply_other_ratios`).
+pub fn ratios_product(ratios: &BTreeMap<String, f64>) -> f64 {
+    let mut product = 1.0;
+    for ratio in ratios.values() {
+        if ratio.is_finite() && *ratio > 0.0 && *ratio != 1.0 {
+            product *= ratio;
+        }
+    }
+    product
 }
 
 /// One declared field's value (`adaptor.go:1535`).
@@ -285,6 +382,60 @@ mod tests {
             &serde_json::json!({"completionTokens": 3, "totalTokens": 5}),
         );
         assert_eq!(billable_tokens(&result), 5);
+    }
+
+    /// Only positive numbers become ratios; a declared number is one, an enum
+    /// never is, and an undeclared numeric fact is bounded before it can name a
+    /// price (`adaptor.go:1445`).
+    #[test]
+    fn ratios_are_the_positive_numbers_and_undeclared_ones_are_bounded() {
+        let schema = schema(&[
+            (
+                "seconds",
+                UsageFieldSchema {
+                    kind: "number".to_string(),
+                    unit: "second".to_string(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "mode",
+                UsageFieldSchema {
+                    enum_values: Some(vec!["std".to_string(), "pro".to_string()]),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let (normalized, ratios) = validated_usage_ratios(
+            &serde_json::json!({
+                "seconds": 5,
+                "mode": "pro",
+                "custom_ratio": 2.5,
+                "label": "x",
+                "zero": 0
+            }),
+            &schema,
+        )
+        .expect("valid");
+        assert_eq!(ratios["seconds"], 5.0);
+        assert_eq!(ratios["custom_ratio"], 2.5);
+        assert!(!ratios.contains_key("mode"));
+        assert!(!ratios.contains_key("label"));
+        assert!(!ratios.contains_key("zero"));
+        assert_eq!(normalized["mode"], "pro");
+
+        assert!(validated_usage_ratios(
+            &serde_json::json!({"custom_ratio": 3601}),
+            &schema
+        )
+        .is_err());
+
+        let product = ratios_product(&BTreeMap::from([
+            ("a".to_string(), 2.0),
+            ("b".to_string(), 3.0),
+            ("identity".to_string(), 1.0),
+        ]));
+        assert_eq!(product, 6.0);
     }
 
     /// Profiles are lookup sugar: the first matching model decides, and the

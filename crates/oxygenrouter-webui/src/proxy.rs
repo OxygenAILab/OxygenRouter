@@ -2018,16 +2018,47 @@ async fn plugin_bridge(
         }
     };
 
-    match oxygenrouter_plugin::interpret_submit(
+    let mut task_billing = task_billing;
+    let answer = match oxygenrouter_plugin::interpret_submit(
         &state.plugins,
         &descriptor,
         &flow_context,
-        context_value,
+        context_value.clone(),
         &mut outcome,
     )
     .await
     {
-        Ok(oxygenrouter_plugin::SubmitAnswer::Immediate { result, body }) => {
+        Ok(answer) => answer,
+        Err(error) => {
+            return json_error(
+                if error.retryable {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                &error.message,
+            )
+        }
+    };
+
+    // The plugin sees the upstream's answer before it states the final price;
+    // NewAPI reserves that adjusted quota before persisting the task
+    // (`controller/relay.go:597`), so an increase the caller cannot cover is
+    // refused rather than under-reserved.
+    let task_data = match &answer {
+        oxygenrouter_plugin::SubmitAnswer::Immediate { task_data, .. } => task_data.clone(),
+        oxygenrouter_plugin::SubmitAnswer::Pending(submission) => submission.task_data.clone(),
+    };
+    if let Some(billing) = task_billing.as_mut() {
+        if let Err(response) =
+            adjust_submit_billing(&state, billing, &flow_context, &context_value, &task_data).await
+        {
+            return response;
+        }
+    }
+
+    match answer {
+        oxygenrouter_plugin::SubmitAnswer::Immediate { result, body, .. } => {
             let response = render_immediate(
                 &state,
                 &binding,
@@ -2041,7 +2072,7 @@ async fn plugin_bridge(
             // here rather than waiting for a poll that will never come.
             settle_immediate_task(&state, task_billing.as_ref(), &result, response)
         }
-        Ok(oxygenrouter_plugin::SubmitAnswer::Pending(submission)) => {
+        oxygenrouter_plugin::SubmitAnswer::Pending(submission) => {
             persist_task(
                 &state,
                 &binding,
@@ -2051,14 +2082,6 @@ async fn plugin_bridge(
                 task_billing,
             )
         }
-        Err(error) => json_error(
-            if error.retryable {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::BAD_REQUEST
-            },
-            &error.message,
-        ),
     }
 }
 
@@ -2815,14 +2838,12 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
         };
         // A per-call price is the contract, so the plugin's usage facts must not
         // turn it into a token charge (`service/task_polling.go:692`).
-        let per_call_pricing = match task.private.billing.as_ref() {
-            Some(billing) => {
-                let pricing = state.billing.pricing();
-                let price = pricing.read().price_data(&billing.model, &billing.group);
-                price.use_price
-            }
-            None => false,
-        };
+        let per_call_pricing = task
+            .private
+            .billing
+            .as_ref()
+            .map(|billing| task_price_is_per_call(state, billing))
+            .unwrap_or(false);
         let settlement = oxygenrouter_plugin::poll_once(
             &state.plugins,
             &transport,
@@ -2968,6 +2989,11 @@ fn reserve_task_quota(
                 group,
                 model: model.to_string(),
                 reserved_micros: reserved,
+                // Nothing has adjusted the price yet, so the base and the
+                // agreed quota are both the reservation.
+                base_micros: reserved,
+                quota_micros: reserved,
+                other_ratios: Vec::new(),
                 from_subscription: !subscription_id.is_empty(),
                 subscription_id,
                 settled: false,
@@ -3025,9 +3051,25 @@ fn settle_immediate_task(
         return response;
     }
     let has_usage = result.total_tokens > 0.0 || result.completion_tokens > 0.0;
-    match oxygenrouter_plugin::settle_plan(&result.status, has_usage, false) {
+    match oxygenrouter_plugin::settle_plan(
+        &result.status,
+        has_usage,
+        task_price_is_per_call(state, billing),
+    ) {
         oxygenrouter_plugin::SettlePlan::Refund => refund_task_quota(state, billing),
-        oxygenrouter_plugin::SettlePlan::KeepReservation => {}
+        // A per-call price keeps its reservation, but a submit-time adjustment
+        // may have agreed on a different final price: move only that
+        // difference, never the whole charge again.
+        oxygenrouter_plugin::SettlePlan::KeepReservation => {
+            let agreed = if billing.quota_micros > 0 {
+                billing.quota_micros
+            } else {
+                billing.reserved_micros
+            };
+            if agreed != billing.reserved_micros {
+                settle_task_usage(state, billing, "", agreed);
+            }
+        }
         // The usage-fact settlement is a separate piece of work. Saying so is the
         // difference between a known gap and a silent one; the reservation stands
         // meanwhile, so a caller is never under-charged by omission.
@@ -3079,6 +3121,75 @@ fn task_session(billing: &oxygenrouter_core::TaskBilling) -> oxygenrouter_billin
     )
 }
 
+/// Apply the ratios a plugin's submit-time usage hook reported.
+///
+/// The hook is the first point at which the real price is known, because it
+/// sees the upstream's answer (`relay_task.go:389`). A price increase is
+/// reserved before the task is persisted; an increase the caller cannot cover
+/// refunds what was taken and refuses the submission, matching the reference's
+/// barrier order.
+async fn adjust_submit_billing(
+    state: &AppState,
+    billing: &mut oxygenrouter_core::TaskBilling,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    request_context: &serde_json::Value,
+    task_data: &serde_json::Value,
+) -> Result<(), Response> {
+    let schema = flow_context.usage.for_models(&[flow_context.model.as_str()]);
+    let Some(ratios) = oxygenrouter_plugin::extract_usage_ratios(
+        &state.plugins,
+        &flow_context.plugin_key,
+        oxygenrouter_plugin::HOOK_EXTRACT_USAGE_ON_SUBMIT,
+        request_context,
+        &[task_data.clone()],
+        schema,
+        flow_context.timeout,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    if ratios.is_empty() {
+        return Ok(());
+    }
+    let base = if billing.base_micros > 0 {
+        billing.base_micros
+    } else {
+        billing.reserved_micros
+    };
+    let (quota, _clamp) = oxygenrouter_billing::quota_round_checked(
+        base as f64 * oxygenrouter_plugin::ratios_product(&ratios),
+    );
+    billing.base_micros = base;
+    billing.quota_micros = quota;
+    billing.other_ratios = ratios.values().copied().collect();
+    if quota <= billing.reserved_micros {
+        return Ok(());
+    }
+    let delta = quota - billing.reserved_micros;
+    let funding = task_funding(billing);
+    match state.billing.reserve_more(
+        state.billing_store.as_ref(),
+        &task_session(billing),
+        &billing.key_id,
+        &funding,
+        delta,
+    ) {
+        Ok(added) => {
+            billing.reserved_micros += added;
+            Ok(())
+        }
+        Err(error) => {
+            refund_task_quota(state, billing);
+            Err(json_policy_error(
+                StatusCode::FORBIDDEN,
+                "insufficient_quota",
+                &format!("insufficient quota for adjusted task cost: {error}"),
+            ))
+        }
+    }
+}
+
 /// The funding source a stored task settles against.
 fn task_funding(billing: &oxygenrouter_core::TaskBilling) -> oxygenrouter_billing::FundingSource {
     if billing.from_subscription && !billing.subscription_id.is_empty() {
@@ -3118,8 +3229,19 @@ fn settle_polled_task(
             refund_task_quota(state, billing);
             mark_settled(state, task);
         }
-        // The price was the contract: a per-call task keeps what it reserved.
-        oxygenrouter_plugin::SettlePlan::KeepReservation => mark_settled(state, task),
+        // The price was the contract: a per-call task keeps what it reserved,
+        // adjusted only by whatever final price its submit-time hook agreed.
+        oxygenrouter_plugin::SettlePlan::KeepReservation => {
+            let agreed = if billing.quota_micros > 0 {
+                billing.quota_micros
+            } else {
+                billing.reserved_micros
+            };
+            if agreed != billing.reserved_micros {
+                settle_task_usage(state, billing, &task.task_id, agreed);
+            }
+            mark_settled(state, task);
+        }
         // A success that reported usage settles at what the tokens actually
         // buy; the session moves only the difference against the reservation.
         oxygenrouter_plugin::SettlePlan::SettleWithUsage => {
@@ -3144,6 +3266,15 @@ fn settle_polled_task(
 /// `None` when the model is per-call priced, unpriced, or the count is not a
 /// count: the reference only re-bills a model that has a ratio, and keeps the
 /// reservation otherwise.
+fn task_price_is_per_call(
+    state: &AppState,
+    billing: &oxygenrouter_core::TaskBilling,
+) -> bool {
+    let pricing = state.billing.pricing();
+    let price = pricing.read().price_data(&billing.model, &billing.group);
+    price.use_price
+}
+
 fn task_usage_quota(
     state: &AppState,
     billing: &oxygenrouter_core::TaskBilling,
@@ -3158,7 +3289,10 @@ fn task_usage_quota(
         return None;
     }
     let mut multiplier = price.model_ratio * price.group_ratio;
-    for ratio in &price.other_ratios {
+    // The ratios that priced this task are the ones its hooks reported when it
+    // was submitted, not whatever the operator has configured since
+    // (`service/task_billing.go:417`).
+    for ratio in &billing.other_ratios {
         if ratio.is_finite() && *ratio > 0.0 && *ratio != 1.0 {
             multiplier *= ratio;
         }
@@ -3175,6 +3309,7 @@ fn settle_task_usage(
     actual_micros: i64,
 ) {
     let funding = task_funding(billing);
+    let reference = (!task_id.is_empty()).then_some(task_id);
     let charge = oxygenrouter_billing::Charge {
         quota: actual_micros,
         path: oxygenrouter_billing::BillingPath::Ratio,
@@ -3190,11 +3325,16 @@ fn settle_task_usage(
         &billing.user_id,
         &charge,
         "task usage settlement",
-        Some(task_id),
+        reference,
         &funding,
     ) {
         Ok(()) => println!(
-            "[OxygenRouter] task {task_id} settled at {actual_micros} micros (reserved {})",
+            "[OxygenRouter] {} settled at {actual_micros} micros (reserved {})",
+            if task_id.is_empty() {
+                "a synchronous task".to_string()
+            } else {
+                format!("task {task_id}")
+            },
             billing.reserved_micros
         ),
         Err(error) => eprintln!(

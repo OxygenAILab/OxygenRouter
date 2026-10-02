@@ -492,6 +492,30 @@ impl BillingService {
         Ok((session, reserved))
     }
 
+    /// Top up a reservation that is already in place.
+    ///
+    /// A task's price can grow after the plugin sees the upstream's answer —
+    /// the submit-time usage adjustment. The session holds the reservation, so
+    /// the increase goes through it rather than through a second session that
+    /// would know nothing about what was already taken.
+    pub fn reserve_more(
+        &self,
+        store: &dyn BillingStore,
+        session: &BillingSession,
+        key_id: &str,
+        funding: &FundingSource,
+        amount: i64,
+    ) -> Result<i64, BillingError> {
+        let dual = match funding {
+            FundingSource::Wallet { .. } => DualStore::new(store, key_id),
+            FundingSource::Subscription {
+                user_id,
+                subscription_id,
+            } => DualStore::new(store, key_id).with_subscription(subscription_id, user_id),
+        };
+        session.reserve_more(&dual, amount)
+    }
+
     /// Settle a completed request.
     pub fn settle(
         &self,

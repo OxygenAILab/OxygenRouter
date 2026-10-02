@@ -1077,6 +1077,19 @@ pub struct TaskBilling {
     /// How much was actually reserved, which is the ceiling a settlement cannot
     /// exceed and the amount a refund returns.
     pub reserved_micros: i64,
+    /// The model price before any plugin-reported ratios. A submit-time
+    /// adjustment recomputes from this base, the way the reference strips the
+    /// current ratios before applying the new ones (`relay_task.go:417`).
+    #[serde(default)]
+    pub base_micros: i64,
+    /// The final price the submit-time adjustment agreed. It equals the
+    /// reservation until a plugin adjusts it.
+    #[serde(default)]
+    pub quota_micros: i64,
+    /// The ratios a plugin's usage hooks reported, applied to the base when a
+    /// quota is recomputed (`service/task_billing.go:417`).
+    #[serde(default)]
+    pub other_ratios: Vec<f64>,
     /// Whether the funding source is a subscription pool rather than the wallet.
     pub from_subscription: bool,
     /// The subscription that funded it, when one did.

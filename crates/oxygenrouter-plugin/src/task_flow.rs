@@ -151,6 +151,9 @@ pub enum SubmitAnswer {
     Immediate {
         result: TaskResult,
         body: serde_json::Value,
+        /// What the plugin stored for itself; the submit-time usage hook reads
+        /// it (`adaptor.go:193`).
+        task_data: serde_json::Value,
     },
 }
 
@@ -373,6 +376,7 @@ pub async fn interpret_submit(
             Ok(SubmitAnswer::Immediate {
                 result: immediate,
                 body,
+                task_data: submission.task_data,
             })
         }
         None => Ok(SubmitAnswer::Pending(submission)),
@@ -1087,7 +1091,7 @@ mod tests {
             .await
             .expect("interpret");
         match answer {
-            SubmitAnswer::Immediate { result, body } => {
+            SubmitAnswer::Immediate { result, body, .. } => {
                 assert_eq!(result.status, STATUS_SUCCESS);
                 assert_eq!(result.url, "https://cdn/1.png");
                 // The raw upstream body travels with the result, because the

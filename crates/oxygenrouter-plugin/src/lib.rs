@@ -70,7 +70,10 @@ pub use routing::{
     EndpointClaim, EndpointIndex, ProtocolBinding, ProtocolContext, RequestContext,
 };
 
-pub use usage::{apply_completion_usage, billable_tokens, validate_completion_facts};
+pub use usage::{
+    apply_completion_usage, billable_tokens, extract_usage_ratios, ratios_product,
+    validate_completion_facts, validated_usage_ratios,
+};
 
 /// Whether a version string is semver, by the reference's pattern
 /// (`pkg/jsplugin/registry.go:40`): a release triple with optional pre-release
@@ -1621,12 +1624,21 @@ impl Engine {
             hook: hook.to_string(),
             message: describe(&error),
         })?;
+        // An export the plugin never declared is "no such hook" -- the driver
+        // hooks are optional ones like `extractUsageOnComplete`, and a caller
+        // that must tell "absent" from "broken" reads this variant.
+        if function.is_undefined() {
+            return Err(PluginError::NoSuchHook {
+                key: key.to_string(),
+                hook: hook.to_string(),
+            });
+        }
         let Some(callable) = function.as_callable() else {
             return Err(PluginError::Hook {
                 key: key.to_string(),
                 hook: hook.to_string(),
                 message: format!(
-                    "plugin {plugin_key} has no export {hook:?}; implement it as a top-level function"
+                    "plugin {plugin_key} export {hook:?} is not a function"
                 ),
             });
         };
