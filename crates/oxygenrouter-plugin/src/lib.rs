@@ -45,7 +45,9 @@ pub use task_flow::{
 pub use task::{
     build_request_body, classify_poll_http, image_base64, decide_poll, is_timed_out, known_status,
     parse_absolute_url, poll_failure_reason, replace_private_task_id, settle_plan,
-    status_is_in_flight, status_is_terminal, terminal_refund_decision, validate_request_url,
+    status_is_in_flight, status_is_terminal, terminal_refund_decision, valid_artifact_key,
+    validate_content_request, validate_request_url, validate_task_artifacts, ArtifactContext,
+    ClientRequest, ContentRequest, TaskArtifact, ARTIFACT_TYPES, MAX_TASK_ARTIFACTS,
     OutboundBody, PollClass, PollDecision, ResolvedFile, SettlePlan, DEFAULT_MAX_INLINE_FILE_BYTES,
     PROGRESS_SUBMITTED,
     QueryContext, RequestDescriptor, RequestPart, SimpleUrl, SubmitOutcome, TaskResult, TaskView,

@@ -881,6 +881,218 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// The artifacts a task produced, as the host accepts them.
+///
+/// Ported from the reference's `validateTaskArtifacts`
+/// (`relay/channel/task/jsplugin/adaptor.go:1139`), including what it *refuses*:
+/// the whole answer is bounded, every entry may carry only the three declared
+/// fields, keys must match the host's pattern and be unique, and the type is one
+/// of four. Each of those is a promise the host makes about a value it did not
+/// produce, so a plugin that breaks one gets an error rather than a runtime
+/// surprise on a later request.
+pub const MAX_TASK_ARTIFACTS: usize = 64;
+
+/// The artifact types a plugin may declare
+/// (`relay/channel/task/jsplugin/adaptor.go:76`).
+pub const ARTIFACT_TYPES: &[&str] = &["video", "audio", "image", "file"];
+
+/// Whether a key is one the host will accept for an artifact.
+///
+/// The reference's pattern (`adaptor.go:76`): a leading alphanumeric, then up to
+/// 127 of alphanumeric, dot, underscore, tilde or dash. It exists because the key
+/// becomes part of a URL path, so anything else would need escaping -- and a key
+/// that needed escaping would make two artifacts indistinguishable in the
+/// requests that address them.
+pub fn valid_artifact_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    let rest: Vec<char> = chars.collect();
+    rest.len() <= 127
+        && rest
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))
+}
+
+/// One artifact, as the host holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskArtifact {
+    pub key: String,
+    /// One of [`ARTIFACT_TYPES`].
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: String,
+}
+
+/// Validate what `listArtifacts` returned.
+pub fn validate_task_artifacts(value: &serde_json::Value) -> Result<Vec<TaskArtifact>, String> {
+    let Some(items) = value.as_array() else {
+        return Err("plugin listArtifacts must return an array".to_string());
+    };
+    if items.len() > MAX_TASK_ARTIFACTS {
+        return Err("plugin returned too many artifacts".to_string());
+    }
+    let mut keys: Vec<&str> = Vec::with_capacity(items.len());
+    let mut artifacts = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            return Err("plugin listArtifacts must return an array of objects".to_string());
+        };
+        // Only the declared fields, because a field the host ignores is a field
+        // the plugin believes it is communicating something with.
+        for field in object.keys() {
+            if field != "key" && field != "type" && field != "mimeType" {
+                return Err(format!("plugin artifact contains unsupported field {field:?}"));
+            }
+        }
+        let key = object.get("key").and_then(|v| v.as_str()).unwrap_or("");
+        if !valid_artifact_key(key) {
+            return Err("plugin artifact has invalid key".to_string());
+        }
+        if keys.contains(&key) {
+            return Err("plugin artifact keys must be unique".to_string());
+        }
+        keys.push(key);
+        let kind = object
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "plugin artifact has invalid type".to_string())?;
+        if !ARTIFACT_TYPES.contains(&kind) {
+            return Err("plugin artifact has unsupported type".to_string());
+        }
+        let mime_type = match object.get("mimeType") {
+            None => String::new(),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| "plugin artifact has invalid mimeType".to_string())?
+                .to_string(),
+        };
+        artifacts.push(TaskArtifact {
+            key: key.to_string(),
+            kind: kind.to_string(),
+            mime_type,
+        });
+    }
+    Ok(artifacts)
+}
+
+/// The context a plugin's `listArtifacts` and `buildContentRequest` read.
+///
+/// Ported from `taskArtifactContext` (`adaptor.go:983`): the task's own id and
+/// lifecycle, its `action`, and the `data` and `state` it produced. Deliberately
+/// not the credential or the upstream id -- an artifact listing is a read of what
+/// exists, not of how to reach the upstream.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArtifactContext {
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub state: serde_json::Value,
+    /// The plugin version that produced the task, so a listing can be interpreted
+    /// by the code that made it (`adaptor.go:993`).
+    #[serde(rename = "producerVersion", default)]
+    pub producer_version: String,
+}
+
+/// A content request a plugin's `buildContentRequest` states.
+///
+/// Ported from the reference's validation (`adaptor.go:910-980`), which is
+/// unusually strict about the credentialless case: a request that goes *without*
+/// the channel credential must be a plain `GET`/`HEAD` with no headers and no
+/// body, because otherwise it is a credential-free call that the plugin can still
+/// shape arbitrarily. That rule exists because a media URL is often public and the
+/// operator's key has no business travelling to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentRequest {
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub credentialless: bool,
+}
+
+/// The method the client used, and the headers it sent, which a plugin may pass
+/// through for a `HEAD` or a range request
+/// (`controller/task.go`'s `taskArtifactClientRequest`).
+#[derive(Debug, Clone, Default)]
+pub struct ClientRequest {
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+}
+
+/// Validate a `buildContentRequest` descriptor against the artifact rules.
+pub fn validate_content_request(
+    descriptor: &crate::RequestDescriptor,
+    client: &ClientRequest,
+) -> Result<ContentRequest, String> {
+    let method = {
+        let stated = descriptor.method.trim().to_ascii_uppercase();
+        if !stated.is_empty() {
+            stated
+        } else {
+            let from_client = client.method.trim().to_ascii_uppercase();
+            if from_client.is_empty() {
+                "GET".to_string()
+            } else {
+                from_client
+            }
+        }
+    };
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
+        return Err("plugin returned an unsupported artifact request method".to_string());
+    }
+    let body = if descriptor.body.is_null() {
+        None
+    } else if let Some(text) = descriptor.body.as_str() {
+        Some(text.as_bytes().to_vec())
+    } else {
+        Some(
+            serde_json::to_vec(&descriptor.body)
+                .map_err(|_| "plugin returned an invalid artifact request body".to_string())?,
+        )
+    };
+    let headers: Vec<(String, String)> = descriptor
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if descriptor.credentialless {
+        if !matches!(method.as_str(), "GET" | "HEAD") {
+            return Err("credentialless artifact requests must use GET or HEAD".to_string());
+        }
+        if !headers.is_empty() || body.is_some() {
+            return Err(
+                "credentialless artifact requests cannot contain headers or a body".to_string(),
+            );
+        }
+        let parsed = crate::task::parse_absolute_url(descriptor.url.trim())
+            .ok_or_else(|| "credentialless artifact request URL must be absolute HTTP(S)".to_string())?;
+        if !matches!(parsed.scheme.as_str(), "http" | "https") {
+            return Err(
+                "credentialless artifact request URL must be absolute HTTP(S)".to_string(),
+            );
+        }
+    }
+    Ok(ContentRequest {
+        url: descriptor.url.trim().to_string(),
+        method,
+        headers,
+        body,
+        credentialless: descriptor.credentialless,
+    })
+}
+
 /// The context a plugin's `buildQueryRequest` and `parseTaskResult` read.
 ///
 /// Ported from `queryContext` (`adaptor.go:1013`): the upstream task id, the
@@ -1616,6 +1828,139 @@ mod tests {
         assert!(!is_timed_out(created, created + 1_000_000, 0));
         // A clock that went backwards must not time out a fresh task.
         assert!(!is_timed_out(created, created - 10, 3600));
+    }
+
+    /// An artifact listing is accepted only in the shape the host promised: a
+    /// bounded array of objects carrying three known fields, with a key the URL
+    /// can hold and a type from the four.
+    ///
+    /// Each refusal is one of the reference's own (`adaptor.go:1139`), and each
+    /// exists because the value comes from a plugin: a field the host ignores is a
+    /// field the plugin believes it is communicating something with.
+    #[test]
+    fn an_artifact_listing_is_validated_the_way_the_reference_validates_it() {
+        let good = serde_json::json!([
+            { "key": "video", "type": "video", "mimeType": "video/mp4" },
+            { "key": "thumb_1", "type": "image" }
+        ]);
+        let artifacts = validate_task_artifacts(&good).expect("valid listing");
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].key, "video");
+        assert_eq!(artifacts[0].mime_type, "video/mp4");
+        assert!(artifacts[1].mime_type.is_empty(), "mimeType is optional");
+
+        for bad in [
+            serde_json::json!({ "key": "video", "type": "video" }),
+            serde_json::json!([{ "key": "video", "type": "video", "extra": 1 }]),
+            serde_json::json!([{ "key": "", "type": "video" }]),
+            serde_json::json!([{ "key": "-leading", "type": "video" }]),
+            serde_json::json!([{ "key": "has space", "type": "video" }]),
+            serde_json::json!([{ "key": "ok", "type": "hologram" }]),
+            serde_json::json!([{ "key": "ok" }]),
+            serde_json::json!([{ "key": "ok", "type": "video", "mimeType": 7 }]),
+            serde_json::json!([{ "key": "dup", "type": "video" }, { "key": "dup", "type": "audio" }]),
+            serde_json::json!([{ "key": "x".repeat(140), "type": "video" }]),
+        ] {
+            assert!(
+                validate_task_artifacts(&bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+
+        // The listing is bounded, so one plugin cannot make the host hold an
+        // unbounded answer.
+        let too_many: Vec<serde_json::Value> = (0..MAX_TASK_ARTIFACTS + 1)
+            .map(|index| serde_json::json!({ "key": format!("a{index}"), "type": "file" }))
+            .collect();
+        assert!(validate_task_artifacts(&serde_json::Value::Array(too_many)).is_err());
+
+        // The key pattern, on its own, because it is what a URL path segment has
+        // to satisfy.
+        assert!(valid_artifact_key("video"));
+        assert!(valid_artifact_key("A.b_c~d-1"));
+        assert!(valid_artifact_key(&"a".repeat(128)));
+        assert!(!valid_artifact_key(&"a".repeat(129)));
+        assert!(!valid_artifact_key(""));
+        assert!(!valid_artifact_key(".leading-dot"));
+        assert!(!valid_artifact_key("slash/inside"));
+    }
+
+    /// A content request is checked before the host makes it, and the strictest
+    /// rule is the credentialless one: a request that goes without the channel
+    /// credential must be a plain GET or HEAD with nothing attached, because a
+    /// media URL is often public and the operator's key has no business travelling
+    /// to it (`adaptor.go:949`).
+    #[test]
+    fn a_content_request_is_validated_before_the_host_makes_it() {
+        let client = ClientRequest {
+            method: "GET".to_string(),
+            headers: vec![("Range".to_string(), "bytes=0-1".to_string())],
+        };
+        let descriptor = |value: serde_json::Value| -> crate::RequestDescriptor {
+            serde_json::from_value(value).expect("descriptor")
+        };
+
+        // A plain GET, with the method defaulted from the client when the plugin
+        // states none.
+        let request = validate_content_request(
+            &descriptor(serde_json::json!({ "url": "https://cdn.example/v.mp4" })),
+            &client,
+        )
+        .expect("valid");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.body, None);
+        assert!(!request.credentialless);
+
+        // A HEAD passes through, and so does a POST with a body.
+        let request = validate_content_request(
+            &descriptor(serde_json::json!({ "url": "https://cdn.example/v.mp4", "method": "head" })),
+            &client,
+        )
+        .expect("valid");
+        assert_eq!(request.method, "HEAD");
+
+        let request = validate_content_request(
+            &descriptor(serde_json::json!({
+                "url": "https://api.vendor.example/sign",
+                "method": "post",
+                "body": { "key": "video" }
+            })),
+            &client,
+        )
+        .expect("valid");
+        assert!(request.body.is_some());
+        assert_eq!(request.method, "POST");
+
+        // A credentialless request may only be a bare GET or HEAD, and its URL has
+        // to be a real one.
+        for bad in [
+            serde_json::json!({ "url": "https://cdn.example/v.mp4", "method": "POST", "credentialless": true }),
+            serde_json::json!({ "url": "https://cdn.example/v.mp4", "credentialless": true, "headers": { "X-A": "1" } }),
+            serde_json::json!({ "url": "https://cdn.example/v.mp4", "credentialless": true, "body": "x" }),
+            serde_json::json!({ "url": "/relative", "credentialless": true }),
+            serde_json::json!({ "url": "ftp://cdn.example/v.mp4", "credentialless": true }),
+        ] {
+            assert!(
+                validate_content_request(&descriptor(bad.clone()), &client).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(validate_content_request(
+            &descriptor(serde_json::json!({
+                "url": "https://cdn.example/v.mp4",
+                "method": "HEAD",
+                "credentialless": true
+            })),
+            &client,
+        )
+        .is_ok());
+
+        // A method the host will not make is refused rather than attempted.
+        assert!(validate_content_request(
+            &descriptor(serde_json::json!({ "url": "https://cdn.example/v.mp4", "method": "DELETE" })),
+            &client,
+        )
+        .is_err());
     }
 
     /// The settlement a terminal task gets, and the invariant it protects: a

@@ -120,6 +120,19 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         // --- Models --------------------------------------------------------
         .route("/v1/models", any(list_models))
         .route("/v1/models/:model", any(models_get_or_delete))
+        // --- Tasks and videos ----------------------------------------------
+        // The video submit surface the reference publishes alongside the image
+        // one (`router/video-router.go:15`), which is the same bridge under two
+        // names: a video request is a task submission.
+        .route("/v1/videos", any(videos_submit))
+        .route("/v1/video/generations", any(videos_submit))
+        .route("/v1/videos/:video_id/remix", any(videos_remix))
+        .route("/v1/videos/:task_id/content", any(videos_content))
+        .route("/v1/tasks/:key/artifacts", any(task_artifacts))
+        .route(
+            "/v1/tasks/:key/artifacts/:artifact_key/content",
+            any(task_artifact_content),
+        )
         // --- Tasks ---------------------------------------------------------
         // The read surfaces a task plugin needs: the generic task id, and the
         // video and response aliases the reference publishes for the same rows
@@ -158,6 +171,415 @@ async fn responses_read(
         );
     };
     task_read_response(&state, &format!("task_{rest}"))
+}
+
+/// Submit a video task, which is the same bridge the image endpoints use.
+///
+/// The difference from an image submission is only that the model must claim the
+/// video protocol, which the endpoint index already enforces: the path is part of
+/// the binding key, so a plugin that claims only images is not reachable here.
+async fn videos_submit(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    task_submit(state, request, "/v1/videos").await
+}
+
+/// Remix an existing task: a submission that names the task it derives from.
+///
+/// The reference routes it to the same controller (`router/video-router.go:31`),
+/// so it is the same bridge; the origin id reaches the plugin through the request
+/// body, which is where a plugin looks for it.
+async fn videos_remix(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: Request,
+) -> Response {
+    task_submit(state, request, "/v1/videos/:video_id/remix").await
+}
+
+/// The shared submission path for a task-shaped endpoint.
+async fn task_submit(
+    state: std::sync::Arc<AppState>,
+    request: Request,
+    client_path: &str,
+) -> Response {
+    let (headers, body_bytes) = read_body(request).await;
+    let model = request_body_model(&headers, &body_bytes).await;
+    let Some(binding) = model
+        .as_deref()
+        .and_then(|model| plugin_for_endpoint(&state, "POST", client_path, model))
+    else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!(
+                "no enabled plugin serves {client_path} for this model; an operator has to install and enable one, or a channel has to serve the model directly"
+            ),
+        );
+    };
+    plugin_bridge(
+        state,
+        PluginInvocation {
+            binding: &binding,
+            headers: &headers,
+            body: &body_bytes,
+        },
+        client_path,
+    )
+    .await
+}
+
+/// List the artifacts a finished task produced.
+///
+/// A plugin that declares no `listArtifacts` produces none, which is an empty
+/// list rather than an error: not every task has artifacts, and the reference
+/// answers the same way (`adaptor.go:896`).
+async fn task_artifacts(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    let Some(task) = state.db.get_task(&task_id).ok().flatten() else {
+        return task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found");
+    };
+    let Some(context) = artifact_context(&state, &task) else {
+        return task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found");
+    };
+    match state
+        .plugins
+        .call_hook_args(
+            &task.platform,
+            oxygenrouter_plugin::HOOK_LIST_ARTIFACTS,
+            &[serde_json::to_value(&context).unwrap_or(serde_json::Value::Null)],
+            PLUGIN_TIMEOUT,
+        )
+        .await
+    {
+        Ok(value) => match oxygenrouter_plugin::validate_task_artifacts(&value) {
+            Ok(artifacts) => (StatusCode::OK, axum::Json(artifacts)).into_response(),
+            Err(reason) => {
+                eprintln!("[OxygenRouter] task {task_id} artifact listing refused: {reason}");
+                task_artifact_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_plugin_error")
+            }
+        },
+        // A plugin without the hook lists nothing, which is not a failure.
+        Err(oxygenrouter_plugin::PluginError::Hook { .. }) => {
+            (StatusCode::OK, axum::Json(Vec::<oxygenrouter_plugin::TaskArtifact>::new()))
+                .into_response()
+        }
+        Err(error) => {
+            eprintln!("[OxygenRouter] task {task_id} artifact listing failed: {error}");
+            task_artifact_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_plugin_error")
+        }
+    }
+}
+
+/// Serve one artifact's content.
+///
+/// Three refusals before the plugin is even asked, all of them the reference's
+/// (`controller/task.go`'s `TaskArtifactContent`): an unreadable artifact key, a
+/// task whose result was discarded, and a task that has not finished -- the last
+/// as `409` rather than `404`, because the artifact is expected to exist later and
+/// a client should retry rather than give up.
+async fn task_artifact_content(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path((task_id, artifact_key)): axum::extract::Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let client_headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    serve_artifact(&state, &task_id, &artifact_key, &method, client_headers).await
+}
+
+/// Serve an artifact through the video path alias, which is the same task row.
+async fn videos_content(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    request: Request,
+) -> Response {
+    let method = request.method().as_str().to_string();
+    let client_headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    serve_artifact(&state, &task_id, "video", &method, client_headers).await
+}
+
+async fn serve_artifact(
+    state: &AppState,
+    task_id: &str,
+    artifact_key: &str,
+    method: &str,
+    client_headers: Vec<(String, String)>,
+) -> Response {
+    if !oxygenrouter_plugin::valid_artifact_key(artifact_key.trim()) {
+        return task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found");
+    }
+    let Some(task) = state.db.get_task(task_id).ok().flatten() else {
+        return task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found");
+    };
+    if task.status != oxygenrouter_plugin::STATUS_SUCCESS {
+        return task_artifact_error(StatusCode::CONFLICT, "artifact_not_ready");
+    }
+    let Some(context) = artifact_context(state, &task) else {
+        return task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found");
+    };
+    let listing = match state
+        .plugins
+        .call_hook_args(
+            &task.platform,
+            oxygenrouter_plugin::HOOK_LIST_ARTIFACTS,
+            &[serde_json::to_value(&context).unwrap_or(serde_json::Value::Null)],
+            PLUGIN_TIMEOUT,
+        )
+        .await
+        .ok()
+        .and_then(|value| oxygenrouter_plugin::validate_task_artifacts(&value).ok())
+    {
+        Some(listing) => listing,
+        None => {
+            return task_artifact_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "artifact_plugin_unavailable",
+            )
+        }
+    };
+    if !listing.iter().any(|artifact| artifact.key == artifact_key) {
+        return task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found");
+    }
+
+    // What the plugin wants fetched, and the guard on it. A credentialless
+    // request is checked against nothing but its own shape, because it carries no
+    // credential to misdirect.
+    // The context a plugin builds a content URL from: the artifact's identity, the
+    // channel's base URL, and -- unless the plugin asked to go without it -- the
+    // credential, in the same shape a submission gets
+    // (`relay/channel/task/jsplugin/adaptor.go:924-930`).
+    let channel = state.db.get_channel(&task.channel_id).ok().flatten();
+    let mut build = serde_json::to_value(&context).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = build.as_object_mut() {
+        object.insert(
+            "upstreamTaskId".to_string(),
+            serde_json::json!(task.private.upstream_task_id),
+        );
+        object.insert("artifactKey".to_string(), serde_json::json!(artifact_key));
+        object.insert(
+            "baseUrl".to_string(),
+            serde_json::json!(channel
+                .as_ref()
+                .map(|channel| channel.base_url.clone())
+                .unwrap_or_default()),
+        );
+        object.insert(
+            "clientRequest".to_string(),
+            serde_json::json!({ "method": method, "headers": client_headers }),
+        );
+        // The stored credential is what this task was submitted with, so a poll
+        // and an artifact fetch authenticate the same way.
+        let credential = task
+            .private
+            .credential
+            .trim()
+            .to_string()
+            .is_empty()
+            .then(|| {
+                channel
+                    .as_ref()
+                    .and_then(|channel| task_authorization(channel))
+            })
+            .flatten()
+            .or_else(|| {
+                (!task.private.credential.trim().is_empty())
+                    .then(|| task.private.credential.clone())
+            });
+        object.insert("auth".to_string(), serde_json::json!({ "authHeader": credential }));
+        object.insert("authHeader".to_string(), serde_json::json!(credential));
+    }
+    let descriptor = match state
+        .plugins
+        .call_hook_args(
+            &task.platform,
+            oxygenrouter_plugin::HOOK_BUILD_CONTENT_REQUEST,
+            &[build],
+            PLUGIN_TIMEOUT,
+        )
+        .await
+    {
+        Ok(value) => serde_json::from_value::<oxygenrouter_plugin::RequestDescriptor>(value)
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    let descriptor = match descriptor {
+        Ok(descriptor) => descriptor,
+        Err(reason) => {
+            eprintln!("[OxygenRouter] task {task_id} artifact request failed: {reason}");
+            return task_artifact_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_plugin_error");
+        }
+    };
+    let client = oxygenrouter_plugin::ClientRequest {
+        method: method.to_string(),
+        headers: client_headers,
+    };
+    let content = match oxygenrouter_plugin::validate_content_request(&descriptor, &client) {
+        Ok(content) => content,
+        Err(reason) => {
+            eprintln!("[OxygenRouter] task {task_id} artifact request refused: {reason}");
+            return task_artifact_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_plugin_error");
+        }
+    };
+    // A credentialed artifact request still has to stay on a host the operator
+    // allowed, exactly like a submission.
+    if !content.credentialless {
+        let base_url = state
+            .db
+            .get_channel(&task.channel_id)
+            .ok()
+            .flatten()
+            .map(|channel| channel.base_url)
+            .unwrap_or_default();
+        if let Err(reason) = oxygenrouter_plugin::validate_request_url(
+            &content.url,
+            &base_url,
+            &allowed_hosts_of(state, &task.platform),
+        ) {
+            eprintln!("[OxygenRouter] task {task_id} artifact host refused: {reason}");
+            return task_artifact_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_plugin_error");
+        }
+    }
+
+    let Ok(transport) = task_transport(state) else {
+        return task_artifact_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact_plugin_unavailable",
+        );
+    };
+    let authorization = if content.credentialless {
+        None
+    } else {
+        task
+            .private
+            .credential
+            .trim()
+            .is_empty()
+            .then(|| {
+                state
+                    .db
+                    .get_channel(&task.channel_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|channel| task_authorization(&channel))
+            })
+            .flatten()
+    };
+    use oxygenrouter_plugin::TaskTransport;
+    let outcome = match transport
+        .execute(oxygenrouter_plugin::OutboundRequest {
+            method: content.method.clone(),
+            url: content.url.clone(),
+            headers: content.headers.clone(),
+            body: content.body.clone().map(|bytes| oxygenrouter_plugin::OutboundBody {
+                content_type: "application/octet-stream".to_string(),
+                bytes,
+            }),
+            authorization,
+        })
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            eprintln!("[OxygenRouter] task {task_id} artifact fetch failed: {reason}");
+            return task_artifact_error(StatusCode::BAD_GATEWAY, "artifact_fetch_error");
+        }
+    };
+    if !outcome.is_success() {
+        return task_artifact_error(
+            StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::BAD_GATEWAY),
+            "artifact_fetch_error",
+        );
+    }
+
+    // The upstream's own content type and length travel, and a HEAD carries no
+    // body -- which is the whole point of the method.
+    let mut builder = Response::builder().status(StatusCode::OK);
+    let is_head = content.method == "HEAD";
+    for (name, value) in &outcome.headers {
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        // A HEAD must report the headers a GET would, length included, while
+        // carrying no body -- that is the whole reason the method exists, and a
+        // HEAD that dropped the length would tell a client nothing it could not
+        // learn by downloading. For every other method the length comes from the
+        // body this response actually has, so the upstream's is dropped to avoid
+        // contradicting it.
+        if name.eq_ignore_ascii_case("content-length") && !is_head {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let body = if content.method == "HEAD" {
+        Body::empty()
+    } else {
+        Body::from(outcome.body)
+    };
+    builder.body(body).unwrap_or_else(|_| error_500())
+}
+
+/// The context an artifact hook reads, or `None` when the plugin is gone.
+fn artifact_context(
+    state: &AppState,
+    task: &oxygenrouter_core::TaskRecord,
+) -> Option<oxygenrouter_plugin::ArtifactContext> {
+    let manifest = state.db.plugin_manifest(&task.platform).ok().flatten()?;
+    Some(oxygenrouter_plugin::ArtifactContext {
+        task_id: task.task_id.clone(),
+        status: task.status.clone(),
+        action: task.action.clone(),
+        data: task.data.clone(),
+        state: task.private.plugin_state.clone(),
+        producer_version: manifest
+            .get("version")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// An artifact failure in the reference's error shape
+/// (`controller/task.go`'s `writeTaskArtifactError`).
+fn task_artifact_error(status: StatusCode, code: &str) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": match status {
+                    StatusCode::NOT_FOUND => "Task or artifact not found",
+                    StatusCode::CONFLICT => "Task artifacts are not ready",
+                    StatusCode::INTERNAL_SERVER_ERROR => "Artifact content plugin failed",
+                    StatusCode::SERVICE_UNAVAILABLE => "Artifact content plugin is unavailable",
+                    _ => "Failed to fetch artifact content",
+                },
+                "type": "invalid_request_error",
+            }
+        })),
+    )
+        .into_response()
 }
 
 pub async fn fallback_handler(request: Request) -> Response {
