@@ -31,9 +31,15 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+mod responses;
 mod routing;
 mod task;
 mod task_flow;
+
+pub use responses::{
+    decode_event_result, sse_frame, EventLimits, EventResult, ResponsesMachine, SemanticEvent,
+    StreamEvent, RESPONSE_COMPLETED, RESPONSE_FAILED, RESPONSE_IN_PROGRESS, RESPONSE_INCOMPLETE,
+};
 
 pub use task_flow::{
     apply_image_inline, build_outbound_request, build_query_request, interpret_submit,
