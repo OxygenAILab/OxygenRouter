@@ -36,6 +36,7 @@ mod routing;
 mod submit_stream;
 mod task;
 mod task_flow;
+mod usage;
 
 pub use responses::{
     decode_event_result, sse_frame, EventLimits, EventResult, ResponsesMachine, SemanticEvent,
@@ -68,6 +69,8 @@ pub use routing::{
     protocol_has_modes, required_modes, unsupported_form_message, BodyFile, BodyKind,
     EndpointClaim, EndpointIndex, ProtocolBinding, ProtocolContext, RequestContext,
 };
+
+pub use usage::{apply_completion_usage, billable_tokens, validate_completion_facts};
 
 /// Whether a version string is semver, by the reference's pattern
 /// (`pkg/jsplugin/registry.go:40`): a release triple with optional pre-release
@@ -460,6 +463,98 @@ pub struct PluginManifest {
     /// Protocols this plugin claims to serve.
     #[serde(default)]
     pub protocols: Vec<ProtocolClaim>,
+    /// How this plugin's usage facts are shaped, so a fact can be validated
+    /// before it influences billing (`pkg/jsplugin/registry.go:1117`).
+    #[serde(rename = "usageSchema", default)]
+    pub usage_schema: std::collections::BTreeMap<String, UsageFieldSchema>,
+    /// Display-only pricing samples over `usage_schema`.
+    #[serde(rename = "usageExamples", default)]
+    pub usage_examples: Vec<UsageExample>,
+    /// Per-model usage schemas, for a plugin whose models report different
+    /// facts (`pkg/jsplugin/registry.go:1129`).
+    #[serde(rename = "usageProfiles", default)]
+    pub usage_profiles: Vec<UsageProfile>,
+}
+
+/// One usage fact's declared shape (`pkg/jsplugin/registry.go:189`).
+///
+/// The display half (`unitLabel`, `description`, `enumLabels`) is carried
+/// through so a manifest the reference accepts loads here; only `type`, `unit`
+/// and `enum` take part in validating a fact.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageFieldSchema {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub unit: String,
+    #[serde(rename = "unitLabel", default)]
+    pub unit_label: Option<LocalizedText>,
+    #[serde(rename = "enum", default)]
+    pub enum_values: Option<Vec<String>>,
+    #[serde(default)]
+    pub description: Option<LocalizedText>,
+    #[serde(rename = "enumLabels", default)]
+    pub enum_labels: Option<std::collections::BTreeMap<String, LocalizedText>>,
+}
+
+/// A display-only pricing sample over a usage schema
+/// (`pkg/jsplugin/registry.go:170`). It never participates in billing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageExample {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub facts: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A usage schema for a subset of the plugin's models
+/// (`pkg/jsplugin/registry.go:1449`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageProfile {
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub schema: Option<std::collections::BTreeMap<String, UsageFieldSchema>>,
+    #[serde(default)]
+    pub examples: Vec<UsageExample>,
+}
+
+/// The usage schema a plugin declares, base plus per-model profiles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginUsage {
+    #[serde(rename = "usageSchema", default)]
+    pub schema: std::collections::BTreeMap<String, UsageFieldSchema>,
+    #[serde(rename = "usageProfiles", default)]
+    pub profiles: Vec<UsageProfile>,
+}
+
+impl PluginUsage {
+    /// The schema for the first of `models` a profile claims, else the base
+    /// schema (`pkg/jsplugin/registry.go:146`). Model matching folds ASCII
+    /// case, as the reference does.
+    pub fn for_models(
+        &self,
+        models: &[&str],
+    ) -> &std::collections::BTreeMap<String, UsageFieldSchema> {
+        for model in models {
+            let folded = model.trim().to_ascii_lowercase();
+            for profile in &self.profiles {
+                if profile
+                    .models
+                    .iter()
+                    .any(|declared| declared.trim().to_ascii_lowercase() == folded)
+                {
+                    if let Some(schema) = &profile.schema {
+                        return schema;
+                    }
+                }
+            }
+        }
+        &self.schema
+    }
 }
 
 impl PluginManifest {
@@ -630,9 +725,260 @@ impl PluginManifest {
             }
             route_keys.push(key);
         }
+        // Usage schemas: the same rules the reference applies before a plugin
+        // may ship one (`pkg/jsplugin/registry.go:1404`).
+        validate_usage_schema(&self.usage_schema).map_err(PluginError::Load)?;
+        validate_usage_examples(&self.usage_schema, &self.usage_examples)
+            .map_err(PluginError::Load)?;
+        let mut profile_models: Vec<&str> = Vec::new();
+        for (index, profile) in self.usage_profiles.iter().enumerate() {
+            if profile.models.iter().all(|model| model.trim().is_empty()) {
+                return Err(PluginError::Load(format!(
+                    "plugin meta usageProfiles[{index}] models must contain at least one model"
+                )));
+            }
+            for model in &profile.models {
+                if model.trim().is_empty() {
+                    return Err(PluginError::Load(format!(
+                        "plugin meta usageProfiles[{index}] models must contain at least one model"
+                    )));
+                }
+                if !self.models.iter().any(|declared| declared == model) {
+                    return Err(PluginError::Load(format!(
+                        "plugin meta usageProfiles[{index}] model {model:?} is not declared in plugin meta models"
+                    )));
+                }
+                if profile_models.contains(&model.as_str()) {
+                    return Err(PluginError::Load(format!(
+                        "plugin meta usageProfiles model {model:?} belongs to multiple profiles"
+                    )));
+                }
+                profile_models.push(model.as_str());
+            }
+            let Some(schema) = &profile.schema else {
+                return Err(PluginError::Load(format!(
+                    "plugin meta usageProfiles[{index}] schema must be an object"
+                )));
+            };
+            validate_usage_schema(schema)
+                .map_err(|reason| PluginError::Load(format!("plugin meta usageProfiles[{index}]: {reason}")))?;
+            validate_usage_examples(schema, &profile.examples)
+                .map_err(|reason| PluginError::Load(format!("plugin meta usageProfiles[{index}]: {reason}")))?;
+        }
         Ok(())
     }
 
+}
+
+/// The reference's usage-schema ceilings (`pkg/jsplugin/registry.go:34,1607`).
+const MAX_USAGE_EXAMPLES: usize = 16;
+const MAX_USAGE_EXAMPLE_LABEL_RUNES: usize = 48;
+const MAX_USAGE_FIELD_DESCRIPTION_RUNES: usize = 256;
+/// The per-task duration ceiling (`relay/common/relay_utils.go:146`).
+pub const MAX_TASK_DURATION_SECONDS: f64 = 3600.0;
+/// The image-count ceiling (`relaykit/dto/openai_image.go:15`).
+pub const MAX_IMAGE_N: f64 = 128.0;
+
+/// The rules a usage schema must satisfy before the host will validate facts
+/// against it (`pkg/jsplugin/registry.go:1440`).
+fn validate_usage_schema(
+    schema: &std::collections::BTreeMap<String, UsageFieldSchema>,
+) -> Result<(), String> {
+    for (name, field) in schema {
+        if name.trim().is_empty() || name.trim() != name {
+            return Err(
+                "plugin meta usageSchema keys must be non-empty canonical names".to_string(),
+            );
+        }
+        validate_usage_field_schema(name, field)?;
+    }
+    Ok(())
+}
+
+/// One field's rules (`pkg/jsplugin/registry.go:1550`).
+fn validate_usage_field_schema(name: &str, field: &UsageFieldSchema) -> Result<(), String> {
+    if let Some(label) = &field.unit_label {
+        if field.kind != "number" || field.unit != "count" || field.enum_values.is_some() {
+            return Err(format!(
+                "plugin meta usageSchema field {name:?} unitLabel requires a number field with count unit"
+            ));
+        }
+        validate_localized_text(
+            label,
+            &format!("usageSchema field {name:?} unitLabel"),
+            MAX_USAGE_FIELD_DESCRIPTION_RUNES,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if let Some(description) = &field.description {
+        validate_localized_text(
+            description,
+            &format!("usageSchema field {name:?} description"),
+            MAX_USAGE_FIELD_DESCRIPTION_RUNES,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if field.enum_labels.is_some() && field.enum_values.is_none() {
+        return Err(format!(
+            "plugin meta usageSchema field {name:?} enumLabels requires enum"
+        ));
+    }
+    if let Some(values) = &field.enum_values {
+        if !field.kind.is_empty() || !field.unit.is_empty() {
+            return Err(format!(
+                "plugin meta usageSchema field {name:?} cannot combine enum with type or unit"
+            ));
+        }
+        if values.is_empty() {
+            return Err(format!(
+                "plugin meta usageSchema field {name:?} enum must contain at least one value"
+            ));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for value in values {
+            if seen.contains(&value.as_str()) {
+                return Err(format!(
+                    "plugin meta usageSchema field {name:?} enum values must be unique"
+                ));
+            }
+            seen.push(value.as_str());
+        }
+        if let Some(labels) = &field.enum_labels {
+            for (value, label) in labels {
+                if !seen.contains(&value.as_str()) {
+                    return Err(format!(
+                        "plugin meta usageSchema field {name:?} enumLabels has undeclared enum value {value:?}"
+                    ));
+                }
+                if label.0.is_empty() {
+                    return Err(format!(
+                        "plugin meta usageSchema field {name:?} enumLabels value {value:?} must include a non-empty label"
+                    ));
+                }
+                validate_localized_text(
+                    label,
+                    &format!("usageSchema field {name:?} enumLabels value {value:?}"),
+                    MAX_USAGE_FIELD_DESCRIPTION_RUNES,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        return Ok(());
+    }
+    if field.kind == "boolean" {
+        if !field.unit.is_empty() {
+            return Err(format!(
+                "plugin meta usageSchema field {name:?} cannot combine boolean with unit"
+            ));
+        }
+        return Ok(());
+    }
+    if field.kind != "number" {
+        return Err(format!(
+            "plugin meta usageSchema field {name:?} type must be number or boolean"
+        ));
+    }
+    if !matches!(field.unit.as_str(), "second" | "count" | "token" | "credit") {
+        return Err(format!(
+            "plugin meta usageSchema field {name:?} unit must be second, count, token, or credit"
+        ));
+    }
+    Ok(())
+}
+
+/// Display samples have to cover the schema and stay bounded
+/// (`pkg/jsplugin/registry.go:1658`). A token unit makes them mandatory,
+/// because a token-priced task without a sample is a pricing page that cannot
+/// explain itself.
+fn validate_usage_examples(
+    schema: &std::collections::BTreeMap<String, UsageFieldSchema>,
+    examples: &[UsageExample],
+) -> Result<(), String> {
+    if examples.is_empty() {
+        if schema
+            .values()
+            .any(|field| field.kind == "number" && field.unit == "token")
+        {
+            return Err(
+                "plugin meta usageExamples is required when usageSchema declares a token unit"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if schema.is_empty() {
+        return Err("plugin meta usageExamples requires usageSchema".to_string());
+    }
+    if examples.len() > MAX_USAGE_EXAMPLES {
+        return Err(format!(
+            "plugin meta usageExamples must not exceed {MAX_USAGE_EXAMPLES} entries"
+        ));
+    }
+    for (index, example) in examples.iter().enumerate() {
+        let label = example.label.trim();
+        if label.is_empty() {
+            return Err(format!("plugin meta usageExamples[{index}] label is required"));
+        }
+        if label.chars().count() > MAX_USAGE_EXAMPLE_LABEL_RUNES {
+            return Err(format!(
+                "plugin meta usageExamples[{index}] label must not exceed {MAX_USAGE_EXAMPLE_LABEL_RUNES} characters"
+            ));
+        }
+        for key in schema.keys() {
+            if !example.facts.contains_key(key) {
+                return Err(format!(
+                    "plugin meta usageExamples[{index}] facts missing key {key:?}"
+                ));
+            }
+        }
+        for (key, value) in &example.facts {
+            let Some(field) = schema.get(key) else {
+                return Err(format!(
+                    "plugin meta usageExamples[{index}] facts has undeclared key {key:?}"
+                ));
+            };
+            validate_usage_example_value(value, field).map_err(|reason| {
+                format!("plugin meta usageExamples[{index}] facts field {key:?} {reason}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_usage_example_value(
+    value: &serde_json::Value,
+    field: &UsageFieldSchema,
+) -> Result<(), String> {
+    if let Some(values) = &field.enum_values {
+        let Some(text) = value.as_str() else {
+            return Err("enum is not an allowed value".to_string());
+        };
+        if values.iter().any(|allowed| allowed == text) {
+            return Ok(());
+        }
+        return Err("enum is not an allowed value".to_string());
+    }
+    if field.kind == "boolean" {
+        if value.is_boolean() {
+            return Ok(());
+        }
+        return Err("must be a boolean".to_string());
+    }
+    let Some(number) = value.as_f64().filter(|number| number.is_finite()) else {
+        return Err("must be a finite non-negative number".to_string());
+    };
+    if number < 0.0 {
+        return Err("must be a finite non-negative number".to_string());
+    }
+    let limit = match field.unit.as_str() {
+        "count" => MAX_IMAGE_N,
+        "token" | "credit" => i32::MAX as f64,
+        _ => MAX_TASK_DURATION_SECONDS,
+    };
+    if number > limit {
+        return Err("exceeds the host limit".to_string());
+    }
+    Ok(())
 }
 
 /// The reference's `pluginKeyPattern`, transcribed.

@@ -1949,6 +1949,7 @@ async fn plugin_bridge(
         allowed_hosts: allowed_hosts_of(&state, &plugin_key),
         submit_response_types: submit_response_types_of(&state, &plugin_key),
         required_capabilities: manifest_strings(&state, &plugin_key, "requiredCapabilities"),
+        usage: plugin_usage_of(&state, &plugin_key),
         files: match resolve_request_files(invocation.headers, invocation.body).await {
             Ok(files) => files,
             Err(reason) => return json_error(StatusCode::BAD_REQUEST, &reason),
@@ -2109,6 +2110,14 @@ fn manifest_strings(state: &AppState, plugin_key: &str, field: &str) -> Vec<Stri
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The usage schema a plugin's stored manifest declares, base and profiles.
+fn plugin_usage_of(state: &AppState, plugin_key: &str) -> oxygenrouter_plugin::PluginUsage {
+    let Some(manifest) = state.db.plugin_manifest(plugin_key).ok().flatten() else {
+        return oxygenrouter_plugin::PluginUsage::default();
+    };
+    serde_json::from_value(manifest).unwrap_or_default()
 }
 
 /// The uploaded files a request carried, resolved to their bytes.
@@ -2774,6 +2783,7 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
             allowed_hosts: allowed_hosts_of(state, &task.platform),
             submit_response_types: submit_response_types_of(state, &task.platform),
             required_capabilities: manifest_strings(state, &task.platform, "requiredCapabilities"),
+            usage: plugin_usage_of(state, &task.platform),
             files: Vec::new(),
             max_inline_bytes: 0,
             timeout: PLUGIN_TIMEOUT,
@@ -2803,6 +2813,16 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
             data: task.data.clone(),
             state: task.private.plugin_state.clone(),
         };
+        // A per-call price is the contract, so the plugin's usage facts must not
+        // turn it into a token charge (`service/task_polling.go:692`).
+        let per_call_pricing = match task.private.billing.as_ref() {
+            Some(billing) => {
+                let pricing = state.billing.pricing();
+                let price = pricing.read().price_data(&billing.model, &billing.group);
+                price.use_price
+            }
+            None => false,
+        };
         let settlement = oxygenrouter_plugin::poll_once(
             &state.plugins,
             &transport,
@@ -2810,7 +2830,7 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
             &poll_task,
             now,
             timeout_secs,
-            false,
+            per_call_pricing,
         )
         .await;
         polled += 1;
@@ -2875,7 +2895,7 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
         }
 
         if let Some(plan) = settlement.settle {
-            settle_polled_task(state, &task, plan);
+            settle_polled_task(state, &task, plan, settlement.usage_tokens);
         }
     }
     (polled, advanced)
@@ -3084,6 +3104,7 @@ fn settle_polled_task(
     state: &AppState,
     task: &oxygenrouter_core::TaskRecord,
     plan: oxygenrouter_plugin::SettlePlan,
+    usage_tokens: i64,
 ) {
     let Some(billing) = task.private.billing.as_ref() else {
         return;
@@ -3099,10 +3120,86 @@ fn settle_polled_task(
         }
         // The price was the contract: a per-call task keeps what it reserved.
         oxygenrouter_plugin::SettlePlan::KeepReservation => mark_settled(state, task),
-        oxygenrouter_plugin::SettlePlan::SettleWithUsage => eprintln!(
-            "[OxygenRouter] task {} reported usage, but task usage settlement is not wired; \
-             the reservation of {} micros stands",
-            task.task_id, billing.reserved_micros
+        // A success that reported usage settles at what the tokens actually
+        // buy; the session moves only the difference against the reservation.
+        oxygenrouter_plugin::SettlePlan::SettleWithUsage => {
+            match task_usage_quota(state, billing, usage_tokens) {
+                Some(actual) => {
+                    settle_task_usage(state, billing, &task.task_id, actual);
+                    mark_settled(state, task);
+                }
+                None => eprintln!(
+                    "[OxygenRouter] task {} reported {usage_tokens} tokens with no token price; \
+                     the reservation of {} micros stands",
+                    task.task_id, billing.reserved_micros
+                ),
+            }
+        }
+    }
+}
+
+/// The quota a completed task's reported tokens buy, at the model and group the
+/// reservation was quoted in (`service/task_billing.go:381`).
+///
+/// `None` when the model is per-call priced, unpriced, or the count is not a
+/// count: the reference only re-bills a model that has a ratio, and keeps the
+/// reservation otherwise.
+fn task_usage_quota(
+    state: &AppState,
+    billing: &oxygenrouter_core::TaskBilling,
+    tokens: i64,
+) -> Option<i64> {
+    if tokens <= 0 {
+        return None;
+    }
+    let pricing = state.billing.pricing();
+    let price = pricing.read().price_data(&billing.model, &billing.group);
+    if price.use_price || !price.model_ratio.is_finite() || price.model_ratio <= 0.0 {
+        return None;
+    }
+    let mut multiplier = price.model_ratio * price.group_ratio;
+    for ratio in &price.other_ratios {
+        if ratio.is_finite() && *ratio > 0.0 && *ratio != 1.0 {
+            multiplier *= ratio;
+        }
+    }
+    let (quota, _clamp) = oxygenrouter_billing::quota_round_checked(tokens as f64 * multiplier);
+    Some(quota)
+}
+
+/// Move only the difference between the reservation and the real usage.
+fn settle_task_usage(
+    state: &AppState,
+    billing: &oxygenrouter_core::TaskBilling,
+    task_id: &str,
+    actual_micros: i64,
+) {
+    let funding = task_funding(billing);
+    let charge = oxygenrouter_billing::Charge {
+        quota: actual_micros,
+        path: oxygenrouter_billing::BillingPath::Ratio,
+        matched_tier: None,
+        per_request: false,
+        clamp: None,
+        estimated_prompt_tokens: 0,
+    };
+    match state.billing.settle(
+        state.billing_store.as_ref(),
+        &task_session(billing),
+        &billing.key_id,
+        &billing.user_id,
+        &charge,
+        "task usage settlement",
+        Some(task_id),
+        &funding,
+    ) {
+        Ok(()) => println!(
+            "[OxygenRouter] task {task_id} settled at {actual_micros} micros (reserved {})",
+            billing.reserved_micros
+        ),
+        Err(error) => eprintln!(
+            "[OxygenRouter] task {task_id} usage settlement for key {} failed: {error}",
+            billing.key_id
         ),
     }
 }

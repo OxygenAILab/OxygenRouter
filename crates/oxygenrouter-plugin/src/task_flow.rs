@@ -24,8 +24,8 @@ use crate::task::{
 };
 use crate::submit_stream::read_submit_events;
 use crate::{
-    PluginError, PluginHost, CAPABILITY_SUBMIT_SSE_DELTA, HOOK_BUILD_QUERY_REQUEST,
-    HOOK_PARSE_SUBMIT_RESPONSE, HOOK_PARSE_TASK_RESULT,
+    PluginError, PluginHost, PluginUsage, CAPABILITY_SUBMIT_SSE_DELTA, HOOK_BUILD_QUERY_REQUEST,
+    HOOK_EXTRACT_USAGE_ON_COMPLETE, HOOK_PARSE_SUBMIT_RESPONSE, HOOK_PARSE_TASK_RESULT,
 };
 
 /// One outbound request, fully formed: the host only has to send it.
@@ -173,6 +173,9 @@ pub struct TaskFlowContext {
     /// is the one the submit-stream reader has to know about, because it
     /// selects which per-event hook the plugin exports.
     pub required_capabilities: Vec<String>,
+    /// The usage schema the plugin declared, so a completion hook's facts can
+    /// be validated against the model they were reported for.
+    pub usage: PluginUsage,
     /// Files the request carried, resolved to their bytes.
     pub files: Vec<ResolvedFile>,
     pub max_inline_bytes: u64,
@@ -451,16 +454,56 @@ pub async fn interpret_task_result(
             &context.plugin_key,
             HOOK_PARSE_TASK_RESULT,
             &[
-                query_context,
+                query_context.clone(),
                 outcome.body_for_hook(),
                 outcome.response_for_hook(),
             ],
             context.timeout,
         )
         .await?;
-    serde_json::from_value(value).map_err(|error| {
+    let mut result: TaskResult = serde_json::from_value(value).map_err(|error| {
         FlowError::fatal(format!("parseTaskResult returned an unusable shape: {error}"))
-    })
+    })?;
+    // The completion usage hook runs at this boundary because the raw poll body
+    // only exists here (`adaptor.go:805`). A hook that is absent, throws, or
+    // returns an invalid shape leaves the result untouched: the reference logs
+    // and carries on, and the reservation then stands.
+    let body = outcome.body_for_hook();
+    match host
+        .call_hook_args(
+            &context.plugin_key,
+            HOOK_EXTRACT_USAGE_ON_COMPLETE,
+            &[
+                query_context.clone(),
+                serde_json::to_value(&result).unwrap_or(serde_json::Value::Null),
+                body,
+            ],
+            context.timeout,
+        )
+        .await
+    {
+        Ok(facts) => {
+            let models: Vec<String> = ["upstreamModel", "model"]
+                .iter()
+                .filter_map(|key| query_context.get(key).and_then(serde_json::Value::as_str))
+                .map(String::from)
+                .collect();
+            let model_refs: Vec<&str> = models.iter().map(String::as_str).collect();
+            match crate::validate_completion_facts(&facts, context.usage.for_models(&model_refs)) {
+                Ok(validated) => crate::apply_completion_usage(&mut result, &validated),
+                Err(reason) => eprintln!(
+                    "[OxygenRouter] plugin {} rejected invalid extractUsageOnComplete facts: {reason}",
+                    context.plugin_key
+                ),
+            }
+        }
+        Err(PluginError::NoSuchHook { .. }) => {}
+        Err(error) => eprintln!(
+            "[OxygenRouter] plugin {} extractUsageOnComplete failed: {error}",
+            context.plugin_key
+        ),
+    }
+    Ok(result)
 }
 
 /// A task as the poller needs to see it.
@@ -519,6 +562,9 @@ pub struct PollSettlement {
     pub plugin_state: Option<serde_json::Value>,
     /// What the quota should do. `None` means "leave it alone for now".
     pub settle: Option<crate::SettlePlan>,
+    /// The billable tokens a usage-reporting answer carried, so the caller can
+    /// settle against real usage rather than the reservation.
+    pub usage_tokens: i64,
     pub round: PollRound,
 }
 
@@ -532,6 +578,7 @@ impl PollSettlement {
             reason: Some(reason),
             plugin_state: None,
             settle: None,
+            usage_tokens: 0,
             round,
         }
     }
@@ -566,6 +613,7 @@ pub async fn poll_once(
             )),
             plugin_state: None,
             settle: Some(crate::SettlePlan::Refund),
+            usage_tokens: 0,
             round: PollRound::Failed,
         };
     }
@@ -625,6 +673,7 @@ pub async fn poll_once(
             reason: None,
             plugin_state: plugin_state_of(parsed.as_ref()),
             settle: None,
+            usage_tokens: 0,
             round: PollRound::Continued,
         },
         crate::PollDecision::Terminal {
@@ -633,7 +682,7 @@ pub async fn poll_once(
             reason,
             result,
         } => {
-            let has_usage = result.total_tokens > 0.0 || result.completion_tokens > 0.0;
+            let usage_tokens = crate::billable_tokens(&result);
             PollSettlement {
                 task_id: task.task_id.clone(),
                 expected_status: task.status.clone(),
@@ -641,7 +690,8 @@ pub async fn poll_once(
                 progress: Some(progress),
                 reason: if reason.is_empty() { None } else { Some(reason) },
                 plugin_state: plugin_state_of(parsed.as_ref()),
-                settle: Some(crate::settle_plan(&status, has_usage, per_call_pricing)),
+                settle: Some(crate::settle_plan(&status, usage_tokens > 0, per_call_pricing)),
+                usage_tokens,
                 round: PollRound::Settled,
             }
         }
@@ -655,6 +705,7 @@ pub async fn poll_once(
             // A task that failed costs nothing, so it refunds in full. A failure
             // that already settled is not refunded again by the caller.
             settle: Some(crate::SettlePlan::Refund),
+            usage_tokens: 0,
             round: PollRound::Failed,
         },
         crate::PollDecision::Retry { reason } => {
@@ -840,6 +891,7 @@ mod tests {
             allowed_hosts: vec!["cdn.vendor.example".to_string()],
             submit_response_types: vec!["json".to_string()],
             required_capabilities: Vec::new(),
+            usage: PluginUsage::default(),
             files: Vec::new(),
             max_inline_bytes: 0,
             timeout: DEFAULT_CALL_TIMEOUT,
@@ -1470,6 +1522,123 @@ mod tests {
                 );
                 assert!(!error.retryable, "{name}: an accepted stream is not retried");
             }
+        });
+    }
+
+    /// A completed poll runs the plugin's own usage hook, validates what it
+    /// reported against the shape the manifest declared, and turns the
+    /// host-owned counters into the token count settlement reads
+    /// (`adaptor.go:805`).
+    #[test]
+    fn a_completion_hook_turns_usage_facts_into_tokens() {
+        runtime().block_on(async {
+            const SOURCE: &str = r#"
+                export const meta = {apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-video"], fetchMode:"per_task",
+                    usageSchema:{seconds:{type:"number",unit:"second"}, mode:{enum:["std","pro"]}},
+                    protocols:["openai_video"]};
+                export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/jobs"}; }
+                export function parseSubmitResponse(ctx, response) { return {taskId:"vendor-1"}; }
+                export function buildQueryRequest(ctx) { return {url: ctx.baseUrl + "/jobs/1"}; }
+                export function parseTaskResult(ctx, body, response) { return {status:"SUCCESS"}; }
+                export function extractUsageOnComplete(ctx, result, body) {
+                    if (body.seconds !== 5) throw new Error("no body argument");
+                    if (!result || result.status !== "SUCCESS") throw new Error("no result argument");
+                    if (ctx.upstreamModel !== "vendor-model") throw new Error("no upstream model in context");
+                    return {seconds:5, mode:"pro", upstreamUnits: 3};
+                }
+                export const protocols = {openai_video: {
+                    decodeRequest: function(ctx) { return {kind:"submit", model: ctx.model}; },
+                    render: function(ctx, task) { return task; }
+                }};
+                export function listArtifacts() { return []; }
+                export function buildContentRequest() { return {}; }
+            "#;
+            let host = PluginHost::start();
+            let manifest = host
+                .load(SOURCE.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("a manifest with a usage schema loads");
+            assert!(manifest.usage_schema.contains_key("seconds"));
+
+            let mut ctx = context();
+            ctx.usage = PluginUsage {
+                schema: manifest.usage_schema.clone(),
+                profiles: manifest.usage_profiles.clone(),
+            };
+            let outcome = HttpOutcome {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"seconds":5}"#.to_vec(),
+            };
+            let result = interpret_task_result(
+                &host,
+                &ctx,
+                serde_json::json!({"model":"acme-video","upstreamModel":"vendor-model"}),
+                &outcome,
+            )
+            .await
+            .expect("parsed");
+            assert_eq!(result.total_tokens, 3.0, "upstreamUnits wins");
+            assert_eq!(result.usage_facts["mode"], "pro");
+            assert_eq!(crate::billable_tokens(&result), 3);
+
+            // A hook that reports a fact the schema refuses leaves the result
+            // untouched: the reservation then stands rather than billing a
+            // value nobody validated.
+            let host = PluginHost::start();
+            host.load(
+                SOURCE.replace(
+                    r#"return {seconds:5, mode:"pro", upstreamUnits: 3};"#,
+                    r#"return {seconds:"five", mode:"pro", upstreamUnits: 3};"#,
+                ),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await
+            .expect("load");
+            let result = interpret_task_result(
+                &host,
+                &ctx,
+                serde_json::json!({"model":"acme-video","upstreamModel":"vendor-model"}),
+                &outcome,
+            )
+            .await
+            .expect("parsed");
+            assert_eq!(crate::billable_tokens(&result), 0);
+            assert!(result.usage_facts.is_null());
+        });
+    }
+
+    /// The schema itself is validated at load time, so a plugin cannot ship a
+    /// unit the host would not know how to bound
+    /// (`pkg/jsplugin/registry.go:1550`).
+    #[test]
+    fn an_invalid_usage_schema_is_refused_at_load() {
+        runtime().block_on(async {
+            const SOURCE: &str = r#"
+                export const meta = {apiVersion:1, key:"acme", name:"Acme", version:"1.0.0",
+                    author:{name:"Test"}, models:["acme-video"], fetchMode:"per_task",
+                    usageSchema:{seconds:{type:"number",unit:"bogus"}},
+                    protocols:["openai_video"]};
+                export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/jobs"}; }
+                export function parseSubmitResponse(ctx, response) { return {taskId:"vendor-1"}; }
+                export function buildQueryRequest(ctx) { return {url: ctx.baseUrl + "/jobs/1"}; }
+                export function parseTaskResult() { return {status:"SUCCESS"}; }
+                export const protocols = {openai_video: {
+                    decodeRequest: function(ctx) { return {kind:"submit", model: ctx.model}; },
+                    render: function(ctx, task) { return task; }
+                }};
+                export function listArtifacts() { return []; }
+                export function buildContentRequest() { return {}; }
+            "#;
+            let error = PluginHost::start()
+                .load(SOURCE.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect_err("invalid unit");
+            assert!(
+                error.to_string().contains("unit must be second, count, token, or credit"),
+                "{error}"
+            );
         });
     }
 

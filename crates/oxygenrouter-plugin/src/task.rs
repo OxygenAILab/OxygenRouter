@@ -426,6 +426,10 @@ pub struct TaskResult {
     pub total_tokens: f64,
     #[serde(default)]
     pub state: serde_json::Value,
+    /// The validated facts `extractUsageOnComplete` reported, when it did.
+    /// Host-side only: a plugin's `parseTaskResult` never sets this.
+    #[serde(rename = "usageFacts", default)]
+    pub usage_facts: serde_json::Value,
 }
 
 impl TaskResult {
