@@ -1298,6 +1298,7 @@ impl Engine {
         module: Option<&boa_engine::Module>,
         protocol: &str,
         plugin_key: &str,
+        member: &str,
     ) -> Result<boa_engine::JsObject, PluginError> {
         let Some(object) = self.protocols_object(module) else {
             return Err(PluginError::Load(
@@ -1319,15 +1320,39 @@ impl Engine {
                 }
             }
         }
+        // The object that *defines the member* wins, whatever the caller called
+        // it. A plugin serves several protocols at once and they are keyed by
+        // protocol name, so stopping at the first object that merely exists would
+        // resolve `renderEvents` against whichever protocol was listed first --
+        // which is how a working plugin came to be reported as missing the hook.
+        let mut found_any_object = false;
         for name in candidates {
             let entry = object.get(boa_engine::js_string!(name.as_str()), &mut self.context);
-            if let Ok(entry) = entry {
-                if !entry.is_undefined() && !entry.is_null() {
-                    if let Ok(entry) = entry.to_object(&mut self.context) {
-                        return Ok(entry);
-                    }
-                }
+            let Ok(entry) = entry else { continue };
+            if entry.is_undefined() || entry.is_null() {
+                continue;
             }
+            let Ok(entry) = entry.to_object(&mut self.context) else {
+                continue;
+            };
+            found_any_object = true;
+            let Ok(value) = entry.get(boa_engine::js_string!(member), &mut self.context) else {
+                continue;
+            };
+            if value.as_callable().is_some() {
+                return Ok(entry);
+            }
+        }
+        if found_any_object {
+            // A protocols object exists but none of them implements the member:
+            // that is the plugin's own gap, and it is named as one.
+            return Err(PluginError::Hook {
+                key: plugin_key.to_string(),
+                hook: member.to_string(),
+                message: format!(
+                    "plugin {plugin_key} has no protocol member {member:?}; implement it under protocols.{protocol}"
+                ),
+            });
         }
         Err(PluginError::Hook {
             key: plugin_key.to_string(),
@@ -1408,7 +1433,7 @@ impl Engine {
                 hook: member.to_string(),
             });
         };
-        let entry = self.protocol_object_for(module.as_ref(), key, &plugin_key)?;
+        let entry = self.protocol_object_for(module.as_ref(), key, &plugin_key, member)?;
         let function = entry
             .get(boa_engine::js_string!(member), &mut self.context)
             .map_err(|error| PluginError::Hook {

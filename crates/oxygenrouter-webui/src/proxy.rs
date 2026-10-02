@@ -2458,6 +2458,271 @@ fn persist_task(
         .into_response()
 }
 
+/// How often a streamed response is observed, before jitter.
+///
+/// The reference's default (`controller/plugin_protocol.go`'s
+/// `defaultPluginProtocolBridgeDeps`): two seconds, jittered per task so a fleet
+/// of simultaneous submissions does not reach the upstream in lockstep.
+pub const RESPONSES_TICK_MS: u64 = 2_000;
+/// The jitter added to each tick, from the same default (zero).
+pub const RESPONSES_TICK_JITTER_MS: u64 = 0;
+/// How long a streamed response may run before it is ended as incomplete
+/// (the reference's ten-minute default).
+pub const RESPONSES_OBSERVATION_SECS: u64 = 600;
+
+/// The delay before one tick, jittered by the task id.
+///
+/// Ported from `pluginProtocolTickDelay`: an FNV-1a hash of the task id and the
+/// tick number, reduced into the jitter window. Two tasks submitted in the same
+/// millisecond therefore drift apart instead of arriving together, which matters
+/// because a plugin's upstream is usually the same host for all of them.
+pub fn protocol_tick_delay(task_id: &str, tick: u64, base_ms: u64, jitter_ms: u64) -> std::time::Duration {
+    if jitter_ms == 0 {
+        return std::time::Duration::from_millis(base_ms);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in task_id.as_bytes().iter().chain(b":").chain(tick.to_string().as_bytes()) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    std::time::Duration::from_millis(base_ms + hash % (jitter_ms + 1))
+}
+
+/// Whether a set of stream events ended the response.
+///
+/// Ported from `taskPluginProtocolEventsTerminal`: the three endings are the only
+/// types that stop the observation loop.
+pub fn events_terminal(events: &[oxygenrouter_plugin::StreamEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "response.completed" | "response.failed" | "response.incomplete"
+        )
+    })
+}
+
+/// Stream a plugin-backed Responses request.
+///
+/// The stream is the observation loop the reference runs: `created`, then a
+/// `renderEvents` tick per interval until the task is terminal, ending as
+/// completed, failed or incomplete. Two things are deliberate.
+///
+/// The task is *submitted first, outside this call*, so the work does not depend on
+/// this connection staying open -- a client that gives up stops watching, not the
+/// job. And every event a client sees is built by the host from semantic events, so
+/// nothing here can be influenced by a plugin beyond the text it produced.
+async fn responses_stream(
+    state: std::sync::Arc<AppState>,
+    task_id: String,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        let mut machine = match load_response_machine(&state_for_task, &task_id) {
+            Some(machine) => machine,
+            None => {
+                let _ = tx
+                    .send(sse_frame_of_error(
+                        "task_protocol_error",
+                        "the task could not be read back",
+                    ))
+                    .await;
+                return;
+            }
+        };
+        match machine.created() {
+            Ok(created) => {
+                if tx.send(oxygenrouter_plugin::sse_frame(&created)).await.is_err() {
+                    return;
+                }
+            }
+            Err(reason) => {
+                let _ = tx.send(sse_frame_of_error("task_protocol_error", &reason)).await;
+                return;
+            }
+        }
+
+        let limits = oxygenrouter_plugin::EventLimits::default();
+        let mut tick: u64 = 0;
+        loop {
+            if started.elapsed().as_secs() >= RESPONSES_OBSERVATION_SECS {
+                if let Ok(event) = machine.timeout(None) {
+                    let _ = tx.send(oxygenrouter_plugin::sse_frame(&event)).await;
+                }
+                return;
+            }
+            // The delay is computed before the work, so the interval is the gap
+            // between ticks rather than the gap plus however long a tick took.
+            let delay = protocol_tick_delay(
+                &task_id,
+                tick,
+                RESPONSES_TICK_MS,
+                RESPONSES_TICK_JITTER_MS,
+            );
+            tokio::time::sleep(delay).await;
+            tick += 1;
+
+            let Some(task) = state_for_task.db.get_task(&task_id).ok().flatten() else {
+                if let Ok(event) = machine.failure(None) {
+                    let _ = tx.send(oxygenrouter_plugin::sse_frame(&event)).await;
+                }
+                return;
+            };
+
+            // The events a plugin emits are read through its own hook; a plugin
+            // that cannot render at all ends the stream rather than stalling it.
+            // One ending for every way a tick can go wrong: a refusal, a missing
+            // hook and a failed call all end the stream as failed rather than
+            // leaving a client watching something that will never finish.
+            let events = match render_events_once(&state_for_task, &task, &machine).await {
+                Ok(Some(result)) => match machine.apply_tick(&result, &task.status) {
+                    Ok(events) => events,
+                    Err(reason) => {
+                        eprintln!("[OxygenRouter] task {task_id} renderEvents refused: {reason}");
+                        machine
+                            .failure(Some(&task.status))
+                            .map(|event| vec![event])
+                            .unwrap_or_default()
+                    }
+                },
+                // A plugin that no longer implements the hook ends the stream.
+                Ok(None) => machine
+                    .failure(Some(&task.status))
+                    .map(|event| vec![event])
+                    .unwrap_or_default(),
+                Err(reason) => {
+                    eprintln!("[OxygenRouter] task {task_id} renderEvents failed: {reason}");
+                    machine
+                        .failure(Some(&task.status))
+                        .map(|event| vec![event])
+                        .unwrap_or_default()
+                }
+            };
+            if events.is_empty() {
+                return;
+            }
+            for event in &events {
+                if tx.send(oxygenrouter_plugin::sse_frame(event)).await.is_err() {
+                    // The client went away. The task keeps running: it is already
+                    // stored and the poll loop owns it.
+                    return;
+                }
+            }
+            if events_terminal(&events) {
+                return;
+            }
+            let _ = limits;
+        }
+    });
+
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), rx))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| error_500())
+}
+
+/// The machine for a stored task, or `None` when it cannot be read.
+fn load_response_machine(
+    state: &AppState,
+    task_id: &str,
+) -> Option<oxygenrouter_plugin::ResponsesMachine> {
+    let task = state.db.get_task(task_id).ok().flatten()?;
+    Some(oxygenrouter_plugin::ResponsesMachine::new(
+        &task.task_id,
+        &task.model,
+        task.created_at.timestamp(),
+        oxygenrouter_plugin::EventLimits::default(),
+    ))
+}
+
+/// One `renderEvents` observation.
+///
+/// `None` means the plugin does not implement the hook, which ends the stream; an
+/// `Err` is a failure of the call itself. A plugin error event is *not* treated as
+/// a host failure: it is decoded and handed to the machine, which decides what a
+/// client may be told.
+async fn render_events_once(
+    state: &AppState,
+    task: &oxygenrouter_core::TaskRecord,
+    machine: &oxygenrouter_plugin::ResponsesMachine,
+) -> Result<Option<oxygenrouter_plugin::EventResult>, String> {
+    let Some(channel) = state.db.get_channel(&task.channel_id).ok().flatten() else {
+        return Ok(None);
+    };
+    let view = oxygenrouter_plugin::TaskView::build(
+        &task.task_id,
+        &task.platform,
+        &task.status,
+        &task.progress,
+        &task.fail_reason,
+        task.created_at.timestamp(),
+        task.updated_at.timestamp(),
+        task.finish_time.map(|at| at.timestamp()).unwrap_or(0),
+        task.data.clone(),
+        &task.private.upstream_task_id,
+    );
+    // The renderer's context is the request's own view plus what a renderer needs
+    // to name the task it is narrating, which is what the reference passes
+    // (`controller/plugin_protocol.go:915`).
+    let mut context = serde_json::json!({
+        "taskId": task.task_id,
+        "responseId": machine.response_id(),
+        "model": task.model,
+        "baseUrl": channel.base_url,
+        "metadata": machine.metadata(),
+    });
+    if let Some(object) = context.as_object_mut() {
+        object.insert(
+            "upstreamTaskId".to_string(),
+            serde_json::json!(task.private.upstream_task_id),
+        );
+    }
+    let view_value = serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
+    match state
+        .plugins
+        .call_hook_args(
+            &task.platform,
+            "renderEvents",
+            &[context, view_value],
+            PLUGIN_TIMEOUT,
+        )
+        .await
+    {
+        Ok(value) => oxygenrouter_plugin::decode_event_result(
+            &value,
+            &oxygenrouter_plugin::EventLimits::default(),
+        )
+        .map(Some)
+        .map_err(|reason| reason),
+        Err(oxygenrouter_plugin::PluginError::NoSuchHook { .. }) => Ok(None),
+        Err(oxygenrouter_plugin::PluginError::Hook { message, .. })
+            if message.contains("no protocol member") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// An error frame for a stream that could not start.
+fn sse_frame_of_error(code: &str, message: &str) -> String {
+    format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "error",
+            "error": { "code": code, "message": message },
+        })
+    )
+}
+
 /// How many tasks one poll tick examines.
 ///
 /// Bounded on purpose: a tick that walked an unbounded backlog would hold a
@@ -3583,6 +3848,53 @@ async fn responses_endpoint(
         .as_deref()
         .and_then(|model| plugin_for_endpoint(&state, "POST", "/v1/responses", model))
     {
+        // A streaming request goes through the observation loop; the submission
+        // itself is the same bridge either way, so a plugin that cannot stream is
+        // still reachable by a client that did not ask to.
+        let wants_stream = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .map(|body| {
+                body.get("stream").and_then(|value| value.as_bool()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if wants_stream && binding.supports_mode("stream") {
+            let submitted = plugin_bridge(
+                state.clone(),
+                PluginInvocation {
+                    binding: &binding,
+                    headers: &headers,
+                    body: &body_bytes,
+                },
+                "/v1/responses",
+            )
+            .await;
+            // A submission that did not produce a task is passed through as-is: an
+            // immediate answer has nothing to stream, and a refusal is a refusal.
+            let (parts, body) = submitted.into_parts();
+            if !parts.status.is_success() {
+                return Response::from_parts(parts, body);
+            }
+            let bytes = match axum::body::to_bytes(body, 1 << 20).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("the submission answer could not be read: {error}"),
+                    )
+                }
+            };
+            let Some(task_id) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("taskId").and_then(|id| id.as_str()).map(String::from))
+            else {
+                return (
+                    StatusCode::from_u16(parts.status.as_u16()).unwrap_or(StatusCode::OK),
+                    bytes,
+                )
+                    .into_response();
+            };
+            return responses_stream(state, task_id).await;
+        }
         return plugin_bridge(
             state,
             PluginInvocation {

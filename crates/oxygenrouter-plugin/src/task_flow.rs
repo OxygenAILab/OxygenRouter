@@ -1181,6 +1181,68 @@ mod tests {
         });
     }
 
+    /// A plugin serving several protocols resolves a hook against the object that
+    /// *defines* it, not the first one that exists.
+    ///
+    /// Found live: a plugin claiming `openai_image`, `openai_video` and
+    /// `openai_responses` was reported as missing `renderEvents`, because the
+    /// resolver fell through to whichever protocol object came first and looked
+    /// there. The protocols are keyed by protocol name, so the caller's key is not
+    /// the right address for a member that lives under another one.
+    #[test]
+    fn a_hook_resolves_against_the_protocol_that_defines_it() {
+        runtime().block_on(async {
+            const SOURCE: &str = r#"
+                export const meta = {apiVersion:1, key:"multi", name:"Multi", version:"1.0.0",
+                    author:{name:"Test"}, models:["m"], fetchMode:"per_task",
+                    protocols:["openai_image", {name:"openai_responses", supports:["sync","stream"]}]};
+                export function buildSubmitRequest() { return {}; }
+                export function parseSubmitResponse() { return {taskId: "1"}; }
+                export function buildQueryRequest() { return {}; }
+                export function parseTaskResult() { return {status: "IN_PROGRESS"}; }
+                export const protocols = {
+                    openai_image: {
+                        decodeRequest: function(ctx) { return {kind:"submit", model: ctx.model}; },
+                        render: function(ctx, task) { return {from: "image"}; }
+                    },
+                    openai_responses: {
+                        decodeRequest: function(ctx) { return {kind:"submit", model: ctx.model}; },
+                        // This member exists only on the *second* protocol object,
+                        // which is what the resolver has to find.
+                        renderEvents: function(ctx, task) {
+                            return {events: [{type: "output", data: "ok"}], done: false};
+                        },
+                        renderFinal: function(ctx, task) { return {from: "responses"}; }
+                    }
+                };
+            "#;
+            let host = PluginHost::start();
+            host.load(SOURCE.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+
+            let value = host
+                .call_hook_args(
+                    "multi",
+                    "renderEvents",
+                    &[serde_json::json!({}), serde_json::json!({})],
+                    DEFAULT_CALL_TIMEOUT,
+                )
+                .await
+                .expect("renderEvents must resolve");
+            assert_eq!(value["events"][0]["data"], "ok");
+
+            // A hook that no protocol object implements is still named as missing,
+            // rather than being reported as an absent protocol.
+            let error = host
+                .call_hook_args("multi", "renderNothing", &[], DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect_err("must fail");
+            let text = error.to_string();
+            assert!(text.contains("no protocol member"), "{text}");
+        });
+    }
+
     /// The poll path: the query descriptor defaults to GET, and the plugin reads
     /// its three arguments.
     #[test]
