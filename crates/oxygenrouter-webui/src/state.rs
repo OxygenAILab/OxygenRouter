@@ -165,6 +165,9 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     /// Global in-flight ceiling. NewAPI does not enforce one.
     pub concurrency: Arc<ConcurrencyGuard>,
+    /// The anonymous artifact-access limiter: capability fetches are bounded
+    /// globally, per address, per object, and failed probes per minute.
+    pub artifact_limiter: Arc<crate::artifact_limit::ArtifactAccessLimiter>,
     /// Rate limit applied to relay endpoints per client IP. `0` disables it.
     pub relay_rate_limit: RateLimit,
     /// `RequestLogEnabled` — whether request rows are persisted.
@@ -230,6 +233,7 @@ impl AppState {
             billing_store: Arc::new(SqliteBillingStore::new(db)),
             rate_limiter: Arc::new(RateLimiter::new()),
             concurrency: Arc::new(ConcurrencyGuard::new(0)),
+            artifact_limiter: Arc::new(crate::artifact_limit::ArtifactAccessLimiter::from_env()),
             relay_rate_limit: RateLimit::disabled(),
             // Refreshed by `configure_limits` during startup and by the option
             // writer; the shipped defaults match the schema.

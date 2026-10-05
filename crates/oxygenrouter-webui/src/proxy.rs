@@ -294,9 +294,10 @@ async fn task_artifact_content(
 ) -> Response {
     let uri = request.uri().clone();
     let headers = request.headers().clone();
-    if let Err(response) = authorize_artifact(&state, &headers, &uri, &task_id, &artifact_key) {
-        return response;
-    }
+    let permit = match authorize_artifact(&state, &headers, &uri, &task_id, &artifact_key) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
     let method = request.method().as_str().to_string();
     let client_headers: Vec<(String, String)> = headers
         .iter()
@@ -307,7 +308,9 @@ async fn task_artifact_content(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect();
-    serve_artifact(&state, &task_id, &artifact_key, &method, client_headers).await
+    let response = serve_artifact(&state, &task_id, &artifact_key, &method, client_headers).await;
+    drop(permit);
+    response
 }
 
 /// Serve an artifact through the video path alias, which is the same task row.
@@ -318,9 +321,10 @@ async fn videos_content(
 ) -> Response {
     let uri = request.uri().clone();
     let headers = request.headers().clone();
-    if let Err(response) = authorize_artifact(&state, &headers, &uri, &task_id, "video") {
-        return response;
-    }
+    let permit = match authorize_artifact(&state, &headers, &uri, &task_id, "video") {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
     let method = request.method().as_str().to_string();
     let client_headers: Vec<(String, String)> = headers
         .iter()
@@ -331,7 +335,9 @@ async fn videos_content(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect();
-    serve_artifact(&state, &task_id, "video", &method, client_headers).await
+    let response = serve_artifact(&state, &task_id, "video", &method, client_headers).await;
+    drop(permit);
+    response
 }
 
 async fn serve_artifact(
@@ -720,7 +726,13 @@ fn authorize_artifact(
     uri: &axum::http::Uri,
     task_id: &str,
     artifact_key: &str,
-) -> Result<(), Response> {
+) -> Result<Option<crate::artifact_limit::ArtifactPermit>, Response> {
+    let ip = remote_ip(headers);
+    let ip = if ip.is_empty() {
+        "unknown".to_string()
+    } else {
+        ip
+    };
     match artifact_access_query(uri) {
         ArtifactAccessQuery::Value(access) => {
             let Ok(secret) = state.db.artifact_secret() else {
@@ -729,17 +741,52 @@ fn authorize_artifact(
                     "artifact_internal_error",
                 ));
             };
-            if oxygenrouter_core::artifact_access::verify(&secret, &access, task_id, artifact_key) {
-                Ok(())
-            } else {
-                Err(task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found"))
+            if !oxygenrouter_core::artifact_access::verify(&secret, &access, task_id, artifact_key) {
+                return Err(invalid_capability_response(state, &ip));
+            }
+            match state.artifact_limiter.acquire(
+                &ip,
+                task_id,
+                artifact_key,
+                std::time::Instant::now(),
+            ) {
+                Some(permit) => Ok(Some(permit)),
+                None => Err(artifact_limited_response()),
             }
         }
-        ArtifactAccessQuery::Invalid => {
-            Err(task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found"))
-        }
-        ArtifactAccessQuery::Absent => local_key_or_keyless(state, headers, task_id),
+        ArtifactAccessQuery::Invalid => Err(invalid_capability_response(state, &ip)),
+        ArtifactAccessQuery::Absent => local_key_or_keyless(state, headers, task_id).map(|_| None),
     }
+}
+
+/// The reference's invalid-attempt policy: a tampered or malformed capability
+/// is a 404 until the address spends its per-minute allowance, then 429 — the
+/// prober pays for probing instead of getting an oracle
+/// (`middleware/task_artifact_access.go:199`).
+fn invalid_capability_response(state: &AppState, ip: &str) -> Response {
+    if state
+        .artifact_limiter
+        .invalid_attempt(ip, std::time::Instant::now())
+    {
+        task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found")
+    } else {
+        artifact_limited_response()
+    }
+}
+
+fn artifact_limited_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "60")],
+        axum::Json(serde_json::json!({
+            "error": {
+                "code": "artifact_access_limited",
+                "message": "Artifact access limit exceeded",
+                "type": "rate_limit_error",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Authorize the artifact listing, which a capability cannot open: it is not

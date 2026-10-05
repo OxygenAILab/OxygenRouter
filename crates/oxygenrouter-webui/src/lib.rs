@@ -3,6 +3,7 @@
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
 pub mod api;
+pub mod artifact_limit;
 pub mod billing_store;
 pub mod embed;
 pub mod model_list;
