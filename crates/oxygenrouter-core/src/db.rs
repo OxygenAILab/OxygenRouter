@@ -4635,6 +4635,7 @@ mod task_store_tests {
             base_micros: 4000,
             quota_micros: 4321,
             other_ratios: vec![1.08025],
+            trusted: false,
             from_subscription: true,
             subscription_id: "sub-1".to_string(),
             settled: false,
@@ -4658,6 +4659,7 @@ mod task_store_tests {
         assert_eq!(billing.base_micros, 4000);
         assert_eq!(billing.quota_micros, 4321);
         assert_eq!(billing.other_ratios, vec![1.08025]);
+        assert!(!billing.trusted);
         assert_eq!(billing.key_id, "key-1");
         assert!(billing.from_subscription);
         assert_eq!(billing.subscription_id, "sub-1");

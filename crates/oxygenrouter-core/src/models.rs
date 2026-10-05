@@ -1090,6 +1090,12 @@ pub struct TaskBilling {
     /// quota is recomputed (`service/task_billing.go:417`).
     #[serde(default)]
     pub other_ratios: Vec<f64>,
+    /// Whether the account was over the trust threshold when the reservation
+    /// was made. A trusted reservation takes nothing up front, so settlement
+    /// must charge the agreed quota rather than treat "nothing reserved" as
+    /// "nothing owed".
+    #[serde(default)]
+    pub trusted: bool,
     /// Whether the funding source is a subscription pool rather than the wallet.
     pub from_subscription: bool,
     /// The subscription that funded it, when one did.

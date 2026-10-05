@@ -267,6 +267,9 @@ impl BillingSession {
     /// account first, the funding account behind it, and a funding refusal gives
     /// the token account its quota back so a failed top-up leaves no trace.
     pub fn reserve_more(&self, store: &dyn QuotaStore, delta: i64) -> Result<i64, BillingError> {
+        // A trusted account skips reservation entirely, so a price increase
+        // takes nothing now and is charged at settlement.
+        let delta = if self.trusted { 0 } else { delta };
         if delta <= 0
             || self.settled.load(Ordering::SeqCst)
             || self.refunded.load(Ordering::SeqCst)
@@ -536,6 +539,20 @@ mod tests {
         assert_eq!(store.balance("token"), 10_000);
         assert_eq!(store.balance("wallet"), 100);
         assert_eq!(s.pre_consumed(), 0);
+    }
+
+    /// A trusted account never reserves; settlement is what charges it, so a
+    /// price that grew after reservation still gets paid at the end.
+    #[test]
+    fn a_trusted_session_reserves_nothing_and_settles_the_agreed_quota() {
+        let store = MemStore::new(&[("token", 10_000), ("wallet", 10_000)]);
+        let s = BillingSession::restored("token".into(), "wallet".into(), false, 0).trusted(true);
+        assert_eq!(s.reserve_more(&store, 700).unwrap(), 0);
+        assert_eq!(store.balance("token"), 10_000);
+        assert_eq!(store.balance("wallet"), 10_000);
+        s.settle(&store, 700).unwrap();
+        assert_eq!(store.balance("token"), 9_300);
+        assert_eq!(store.balance("wallet"), 9_300);
     }
 
     #[test]

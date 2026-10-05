@@ -1927,20 +1927,6 @@ async fn plugin_bridge(
         );
     };
 
-    // The task's quota is reserved *now*, and the facts settlement will need travel
-    // with the task. A task settles long after this request is gone, from a loop
-    // that has no access to the key or the group; the reference persists the same
-    // snapshot for the same reason (`model/task.go`'s `BillingContext`).
-    let task_billing = match reserve_task_quota(
-        &state,
-        invocation.headers,
-        &binding.model,
-        invocation.body,
-    ) {
-        Ok(billing) => billing,
-        Err(response) => return response,
-    };
-
     let flow_context = oxygenrouter_plugin::TaskFlowContext {
         plugin_key: plugin_key.clone(),
         model: binding.model.clone(),
@@ -1963,6 +1949,27 @@ async fn plugin_bridge(
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         created_at: Utc::now().timestamp(),
+    };
+
+    // The plugin's own estimate of what this request costs, before anything is
+    // reserved: `extractUsage` with the billing-ratios purpose
+    // (`relay_task.go:305`). Its numeric facts multiply the base price, and the
+    // base itself is kept so a submit-time adjustment can recompute from it.
+    let estimate_ratios = estimate_usage_ratios(&state, &flow_context, &context_value).await;
+
+    // The task's quota is reserved *now*, and the facts settlement will need travel
+    // with the task. A task settles long after this request is gone, from a loop
+    // that has no access to the key or the group; the reference persists the same
+    // snapshot for the same reason (`model/task.go`'s `BillingContext`).
+    let task_billing = match reserve_task_quota(
+        &state,
+        invocation.headers,
+        &binding.model,
+        invocation.body,
+        &estimate_ratios,
+    ) {
+        Ok(billing) => billing,
+        Err(response) => return response,
     };
 
     // The descriptor is what the plugin wants sent; the guard checks it before a
@@ -2932,6 +2939,7 @@ fn reserve_task_quota(
     headers: &axum::http::HeaderMap,
     model: &str,
     client_body: &[u8],
+    estimate_ratios: &std::collections::BTreeMap<String, f64>,
 ) -> Result<Option<oxygenrouter_core::TaskBilling>, Response> {
     let Some(api_key) = authorize_for_task(state, headers, model) else {
         return Ok(None);
@@ -2945,16 +2953,18 @@ fn reserve_task_quota(
     } else {
         api_key.group_name.clone()
     };
-    // The reservation estimates from *what the caller sent*: the estimator counts
-    // the prompt in the body, so an empty body reserves nothing and a task would
-    // ride free. A task's exact price is what the plugin's usage hooks exist to
-    // report (`adaptor.go:155`); until those are wired the estimate is the honest
-    // ceiling rather than an invented number.
+    // The reservation starts from *what the caller sent* -- the estimator counts
+    // the prompt -- and the plugin's estimate ratios scale it. A submit-time
+    // hook may revise the ratios later; the base kept here is what that revision
+    // recomputes from.
     let body: serde_json::Value = serde_json::from_slice(client_body)
         .unwrap_or_else(|_| serde_json::json!({}));
-    let amount = state
+    let base = state
         .billing
         .reservation(model, &group, &body, "/v1/tasks");
+    let (amount, _clamp) = oxygenrouter_billing::quota_round_checked(
+        base as f64 * oxygenrouter_plugin::ratios_product(estimate_ratios),
+    );
     let funding = match state.db.subscription_funding_source(&user_id, amount) {
         Ok(Some(subscription)) => oxygenrouter_billing::FundingSource::Subscription {
             user_id: user_id.clone(),
@@ -2976,7 +2986,8 @@ fn reserve_task_quota(
         .billing
         .begin(state.billing_store.as_ref(), &key_id, &funding, false, amount)
     {
-        Ok((_session, reserved)) => {
+        Ok((session, reserved)) => {
+            let trusted = session.is_trusted();
             let subscription_id = match &funding {
                 oxygenrouter_billing::FundingSource::Subscription {
                     subscription_id, ..
@@ -2989,11 +3000,12 @@ fn reserve_task_quota(
                 group,
                 model: model.to_string(),
                 reserved_micros: reserved,
-                // Nothing has adjusted the price yet, so the base and the
-                // agreed quota are both the reservation.
-                base_micros: reserved,
-                quota_micros: reserved,
-                other_ratios: Vec::new(),
+                base_micros: base,
+                // The agreed price, independent of what a trusted account left
+                // unreserved: settlement is what charges the difference.
+                quota_micros: amount,
+                other_ratios: estimate_ratios.values().copied().collect(),
+                trusted,
                 from_subscription: !subscription_id.is_empty(),
                 subscription_id,
                 settled: false,
@@ -3119,6 +3131,38 @@ fn task_session(billing: &oxygenrouter_core::TaskBilling) -> oxygenrouter_billin
         false,
         billing.reserved_micros,
     )
+    .trusted(billing.trusted)
+}
+
+/// The ratios `extractUsage` reports for the estimate (`relay_task.go:305`).
+///
+/// The reference runs this hook twice: once with `usagePurpose: "facts"` for
+/// tiered billing and once with `"billing_ratios"` for the estimate. Only the
+/// ratio half has a consumer until task expressions land.
+async fn estimate_usage_ratios(
+    state: &AppState,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    request_context: &serde_json::Value,
+) -> std::collections::BTreeMap<String, f64> {
+    let schema = flow_context.usage.for_models(&[flow_context.model.as_str()]);
+    let mut context = request_context.clone();
+    if let Some(object) = context.as_object_mut() {
+        object.insert(
+            "usagePurpose".to_string(),
+            serde_json::Value::String("billing_ratios".to_string()),
+        );
+    }
+    oxygenrouter_plugin::extract_usage_ratios(
+        &state.plugins,
+        &flow_context.plugin_key,
+        oxygenrouter_plugin::HOOK_EXTRACT_USAGE,
+        &context,
+        &[],
+        schema,
+        flow_context.timeout,
+    )
+    .await
+    .unwrap_or_default()
 }
 
 /// Apply the ratios a plugin's submit-time usage hook reported.
