@@ -2611,6 +2611,36 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
         Ok(())
     }
 
+    /// The instance's crypto secret, minted once and kept for the life of the
+    /// database.
+    ///
+    /// Artifact-access capabilities are HMACs over this value, so it has to be
+    /// stable: a secret that changed per process would invalidate every URL
+    /// already handed to a client. `INSERT OR IGNORE` makes two concurrent
+    /// first-reads agree on whichever value landed first.
+    pub fn artifact_secret(&self) -> SqliteResult<String> {
+        if let Some(existing) = self.get_setting("crypto_secret")? {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+        let candidate = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO settings (key,value) VALUES ('crypto_secret', ?1)",
+            params![candidate],
+        )?;
+        Ok(self
+            .get_setting("crypto_secret")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(candidate))
+    }
+
     // ── SaaS identity, wallet, and commerce ──────────────────────────────────
 
     fn parse_time(value: String) -> SqliteResult<DateTime<Utc>> {
@@ -4672,6 +4702,19 @@ mod task_store_tests {
         // than an error: that is the unreserved case.
         db.mark_task_billing_settled("task_bill").expect("idempotent");
         assert!(db.mark_task_billing_settled("task_none").is_ok());
+    }
+
+    #[test]
+    fn the_artifact_secret_is_minted_once_and_stays_stable() {
+        let db = Database::new(":memory:").expect("db");
+        let first = db.artifact_secret().expect("secret");
+        assert!(!first.trim().is_empty());
+        let second = db.artifact_secret().expect("secret");
+        assert_eq!(first, second);
+        assert_eq!(
+            db.get_setting("crypto_secret").expect("read").as_deref(),
+            Some(first.as_str())
+        );
     }
 
     #[test]

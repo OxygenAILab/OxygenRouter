@@ -17,6 +17,8 @@ argon2      = { version = "0.5", features = ["std"] }
 rand_core   = { version = "0.6", features = ["getrandom"] }
 sha1 = "0.10"
 hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 oxygenrouter-plugin = { path = "../oxygenrouter-plugin" }
 
 [dev-dependencies]

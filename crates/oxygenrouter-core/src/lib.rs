@@ -16,6 +16,7 @@
 //! value per setting rather than two that disagree.
 
 pub mod authz;
+pub mod artifact_access;
 mod config;
 mod db;
 mod models;

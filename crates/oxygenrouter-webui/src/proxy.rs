@@ -236,7 +236,12 @@ async fn task_submit(
 async fn task_artifacts(
     State(state): State<std::sync::Arc<AppState>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
+    if let Err(response) = authorize_artifact_listing(&state, &headers, &uri, &task_id) {
+        return response;
+    }
     let Some(task) = state.db.get_task(&task_id).ok().flatten() else {
         return task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found");
     };
@@ -254,7 +259,10 @@ async fn task_artifacts(
         .await
     {
         Ok(value) => match oxygenrouter_plugin::validate_task_artifacts(&value) {
-            Ok(artifacts) => (StatusCode::OK, axum::Json(artifacts)).into_response(),
+            Ok(artifacts) => match artifact_listing(&state, &headers, &task, &artifacts) {
+                Ok(body) => (StatusCode::OK, axum::Json(body)).into_response(),
+                Err(response) => response,
+            },
             Err(reason) => {
                 eprintln!("[OxygenRouter] task {task_id} artifact listing refused: {reason}");
                 task_artifact_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_plugin_error")
@@ -284,9 +292,13 @@ async fn task_artifact_content(
     axum::extract::Path((task_id, artifact_key)): axum::extract::Path<(String, String)>,
     request: Request,
 ) -> Response {
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    if let Err(response) = authorize_artifact(&state, &headers, &uri, &task_id, &artifact_key) {
+        return response;
+    }
     let method = request.method().as_str().to_string();
-    let client_headers: Vec<(String, String)> = request
-        .headers()
+    let client_headers: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             value
@@ -304,9 +316,13 @@ async fn videos_content(
     axum::extract::Path(task_id): axum::extract::Path<String>,
     request: Request,
 ) -> Response {
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    if let Err(response) = authorize_artifact(&state, &headers, &uri, &task_id, "video") {
+        return response;
+    }
     let method = request.method().as_str().to_string();
-    let client_headers: Vec<(String, String)> = request
-        .headers()
+    let client_headers: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             value
@@ -580,6 +596,193 @@ fn task_artifact_error(status: StatusCode, code: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+/// The reference's artifact listing: every item carries the capability URL that
+/// opens its content (`controller/task.go:100`).
+fn artifact_listing(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    task: &oxygenrouter_core::TaskRecord,
+    artifacts: &[oxygenrouter_plugin::TaskArtifact],
+) -> Result<serde_json::Value, Response> {
+    let secret = state.db.artifact_secret().map_err(|error| {
+        eprintln!(
+            "[OxygenRouter] task {} artifact secret unavailable: {error}",
+            task.task_id
+        );
+        task_artifact_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_internal_error")
+    })?;
+    let base = request_base_url(headers);
+    let mut items = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let Some(access) =
+            oxygenrouter_core::artifact_access::issue(&secret, &task.task_id, &artifact.key)
+        else {
+            return Err(task_artifact_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_url_error",
+            ));
+        };
+        let mut item = serde_json::json!({
+            "key": artifact.key,
+            "type": artifact.kind,
+            "content_url": format!(
+                "{base}/v1/tasks/{}/artifacts/{}/content?access={access}",
+                task.task_id, artifact.key
+            ),
+        });
+        if !artifact.mime_type.is_empty() {
+            item["mime_type"] = serde_json::json!(artifact.mime_type);
+        }
+        items.push(item);
+    }
+    Ok(serde_json::json!({ "task_id": task.task_id, "artifacts": items }))
+}
+
+/// The address the client reached this instance through, so a proxied
+/// deployment hands back its own name rather than a loopback literal.
+fn request_base_url(headers: &axum::http::HeaderMap) -> String {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| *value == "http" || *value == "https")
+        .unwrap_or("http");
+    format!("{scheme}://{host}")
+}
+
+/// What the `access` query parameter looked like. A present-but-broken value is
+/// its own case: it must be refused without being confused with "no capability,
+/// use a key instead".
+enum ArtifactAccessQuery {
+    Absent,
+    Value(String),
+    Invalid,
+}
+
+fn artifact_access_query(uri: &axum::http::Uri) -> ArtifactAccessQuery {
+    let Some(query) = uri.query() else {
+        return ArtifactAccessQuery::Absent;
+    };
+    let mut value: Option<String> = None;
+    let mut count = 0usize;
+    let mut invalid = false;
+    for (key, raw) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key != "access" {
+            continue;
+        }
+        count += 1;
+        if raw.len() > 128 {
+            invalid = true;
+            continue;
+        }
+        if value.is_none() {
+            value = Some(raw.into_owned());
+        }
+    }
+    match (count, value) {
+        (0, _) => ArtifactAccessQuery::Absent,
+        (1, Some(value)) if !value.is_empty() && !invalid => ArtifactAccessQuery::Value(value),
+        _ => ArtifactAccessQuery::Invalid,
+    }
+}
+
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+}
+
+/// Authorize one artifact fetch: a path-bound capability, or a local key when
+/// this instance has a key registry.
+///
+/// The capability is verified before any task read, so a bad value costs a
+/// signature check rather than a database query
+/// (`middleware/task_artifact_access.go:199`). A channel-only deployment has no
+/// key to present and keeps the relay's permissive posture for its own content;
+/// an instance with keys requires one, exactly as the reference's
+/// `TokenOrTaskArtifactAccessAuth` does.
+fn authorize_artifact(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    task_id: &str,
+    artifact_key: &str,
+) -> Result<(), Response> {
+    match artifact_access_query(uri) {
+        ArtifactAccessQuery::Value(access) => {
+            let Ok(secret) = state.db.artifact_secret() else {
+                return Err(task_artifact_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "artifact_internal_error",
+                ));
+            };
+            if oxygenrouter_core::artifact_access::verify(&secret, &access, task_id, artifact_key) {
+                Ok(())
+            } else {
+                Err(task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found"))
+            }
+        }
+        ArtifactAccessQuery::Invalid => {
+            Err(task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found"))
+        }
+        ArtifactAccessQuery::Absent => local_key_or_keyless(state, headers, task_id),
+    }
+}
+
+/// Authorize the artifact listing, which a capability cannot open: it is not
+/// one object, and the listing itself hands out the capabilities.
+fn authorize_artifact_listing(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    task_id: &str,
+) -> Result<(), Response> {
+    match artifact_access_query(uri) {
+        ArtifactAccessQuery::Absent => local_key_or_keyless(state, headers, task_id),
+        ArtifactAccessQuery::Value(_) | ArtifactAccessQuery::Invalid => {
+            Err(task_artifact_error(StatusCode::NOT_FOUND, "artifact_not_found"))
+        }
+    }
+}
+
+/// A local key, or a permissive pass when this deployment has no key registry
+/// at all (channel-only mode).
+fn local_key_or_keyless(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    task_id: &str,
+) -> Result<(), Response> {
+    if !state.db.has_active_api_keys().unwrap_or(false) {
+        return Ok(());
+    }
+    let Some(token) = bearer_token(headers) else {
+        return Err(task_artifact_error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    };
+    let model = state
+        .db
+        .get_task(task_id)
+        .ok()
+        .flatten()
+        .map(|task| task.model)
+        .unwrap_or_default();
+    if state.db.resolve_api_key(token, &model, "").is_ok() {
+        Ok(())
+    } else {
+        Err(task_artifact_error(StatusCode::UNAUTHORIZED, "unauthorized"))
+    }
 }
 
 pub async fn fallback_handler(request: Request) -> Response {
