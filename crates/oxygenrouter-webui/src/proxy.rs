@@ -3661,30 +3661,22 @@ fn resolve_task_expression(state: &AppState, plugin_key: &str, model: &str) -> O
     None
 }
 
-/// Whether an expression only references usage facts this host can price.
+/// Whether an expression only references usage facts the plugin declared.
 ///
-/// The reference accepts any schema-declared key; this host's expression engine
-/// is numeric, so a string or enum fact would evaluate to nil and silently take
-/// the wrong branch. Refusing the expression is the honest failure until the
-/// engine carries typed values.
+/// The engine prices numbers, compares booleans as 1/0 against `true`/`false`,
+/// and compares string facts by equality (`u("mode") == "pro"`). A string fact
+/// used for anything else produces an invalid cost, which refuses the estimate
+/// rather than mispricing it.
 fn task_expression_compatible(
     expression: &str,
     flow_context: &oxygenrouter_plugin::TaskFlowContext,
 ) -> Result<(), String> {
     let schema = flow_context.usage.for_models(&[flow_context.model.as_str()]);
     for key in oxygenrouter_billing::used_usage_keys(expression) {
-        match schema.get(&key) {
-            Some(field) if field.kind == "number" => {}
-            Some(_) => {
-                return Err(format!(
-                    "task expression uses the non-numeric usage fact {key:?}, which this host cannot price yet"
-                ))
-            }
-            None => {
-                return Err(format!(
-                    "task expression uses undeclared usage fact {key:?}"
-                ))
-            }
+        if !schema.contains_key(&key) {
+            return Err(format!(
+                "task expression uses undeclared usage fact {key:?}"
+            ));
         }
     }
     Ok(())

@@ -77,6 +77,12 @@ pub struct EvalContext {
     pub body: serde_json::Value,
     /// Extra named usage counters addressable as `u("name")`.
     pub usage_extras: HashMap<String, f64>,
+    /// String usage facts, addressable as `u("name")` in a string comparison.
+    ///
+    /// The evaluator is numeric by design; a text fact only ever takes part in
+    /// equality (`u("mode") == "pro" ? ... : ...`), which is how task
+    /// expressions price enum-shaped facts.
+    pub usage_texts: HashMap<String, String>,
     /// Image count override for `image_count`.
     pub image_count: Option<i64>,
 }
@@ -253,7 +259,8 @@ pub fn quota_from_cost(
 /// The task conversion is not the token one: a task expression's coefficients
 /// are USD per usage unit, so its output converts straight to quota
 /// (`billingexpr/settle.go:12`). `fixed(...)` leaves are refused, because a
-/// flat fee is not a usage meter.
+/// flat fee is not a usage meter. Numeric facts price, boolean facts compare as
+/// 1/0, and string facts compare by equality.
 pub fn evaluate_task_usage(
     expression: &str,
     facts: &serde_json::Value,
@@ -261,15 +268,30 @@ pub fn evaluate_task_usage(
     group_ratio: f64,
 ) -> Result<(i64, Option<String>), ExprError> {
     let mut usage_extras = HashMap::new();
+    let mut usage_texts = HashMap::new();
     if let Some(object) = facts.as_object() {
         for (key, value) in object {
-            if let Some(number) = value.as_f64().filter(|number| number.is_finite()) {
-                usage_extras.insert(key.clone(), number);
+            match value {
+                serde_json::Value::Number(number) => {
+                    if let Some(number) = number.as_f64().filter(|number| number.is_finite()) {
+                        usage_extras.insert(key.clone(), number);
+                    }
+                }
+                // A boolean fact compares as 1/0, so `u("flag") == true` reads
+                // naturally with the boolean literals.
+                serde_json::Value::Bool(flag) => {
+                    usage_extras.insert(key.clone(), if *flag { 1.0 } else { 0.0 });
+                }
+                serde_json::Value::String(text) => {
+                    usage_texts.insert(key.clone(), text.clone());
+                }
+                _ => {}
             }
         }
     }
     let context = EvalContext {
         usage_extras,
+        usage_texts,
         ..EvalContext::default()
     };
     let outcome = evaluate_with(expression, &TokenParams::default(), &context)?;
@@ -682,6 +704,50 @@ impl<'a> Parser<'a> {
 // Evaluator
 // ---------------------------------------------------------------------------
 
+/// Resolve a node that can carry a string: a literal, a `u("key")` backed by a
+/// text fact, a header value, or a request-body path.
+fn text_source(node: &Node, ctx: &EvalContext) -> Option<String> {
+    match node {
+        Node::Str(text) => Some(text.clone()),
+        Node::Call(name, args) if args.len() == 1 => {
+            let key = match &args[0] {
+                Node::Str(key) => key.as_str(),
+                _ => return None,
+            };
+            match name.as_str() {
+                "u" => ctx.usage_texts.get(key.trim()).cloned(),
+                "header" => ctx
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.trim().eq_ignore_ascii_case(key.trim()))
+                    .map(|(_, value)| value.trim().to_string()),
+                "param" => match json_path(&ctx.body, key) {
+                    Some(serde_json::Value::String(text)) => Some(text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// String equality for the sources above.
+///
+/// `None` means "not a text comparison" and the numeric path runs. When one
+/// side is a string and the other is not a text value at all -- a numeric fact,
+/// a missing key, a number literal -- equality is false rather than an error,
+/// which is how a missing enum fact falls into the expression's default branch.
+fn eval_text_comparison(left: &Node, right: &Node, ctx: &EvalContext) -> Option<f64> {
+    let left_text = text_source(left, ctx);
+    let right_text = text_source(right, ctx);
+    match (left_text, right_text) {
+        (Some(left), Some(right)) => Some(bool_num(left == right)),
+        (Some(_), None) | (None, Some(_)) => Some(0.0),
+        (None, None) => None,
+    }
+}
+
 fn eval_node(node: &Node, params: &TokenParams, ctx: &EvalContext, trace: &mut Trace) -> Result<f64, ExprError> {
     match node {
         Node::Number(n) => Ok(*n),
@@ -699,6 +765,10 @@ fn eval_node(node: &Node, params: &TokenParams, ctx: &EvalContext, trace: &mut T
             "ai" => params.ai,
             "ao" => params.ao,
             "image_count" => 1.0,
+            // Boolean literals, which task expressions use as comparisons
+            // (`u("flag") == true ? ... : ...`) and as conditions.
+            "true" => 1.0,
+            "false" => 0.0,
             other => return Err(ExprError::UnknownIdentifier(other.to_string())),
         }),
         Node::Unary(op, inner) => {
@@ -739,6 +809,15 @@ fn eval_node(node: &Node, params: &TokenParams, ctx: &EvalContext, trace: &mut T
                     }
                     let r = eval_node(right, params, ctx, trace)?;
                     return Ok(if r != 0.0 { 1.0 } else { 0.0 });
+                }
+                BinaryOp::Eq | BinaryOp::Ne => {
+                    if let Some(value) = eval_text_comparison(left, right, ctx) {
+                        return Ok(if matches!(op, BinaryOp::Ne) {
+                            1.0 - value
+                        } else {
+                            value
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -1339,6 +1418,78 @@ mod tests {
             ),
             Err(ExprError::TaskInvalidCost)
         ));
+    }
+
+    /// Enum facts drive branches through string equality, which is how real
+    /// task expressions price a resolution or a mode.
+    #[test]
+    fn a_task_expression_can_compare_string_facts() {
+        let facts = serde_json::json!({"seconds": 2, "mode": "pro", "quality": "hd"});
+        let expression = r#"u("mode") == "pro" && u("quality") == "hd" ? tier("pro", u("seconds") * 0.8) : tier("std", u("seconds") * 0.4)"#;
+        let (quota, tier) =
+            evaluate_task_usage(expression, &facts, 500_000.0, 1.0).expect("evaluated");
+        assert_eq!(quota, 800_000);
+        assert_eq!(tier.as_deref(), Some("pro"));
+
+        // A missing enum fact takes the default branch rather than failing.
+        let (quota, tier) = evaluate_task_usage(
+            expression,
+            &serde_json::json!({"seconds": 2}),
+            500_000.0,
+            1.0,
+        )
+        .expect("evaluated");
+        assert_eq!(quota, 400_000);
+        assert_eq!(tier.as_deref(), Some("std"));
+
+        // Inequality works the same way.
+        let (quota, _) = evaluate_task_usage(
+            r#"u("mode") != "std" ? u("seconds") * 1 : 0"#,
+            &facts,
+            500_000.0,
+            1.0,
+        )
+        .expect("evaluated");
+        assert_eq!(quota, 1_000_000);
+    }
+
+    #[test]
+    fn boolean_facts_and_literals_compare_numerically() {
+        let facts = serde_json::json!({"seconds": 2, "flag": true});
+        let (quota, _) = evaluate_task_usage(
+            r#"u("flag") == true ? u("seconds") * 1 : 0"#,
+            &facts,
+            500_000.0,
+            1.0,
+        )
+        .expect("evaluated");
+        assert_eq!(quota, 1_000_000);
+        let (quota, _) = evaluate_task_usage(
+            r#"false ? 0 : u("seconds") * 1"#,
+            &facts,
+            500_000.0,
+            1.0,
+        )
+        .expect("evaluated");
+        assert_eq!(quota, 1_000_000);
+    }
+
+    #[test]
+    fn header_values_compare_as_strings_too() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Mode".to_string(), "pro".to_string());
+        let ctx = EvalContext {
+            headers,
+            ..EvalContext::default()
+        };
+        let out = evaluate_with(
+            r#"header("x-mode") == "pro" ? tier("pro", 1) : 2"#,
+            &TokenParams::default(),
+            &ctx,
+        )
+        .expect("evaluated");
+        assert_eq!(out.cost_usd, 1.0);
+        assert_eq!(out.matched_tier.as_deref(), Some("pro"));
     }
 
     #[test]
