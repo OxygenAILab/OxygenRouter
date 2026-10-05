@@ -159,6 +159,49 @@ pub async fn extract_usage_ratios(
     schema: &UsageSchema,
     timeout: Duration,
 ) -> Option<BTreeMap<String, f64>> {
+    let facts = call_usage_hook(host, plugin_key, hook, context, args, timeout).await?;
+    match validated_usage_ratios(&facts, schema) {
+        Ok((_, ratios)) => Some(ratios),
+        Err(reason) => {
+            eprintln!("[OxygenRouter] plugin {plugin_key} rejected invalid {hook} facts: {reason}");
+            None
+        }
+    }
+}
+
+/// The validated facts a usage hook reported, for the tiered-billing path that
+/// prices from facts rather than from ratios
+/// (`adaptor.go:170`'s `ExtractUsageFactsValidated`).
+pub async fn extract_usage_facts(
+    host: &PluginHost,
+    plugin_key: &str,
+    hook: &str,
+    context: &Value,
+    args: &[Value],
+    schema: &UsageSchema,
+    timeout: Duration,
+) -> Option<Value> {
+    let facts = call_usage_hook(host, plugin_key, hook, context, args, timeout).await?;
+    match validated_usage_ratios(&facts, schema) {
+        Ok((facts, _)) => Some(facts),
+        Err(reason) => {
+            eprintln!("[OxygenRouter] plugin {plugin_key} rejected invalid {hook} facts: {reason}");
+            None
+        }
+    }
+}
+
+/// Call a usage hook and answer with its raw facts, or `None` when the hook is
+/// absent, failed, or returned nothing. The reference logs and carries on
+/// rather than failing the request (`adaptor.go:1378`).
+async fn call_usage_hook(
+    host: &PluginHost,
+    plugin_key: &str,
+    hook: &str,
+    context: &Value,
+    args: &[Value],
+    timeout: Duration,
+) -> Option<Value> {
     let mut call_args = Vec::with_capacity(args.len() + 1);
     call_args.push(context.clone());
     call_args.extend_from_slice(args);
@@ -176,13 +219,7 @@ pub async fn extract_usage_ratios(
     if facts.is_null() {
         return None;
     }
-    match validated_usage_ratios(&facts, schema) {
-        Ok((_, ratios)) => Some(ratios),
-        Err(reason) => {
-            eprintln!("[OxygenRouter] plugin {plugin_key} rejected invalid {hook} facts: {reason}");
-            None
-        }
-    }
+    Some(facts)
 }
 
 /// The product of a ratio set, skipping the identity and anything that is not a

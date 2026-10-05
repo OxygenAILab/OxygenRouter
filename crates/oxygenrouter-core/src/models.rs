@@ -1096,6 +1096,12 @@ pub struct TaskBilling {
     /// "nothing owed".
     #[serde(default)]
     pub trusted: bool,
+    /// The tiered-billing snapshot, when this task's price came from a usage
+    /// expression rather than the ratio tables
+    /// (`billingexpr.BillingSnapshot`). It freezes the expression and the
+    /// estimate facts so completion settles at the quoted price.
+    #[serde(default)]
+    pub tiered: Option<TaskTieredSnapshot>,
     /// Whether the funding source is a subscription pool rather than the wallet.
     pub from_subscription: bool,
     /// The subscription that funded it, when one did.
@@ -1105,6 +1111,21 @@ pub struct TaskBilling {
     /// rather than a second movement of money.
     #[serde(default)]
     pub settled: bool,
+}
+
+/// The expression and inputs frozen when a task was reserved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskTieredSnapshot {
+    pub expression: String,
+    /// The group ratio the estimate was quoted at.
+    pub group_ratio: f64,
+    /// `QuotaPerUnit` at estimate time.
+    pub quota_per_unit: f64,
+    /// The facts `extractUsage` reported at reservation; completion facts are
+    /// merged over them, completion winning
+    /// (`service/task_billing.go:438`).
+    #[serde(default)]
+    pub estimate_facts: serde_json::Value,
 }
 
 /// What changed on a task since it was read.

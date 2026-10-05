@@ -569,6 +569,9 @@ pub struct PollSettlement {
     /// The billable tokens a usage-reporting answer carried, so the caller can
     /// settle against real usage rather than the reservation.
     pub usage_tokens: i64,
+    /// The validated facts the completion hook reported, for a task priced by
+    /// a usage expression rather than by tokens.
+    pub usage_facts: serde_json::Value,
     pub round: PollRound,
 }
 
@@ -583,6 +586,7 @@ impl PollSettlement {
             plugin_state: None,
             settle: None,
             usage_tokens: 0,
+            usage_facts: serde_json::Value::Null,
             round,
         }
     }
@@ -618,6 +622,7 @@ pub async fn poll_once(
             plugin_state: None,
             settle: Some(crate::SettlePlan::Refund),
             usage_tokens: 0,
+            usage_facts: serde_json::Value::Null,
             round: PollRound::Failed,
         };
     }
@@ -678,6 +683,7 @@ pub async fn poll_once(
             plugin_state: plugin_state_of(parsed.as_ref()),
             settle: None,
             usage_tokens: 0,
+            usage_facts: serde_json::Value::Null,
             round: PollRound::Continued,
         },
         crate::PollDecision::Terminal {
@@ -687,6 +693,7 @@ pub async fn poll_once(
             result,
         } => {
             let usage_tokens = crate::billable_tokens(&result);
+            let usage_facts = result.usage_facts.clone();
             PollSettlement {
                 task_id: task.task_id.clone(),
                 expected_status: task.status.clone(),
@@ -696,6 +703,7 @@ pub async fn poll_once(
                 plugin_state: plugin_state_of(parsed.as_ref()),
                 settle: Some(crate::settle_plan(&status, usage_tokens > 0, per_call_pricing)),
                 usage_tokens,
+                usage_facts,
                 round: PollRound::Settled,
             }
         }
@@ -710,6 +718,7 @@ pub async fn poll_once(
             // that already settled is not refunded again by the caller.
             settle: Some(crate::SettlePlan::Refund),
             usage_tokens: 0,
+            usage_facts: serde_json::Value::Null,
             round: PollRound::Failed,
         },
         crate::PollDecision::Retry { reason } => {

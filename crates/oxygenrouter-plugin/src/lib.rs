@@ -71,8 +71,8 @@ pub use routing::{
 };
 
 pub use usage::{
-    apply_completion_usage, billable_tokens, extract_usage_ratios, ratios_product,
-    validate_completion_facts, validated_usage_ratios,
+    apply_completion_usage, billable_tokens, extract_usage_facts, extract_usage_ratios,
+    ratios_product, validate_completion_facts, validated_usage_ratios,
 };
 
 /// Whether a version string is semver, by the reference's pattern

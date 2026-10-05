@@ -4666,6 +4666,7 @@ mod task_store_tests {
             quota_micros: 4321,
             other_ratios: vec![1.08025],
             trusted: false,
+            tiered: None,
             from_subscription: true,
             subscription_id: "sub-1".to_string(),
             settled: false,

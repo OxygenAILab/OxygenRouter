@@ -27,8 +27,8 @@ pub mod usage;
 pub use chat_quota::{compute_chat_quota, ChatQuotaRequest, ChatQuotaResult};
 pub use estimator::{estimate_prompt_tokens, estimate_tokens, TokenEstimator};
 pub use expr::{
-    build_params, evaluate, evaluate_with, quota_from_cost, used_vars, EvalContext, ExprError,
-    ExprOutcome, TokenParams,
+    build_params, evaluate, evaluate_task_usage, evaluate_with, quota_from_cost, used_usage_keys,
+    used_vars, EvalContext, ExprError, ExprOutcome, TokenParams,
 };
 pub use price::{PriceData, QUOTA_PER_UNIT};
 pub use pricing::{

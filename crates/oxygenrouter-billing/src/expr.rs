@@ -56,6 +56,12 @@ pub enum ExprError {
     UnknownFunction(String),
     #[error("`{0}` expects {1} argument(s)")]
     Arity(&'static str, usize),
+    /// A task usage expression must be priced by usage, not by a flat fee
+    /// (`settle.go:29`).
+    #[error("fixed pricing is not supported for task usage expressions")]
+    TaskFixedPricing,
+    #[error("task usage expression produced an invalid cost")]
+    TaskInvalidCost,
 }
 
 /// Inputs available to an expression beyond the token counts.
@@ -240,6 +246,81 @@ pub fn quota_from_cost(
 ) -> (i64, Option<QuotaClamp>) {
     let before_group = cost_usd / 1_000_000.0 * quota_per_unit;
     quota_round_checked(before_group * group_ratio)
+}
+
+/// Evaluate a task usage expression against the facts a plugin reported.
+///
+/// The task conversion is not the token one: a task expression's coefficients
+/// are USD per usage unit, so its output converts straight to quota
+/// (`billingexpr/settle.go:12`). `fixed(...)` leaves are refused, because a
+/// flat fee is not a usage meter.
+pub fn evaluate_task_usage(
+    expression: &str,
+    facts: &serde_json::Value,
+    quota_per_unit: f64,
+    group_ratio: f64,
+) -> Result<(i64, Option<String>), ExprError> {
+    let mut usage_extras = HashMap::new();
+    if let Some(object) = facts.as_object() {
+        for (key, value) in object {
+            if let Some(number) = value.as_f64().filter(|number| number.is_finite()) {
+                usage_extras.insert(key.clone(), number);
+            }
+        }
+    }
+    let context = EvalContext {
+        usage_extras,
+        ..EvalContext::default()
+    };
+    let outcome = evaluate_with(expression, &TokenParams::default(), &context)?;
+    if outcome.billing_unit_request {
+        return Err(ExprError::TaskFixedPricing);
+    }
+    if !outcome.cost_usd.is_finite() || outcome.cost_usd < 0.0 {
+        return Err(ExprError::TaskInvalidCost);
+    }
+    let (quota, _clamp) = quota_round_checked(outcome.cost_usd * quota_per_unit * group_ratio);
+    Ok((quota, outcome.matched_tier))
+}
+
+/// The usage keys an expression references through `u("...")`.
+///
+/// Lexical, like [`used_vars`], and for the same reason: a key that appears
+/// only in a branch this request does not take still decides whether the
+/// expression is compatible with the plugin's schema.
+pub fn used_usage_keys(expression: &str) -> Vec<String> {
+    let bytes = expression.as_bytes();
+    let mut keys = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let boundary = index == 0
+            || !(bytes[index - 1] as char).is_ascii_alphanumeric() && bytes[index - 1] != b'_';
+        if boundary
+            && bytes[index] == b'u'
+            && index + 1 < bytes.len()
+            && bytes[index + 1] == b'('
+        {
+            let mut cursor = index + 2;
+            while cursor < bytes.len() && (bytes[cursor] as char).is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && (bytes[cursor] == b'"' || bytes[cursor] == b'\'') {
+                let quote = bytes[cursor];
+                cursor += 1;
+                let start = cursor;
+                while cursor < bytes.len() && bytes[cursor] != quote {
+                    cursor += 1;
+                }
+                if cursor < bytes.len() {
+                    keys.push(expression[start..cursor].to_string());
+                    index = cursor + 1;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    keys
 }
 
 /// Evaluate `expression` against `params`.
@@ -1212,5 +1293,61 @@ mod tests {
             evaluate(r#"bogus(1)"#, &params),
             Err(ExprError::UnknownFunction(_))
         ));
+    }
+
+    /// A task expression prices usage facts: coefficients are USD per unit, so
+    /// the output converts straight through `QuotaPerUnit` and the group ratio.
+    #[test]
+    fn a_task_expression_prices_usage_facts() {
+        let facts = serde_json::json!({"seconds": 20});
+        let (quota, tier) =
+            evaluate_task_usage(r#"u("seconds") * 0.05"#, &facts, 500_000.0, 1.0)
+                .expect("evaluated");
+        assert_eq!(quota, 500_000);
+        assert_eq!(tier, None);
+
+        let (tiered, tier) = evaluate_task_usage(
+            r#"tier("long", u("seconds") * 0.1)"#,
+            &facts,
+            500_000.0,
+            1.0,
+        )
+        .expect("evaluated");
+        assert_eq!(tiered, 1_000_000);
+        assert_eq!(tier.as_deref(), Some("long"));
+
+        // The group ratio multiplies the converted amount.
+        let (grouped, _) =
+            evaluate_task_usage(r#"u("seconds") * 0.05"#, &facts, 500_000.0, 2.0)
+                .expect("evaluated");
+        assert_eq!(grouped, 1_000_000);
+    }
+
+    #[test]
+    fn a_task_expression_refuses_flat_fees_and_negative_costs() {
+        let facts = serde_json::json!({"seconds": 20});
+        assert!(matches!(
+            evaluate_task_usage("fixed(3)", &facts, 500_000.0, 1.0),
+            Err(ExprError::TaskFixedPricing)
+        ));
+        assert!(matches!(
+            evaluate_task_usage(
+                r#"u("seconds") * -1"#,
+                &facts,
+                500_000.0,
+                1.0
+            ),
+            Err(ExprError::TaskInvalidCost)
+        ));
+    }
+
+    #[test]
+    fn usage_keys_are_found_structurally() {
+        let keys = used_usage_keys(
+            r#"u("seconds") <= 10 ? u("seconds") * 1 : tier("long", u("custom") * 2)"#,
+        );
+        assert_eq!(keys, vec!["seconds".to_string(), "seconds".to_string(), "custom".to_string()]);
+        // A bare identifier that merely contains `u` is not a call.
+        assert!(used_usage_keys(r#"ifelse(1, 2, 3)"#).is_empty());
     }
 }

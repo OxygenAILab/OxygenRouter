@@ -2228,11 +2228,25 @@ async fn plugin_bridge(
         created_at: Utc::now().timestamp(),
     };
 
-    // The plugin's own estimate of what this request costs, before anything is
-    // reserved: `extractUsage` with the billing-ratios purpose
-    // (`relay_task.go:305`). Its numeric facts multiply the base price, and the
-    // base itself is kept so a submit-time adjustment can recompute from it.
-    let estimate_ratios = estimate_usage_ratios(&state, &flow_context, &context_value).await;
+    // A usage expression prices the task from facts and takes precedence over
+    // the ratio tables (`relay_task.go:259`); otherwise the plugin's estimate
+    // hook supplies ratios that multiply the base price
+    // (`relay_task.go:305`). The base itself is kept so a submit-time
+    // adjustment can recompute from it.
+    let task_expression = resolve_task_expression(&state, &plugin_key, &binding.model);
+    let mut tiered_estimate: Option<(String, serde_json::Value)> = None;
+    if let Some(expression) = &task_expression {
+        if let Err(reason) = task_expression_compatible(expression, &flow_context) {
+            return json_error(StatusCode::BAD_REQUEST, &reason);
+        }
+        let facts = extract_estimate_facts(&state, &flow_context, &context_value).await;
+        tiered_estimate = Some((expression.clone(), facts));
+    }
+    let estimate_ratios = if tiered_estimate.is_some() {
+        std::collections::BTreeMap::new()
+    } else {
+        estimate_usage_ratios(&state, &flow_context, &context_value).await
+    };
 
     // The task's quota is reserved *now*, and the facts settlement will need travel
     // with the task. A task settles long after this request is gone, from a loop
@@ -2244,6 +2258,9 @@ async fn plugin_bridge(
         &binding.model,
         invocation.body,
         &estimate_ratios,
+        tiered_estimate
+            .as_ref()
+            .map(|(expression, facts)| (expression.as_str(), facts.clone())),
     ) {
         Ok(billing) => billing,
         Err(response) => return response,
@@ -3246,7 +3263,13 @@ pub async fn poll_tasks_once(state: &std::sync::Arc<AppState>, now: i64) -> (usi
         }
 
         if let Some(plan) = settlement.settle {
-            settle_polled_task(state, &task, plan, settlement.usage_tokens);
+            settle_polled_task(
+                state,
+                &task,
+                plan,
+                settlement.usage_tokens,
+                &settlement.usage_facts,
+            );
         }
     }
     (polled, advanced)
@@ -3263,6 +3286,7 @@ fn reserve_task_quota(
     model: &str,
     client_body: &[u8],
     estimate_ratios: &std::collections::BTreeMap<String, f64>,
+    tiered: Option<(&str, serde_json::Value)>,
 ) -> Result<Option<oxygenrouter_core::TaskBilling>, Response> {
     let Some(api_key) = authorize_for_task(state, headers, model) else {
         return Ok(None);
@@ -3277,17 +3301,54 @@ fn reserve_task_quota(
         api_key.group_name.clone()
     };
     // The reservation starts from *what the caller sent* -- the estimator counts
-    // the prompt -- and the plugin's estimate ratios scale it. A submit-time
-    // hook may revise the ratios later; the base kept here is what that revision
-    // recomputes from.
+    // the prompt -- and the plugin's estimate ratios scale it. A usage
+    // expression replaces that path entirely: its converted output is the
+    // estimate, and the expression plus the estimate facts are frozen so
+    // completion settles against the same price (`relay_task.go:259`).
     let body: serde_json::Value = serde_json::from_slice(client_body)
         .unwrap_or_else(|_| serde_json::json!({}));
     let base = state
         .billing
         .reservation(model, &group, &body, "/v1/tasks");
-    let (amount, _clamp) = oxygenrouter_billing::quota_round_checked(
-        base as f64 * oxygenrouter_plugin::ratios_product(estimate_ratios),
-    );
+    let (amount, tiered_snapshot) = match tiered {
+        Some((expression, facts)) => {
+            let pricing = state.billing.pricing();
+            let (quota_per_unit, group_ratio) = {
+                let price = pricing.read();
+                (price.quota_per_unit(), price.group_ratio(&group))
+            };
+            match oxygenrouter_billing::evaluate_task_usage(
+                expression,
+                &facts,
+                quota_per_unit,
+                group_ratio,
+            ) {
+                Ok((quota, _tier)) => (
+                    quota,
+                    Some(oxygenrouter_core::TaskTieredSnapshot {
+                        expression: expression.to_string(),
+                        group_ratio,
+                        quota_per_unit,
+                        estimate_facts: facts,
+                    }),
+                ),
+                Err(error) => {
+                    return Err(json_policy_error(
+                        StatusCode::BAD_REQUEST,
+                        "model_price_error",
+                        &error.to_string(),
+                    ))
+                }
+            }
+        }
+        None => (
+            oxygenrouter_billing::quota_round_checked(
+                base as f64 * oxygenrouter_plugin::ratios_product(estimate_ratios),
+            )
+            .0,
+            None,
+        ),
+    };
     let funding = match state.db.subscription_funding_source(&user_id, amount) {
         Ok(Some(subscription)) => oxygenrouter_billing::FundingSource::Subscription {
             user_id: user_id.clone(),
@@ -3329,6 +3390,7 @@ fn reserve_task_quota(
                 quota_micros: amount,
                 other_ratios: estimate_ratios.values().copied().collect(),
                 trusted,
+                tiered: tiered_snapshot,
                 from_subscription: !subscription_id.is_empty(),
                 subscription_id,
                 settled: false,
@@ -3389,6 +3451,49 @@ fn settle_immediate_task(
         return response;
     }
     let usage_tokens = oxygenrouter_plugin::billable_tokens(result);
+    // A tiered answer settles against its frozen expression, exactly like the
+    // polled path; only success and failure are terminal here.
+    if let Some(snapshot) = billing.tiered.as_ref() {
+        match result.status.as_str() {
+            oxygenrouter_plugin::STATUS_FAILURE => {
+                refund_task_quota(state, billing);
+                record_task_settlement(state, billing, channel_id, client_path, 0, 0, true);
+            }
+            oxygenrouter_plugin::STATUS_SUCCESS => {
+                match settle_tiered_task(snapshot, &result.usage_facts) {
+                    Some(actual) => {
+                        settle_task_usage(state, billing, "", actual);
+                        record_task_settlement(
+                            state,
+                            billing,
+                            channel_id,
+                            client_path,
+                            actual,
+                            usage_tokens,
+                            false,
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "[OxygenRouter] a synchronous tiered task failed to settle; the reservation of {} micros stands",
+                            billing.reserved_micros
+                        );
+                        record_task_settlement(
+                            state,
+                            billing,
+                            channel_id,
+                            client_path,
+                            billing.reserved_micros,
+                            0,
+                            false,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        return response;
+    }
     match oxygenrouter_plugin::settle_plan(
         &result.status,
         usage_tokens > 0,
@@ -3493,8 +3598,8 @@ fn task_session(billing: &oxygenrouter_core::TaskBilling) -> oxygenrouter_billin
 /// The ratios `extractUsage` reports for the estimate (`relay_task.go:305`).
 ///
 /// The reference runs this hook twice: once with `usagePurpose: "facts"` for
-/// tiered billing and once with `"billing_ratios"` for the estimate. Only the
-/// ratio half has a consumer until task expressions land.
+/// tiered billing and once with `"billing_ratios"` for the estimate. This is
+/// the ratio half; [`extract_estimate_facts`] is the facts half.
 async fn estimate_usage_ratios(
     state: &AppState,
     flow_context: &oxygenrouter_plugin::TaskFlowContext,
@@ -3519,6 +3624,128 @@ async fn estimate_usage_ratios(
     )
     .await
     .unwrap_or_default()
+}
+
+/// The task billing expression that applies to this plugin and model.
+///
+/// The resolution order is the reference's (`ResolveTaskBillingExpr`): a
+/// per-plugin expression first, then the model's own `tiered_expr` expression.
+/// Our per-plugin map lives in a `plugin_billing_expr` setting shaped
+/// `{plugin: {model: expression}}`.
+fn resolve_task_expression(state: &AppState, plugin_key: &str, model: &str) -> Option<String> {
+    if let Ok(Some(raw)) = state.db.get_setting("plugin_billing_expr") {
+        if let Ok(map) = serde_json::from_str::<
+            std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+        >(&raw)
+        {
+            if let Some(expression) = map
+                .get(plugin_key)
+                .and_then(|models| models.get(model))
+                .map(String::as_str)
+                .filter(|expression| !expression.trim().is_empty())
+            {
+                return Some(expression.to_string());
+            }
+        }
+    }
+    let pricing = state.billing.pricing();
+    let price = pricing.read();
+    if price.mode(model) == oxygenrouter_billing::BillingMode::TieredExpr {
+        if let Some(expression) = price
+            .expression(model)
+            .filter(|expression| !expression.trim().is_empty())
+        {
+            return Some(expression.to_string());
+        }
+    }
+    None
+}
+
+/// Whether an expression only references usage facts this host can price.
+///
+/// The reference accepts any schema-declared key; this host's expression engine
+/// is numeric, so a string or enum fact would evaluate to nil and silently take
+/// the wrong branch. Refusing the expression is the honest failure until the
+/// engine carries typed values.
+fn task_expression_compatible(
+    expression: &str,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+) -> Result<(), String> {
+    let schema = flow_context.usage.for_models(&[flow_context.model.as_str()]);
+    for key in oxygenrouter_billing::used_usage_keys(expression) {
+        match schema.get(&key) {
+            Some(field) if field.kind == "number" => {}
+            Some(_) => {
+                return Err(format!(
+                    "task expression uses the non-numeric usage fact {key:?}, which this host cannot price yet"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "task expression uses undeclared usage fact {key:?}"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The facts `extractUsage` reports for tiered billing
+/// (`usagePurpose: "facts"`, `adaptor.go:170`).
+async fn extract_estimate_facts(
+    state: &AppState,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    request_context: &serde_json::Value,
+) -> serde_json::Value {
+    let schema = flow_context.usage.for_models(&[flow_context.model.as_str()]);
+    let mut context = request_context.clone();
+    if let Some(object) = context.as_object_mut() {
+        object.insert(
+            "usagePurpose".to_string(),
+            serde_json::Value::String("facts".to_string()),
+        );
+    }
+    oxygenrouter_plugin::extract_usage_facts(
+        &state.plugins,
+        &flow_context.plugin_key,
+        oxygenrouter_plugin::HOOK_EXTRACT_USAGE,
+        &context,
+        &[],
+        schema,
+        flow_context.timeout,
+    )
+    .await
+    .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Evaluate a tiered task at settlement: the estimate facts with the completion
+/// facts merged over them (`service/task_billing.go:438`).
+fn settle_tiered_task(
+    snapshot: &oxygenrouter_core::TaskTieredSnapshot,
+    completion_facts: &serde_json::Value,
+) -> Option<i64> {
+    let mut merged = snapshot
+        .estimate_facts
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(object) = completion_facts.as_object() {
+        for (key, value) in object {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    match oxygenrouter_billing::evaluate_task_usage(
+        &snapshot.expression,
+        &serde_json::Value::Object(merged),
+        snapshot.quota_per_unit,
+        snapshot.group_ratio,
+    ) {
+        Ok((quota, _tier)) => Some(quota),
+        Err(error) => {
+            eprintln!("[OxygenRouter] tiered task settlement refused: {error}");
+            None
+        }
+    }
 }
 
 /// The context a synchronous answer's completion hook reads.
@@ -3605,6 +3832,11 @@ async fn adjust_submit_billing(
     request_context: &serde_json::Value,
     task_data: &serde_json::Value,
 ) -> Result<(), Response> {
+    // A usage expression has no submit-time revision: the reference skips
+    // `AdjustBillingOnSubmit` for the tiered path (`relay_task.go:389`).
+    if billing.tiered.is_some() {
+        return Ok(());
+    }
     let schema = flow_context.usage.for_models(&[flow_context.model.as_str()]);
     let Some(ratios) = oxygenrouter_plugin::extract_usage_ratios(
         &state.plugins,
@@ -3686,11 +3918,54 @@ fn settle_polled_task(
     task: &oxygenrouter_core::TaskRecord,
     plan: oxygenrouter_plugin::SettlePlan,
     usage_tokens: i64,
+    usage_facts: &serde_json::Value,
 ) {
     let Some(billing) = task.private.billing.as_ref() else {
         return;
     };
     if billing.settled {
+        return;
+    }
+    // A tiered task settles against its frozen expression: the completion facts
+    // merge over the estimate facts and the quota is re-evaluated. Only a
+    // failure is an ordinary refund.
+    if let Some(snapshot) = billing.tiered.as_ref() {
+        let path = format!("/v1/tasks/{}", task.task_id);
+        if plan == oxygenrouter_plugin::SettlePlan::Refund {
+            refund_task_quota(state, billing);
+            record_task_settlement(state, billing, &task.channel_id, &path, 0, 0, true);
+        } else {
+            match settle_tiered_task(snapshot, usage_facts) {
+                Some(actual) => {
+                    settle_task_usage(state, billing, &task.task_id, actual);
+                    record_task_settlement(
+                        state,
+                        billing,
+                        &task.channel_id,
+                        &path,
+                        actual,
+                        usage_tokens,
+                        false,
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[OxygenRouter] task {} tiered settlement failed; the reservation of {} micros stands",
+                        task.task_id, billing.reserved_micros
+                    );
+                    record_task_settlement(
+                        state,
+                        billing,
+                        &task.channel_id,
+                        &path,
+                        billing.reserved_micros,
+                        0,
+                        false,
+                    );
+                }
+            }
+        }
+        mark_settled(state, task);
         return;
     }
     match plan {
