@@ -2065,7 +2065,17 @@ async fn plugin_bridge(
     }
 
     match answer {
-        oxygenrouter_plugin::SubmitAnswer::Immediate { result, body, .. } => {
+        oxygenrouter_plugin::SubmitAnswer::Immediate {
+            mut result,
+            body,
+            task_data,
+        } => {
+            // A synchronous success still reports its usage at completion, and
+            // that report is what settlement bills (`adaptor.go:554`).
+            if result.status == oxygenrouter_plugin::STATUS_SUCCESS {
+                apply_immediate_completion_usage(&state, &flow_context, &mut result, &task_data)
+                    .await;
+            }
             let response = render_immediate(
                 &state,
                 &binding,
@@ -3062,10 +3072,10 @@ fn settle_immediate_task(
         refund_task_quota(state, billing);
         return response;
     }
-    let has_usage = result.total_tokens > 0.0 || result.completion_tokens > 0.0;
+    let usage_tokens = oxygenrouter_plugin::billable_tokens(result);
     match oxygenrouter_plugin::settle_plan(
         &result.status,
-        has_usage,
+        usage_tokens > 0,
         task_price_is_per_call(state, billing),
     ) {
         oxygenrouter_plugin::SettlePlan::Refund => refund_task_quota(state, billing),
@@ -3082,14 +3092,18 @@ fn settle_immediate_task(
                 settle_task_usage(state, billing, "", agreed);
             }
         }
-        // The usage-fact settlement is a separate piece of work. Saying so is the
-        // difference between a known gap and a silent one; the reservation stands
-        // meanwhile, so a caller is never under-charged by omission.
-        oxygenrouter_plugin::SettlePlan::SettleWithUsage => eprintln!(
-            "[OxygenRouter] a synchronous task reported usage, but task usage settlement is \
-             not wired; the reservation of {} micros stands",
-            billing.reserved_micros
-        ),
+        // The completion hook reported how much the answer actually used, so
+        // settle at what those tokens buy (`service/task_billing.go:381`).
+        oxygenrouter_plugin::SettlePlan::SettleWithUsage => {
+            match task_usage_quota(state, billing, usage_tokens) {
+                Some(actual) => settle_task_usage(state, billing, "", actual),
+                None => eprintln!(
+                    "[OxygenRouter] a synchronous task reported {usage_tokens} tokens with no \
+                     token price; the reservation of {} micros stands",
+                    billing.reserved_micros
+                ),
+            }
+        }
     }
     response
 }
@@ -3163,6 +3177,76 @@ async fn estimate_usage_ratios(
     )
     .await
     .unwrap_or_default()
+}
+
+/// The context a synchronous answer's completion hook reads.
+///
+/// The reference builds a temporary task and serializes its query context
+/// (`adaptor.go:558`). No task is persisted yet here, so the upstream id
+/// stands in for the public one; the fields a hook actually prices with --
+/// model, upstream model, data, base URL -- are all present.
+fn immediate_query_context(
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    result: &oxygenrouter_plugin::TaskResult,
+    task_data: &serde_json::Value,
+) -> serde_json::Value {
+    let context = oxygenrouter_plugin::QueryContext {
+        task_id: result.task_id.clone(),
+        public_task_id: result.task_id.clone(),
+        action: String::new(),
+        model: flow_context.model.clone(),
+        upstream_model: flow_context.model.clone(),
+        base_url: flow_context.base_url.clone(),
+        data: task_data.clone(),
+        state: serde_json::Value::Null,
+        upstream: None,
+    };
+    serde_json::to_value(context).unwrap_or(serde_json::Value::Null)
+}
+
+/// Apply the completion usage hook to a synchronous answer
+/// (`adaptor.go:554`), and answer with the token count settlement reads.
+async fn apply_immediate_completion_usage(
+    state: &AppState,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    result: &mut oxygenrouter_plugin::TaskResult,
+    task_data: &serde_json::Value,
+) -> i64 {
+    let schema = flow_context.usage.for_models(&[flow_context.model.as_str()]);
+    let query_context = immediate_query_context(flow_context, result, task_data);
+    let result_value = serde_json::to_value(&*result).unwrap_or(serde_json::Value::Null);
+    match state
+        .plugins
+        .call_hook_args(
+            &flow_context.plugin_key,
+            oxygenrouter_plugin::HOOK_EXTRACT_USAGE_ON_COMPLETE,
+            &[query_context, result_value, task_data.clone()],
+            flow_context.timeout,
+        )
+        .await
+    {
+        Ok(facts) => match oxygenrouter_plugin::validate_completion_facts(&facts, schema) {
+            Ok(validated) => {
+                oxygenrouter_plugin::apply_completion_usage(result, &validated);
+                oxygenrouter_plugin::billable_tokens(result)
+            }
+            Err(reason) => {
+                eprintln!(
+                    "[OxygenRouter] plugin {} rejected invalid extractUsageOnComplete facts: {reason}",
+                    flow_context.plugin_key
+                );
+                0
+            }
+        },
+        Err(oxygenrouter_plugin::PluginError::NoSuchHook { .. }) => 0,
+        Err(error) => {
+            eprintln!(
+                "[OxygenRouter] plugin {} extractUsageOnComplete failed: {error}",
+                flow_context.plugin_key
+            );
+            0
+        }
+    }
 }
 
 /// Apply the ratios a plugin's submit-time usage hook reported.
