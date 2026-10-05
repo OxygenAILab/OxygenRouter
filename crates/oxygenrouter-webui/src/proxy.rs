@@ -1046,6 +1046,80 @@ fn log_request_with_usage(
     let _ = state.log_broadcast.send(log);
 }
 
+/// Record a successful task submission in the request log.
+///
+/// The reference logs a task when it is submitted (`LogTaskConsumption`); a
+/// synchronous answer's usage is already known and rides along, while a
+/// pending task's tokens are written when it settles.
+fn log_task_submission(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    client_path: &str,
+    model: &str,
+    channel_id: &str,
+    key_id: Option<&str>,
+    duration_ms: i64,
+    tokens_used: Option<i64>,
+) {
+    log_request_with_usage(
+        state,
+        headers,
+        "POST",
+        client_path,
+        Some(model.to_string()),
+        (!channel_id.is_empty()).then(|| channel_id.to_string()),
+        key_id.filter(|key| !key.is_empty()).map(String::from),
+        Some(StatusCode::OK.as_u16()),
+        None,
+        duration_ms,
+        tokens_used,
+    );
+}
+
+/// Fold a settled task into the usage aggregates and the request log.
+///
+/// A task's cost is only known once it settles, which is where the relay path
+/// records its own charge; `quota_data` is the dashboard's grain, and the log
+/// row is what the console shows. The row's path names the task for a polled
+/// settlement and the original request for a synchronous one.
+fn record_task_settlement(
+    state: &AppState,
+    billing: &oxygenrouter_core::TaskBilling,
+    channel_id: &str,
+    path: &str,
+    quota_micros: i64,
+    tokens_used: i64,
+    refunded: bool,
+) {
+    if state.data_export_enabled() {
+        state.usage.record(
+            &billing.user_id,
+            channel_id,
+            &billing.key_id,
+            &billing.group,
+            &billing.model,
+            quota_micros,
+            tokens_used,
+        );
+    }
+    // The settlement happens outside any client request, so there is no caller
+    // address to offer and `RecordIpLog` has nothing to capture.
+    let headers = axum::http::HeaderMap::new();
+    log_request_with_usage(
+        state,
+        &headers,
+        "POST",
+        path,
+        Some(billing.model.clone()),
+        (!channel_id.is_empty()).then(|| channel_id.to_string()),
+        (!billing.key_id.is_empty()).then(|| billing.key_id.clone()),
+        Some(StatusCode::OK.as_u16()),
+        refunded.then(|| "task failed; the reservation was refunded".to_string()),
+        0,
+        (tokens_used > 0).then_some(tokens_used),
+    );
+}
+
 #[axum::debug_handler(state = std::sync::Arc<AppState>)]
 async fn chat_completions(
     State(state): State<std::sync::Arc<AppState>>,
@@ -2288,19 +2362,55 @@ async fn plugin_bridge(
                 body,
             )
             .await;
+            let key_id = task_billing.as_ref().map(|billing| billing.key_id.clone());
             // A synchronous answer is already terminal, so its reservation settles
             // here rather than waiting for a poll that will never come.
-            settle_immediate_task(&state, task_billing.as_ref(), &result, response)
+            let response = settle_immediate_task(
+                &state,
+                task_billing.as_ref(),
+                &channel.id,
+                client_path,
+                &result,
+                response,
+            );
+            if response.status().is_success() {
+                let tokens = oxygenrouter_plugin::billable_tokens(&result);
+                log_task_submission(
+                    &state,
+                    invocation.headers,
+                    client_path,
+                    &binding.model,
+                    &channel.id,
+                    key_id.as_deref(),
+                    requested_at.elapsed().as_millis() as i64,
+                    (tokens > 0).then_some(tokens),
+                );
+            }
+            response
         }
         oxygenrouter_plugin::SubmitAnswer::Pending(submission) => {
-            persist_task(
+            let key_id = task_billing.as_ref().map(|billing| billing.key_id.clone());
+            let response = persist_task(
                 &state,
                 &binding,
                 &channel,
                 &flow_context,
                 &submission,
                 task_billing,
-            )
+            );
+            if response.status().is_success() {
+                log_task_submission(
+                    &state,
+                    invocation.headers,
+                    client_path,
+                    &binding.model,
+                    &channel.id,
+                    key_id.as_deref(),
+                    requested_at.elapsed().as_millis() as i64,
+                    None,
+                );
+            }
+            response
         }
     }
 }
@@ -3263,6 +3373,8 @@ fn authorize_for_task(state: &AppState, headers: &axum::http::HeaderMap, model: 
 fn settle_immediate_task(
     state: &AppState,
     billing: Option<&oxygenrouter_core::TaskBilling>,
+    channel_id: &str,
+    client_path: &str,
     result: &oxygenrouter_plugin::TaskResult,
     response: Response,
 ) -> Response {
@@ -3273,6 +3385,7 @@ fn settle_immediate_task(
     // returned here, and doing it twice would pay the caller twice.
     if !response.status().is_success() {
         refund_task_quota(state, billing);
+        record_task_settlement(state, billing, channel_id, client_path, 0, 0, true);
         return response;
     }
     let usage_tokens = oxygenrouter_plugin::billable_tokens(result);
@@ -3281,7 +3394,10 @@ fn settle_immediate_task(
         usage_tokens > 0,
         task_price_is_per_call(state, billing),
     ) {
-        oxygenrouter_plugin::SettlePlan::Refund => refund_task_quota(state, billing),
+        oxygenrouter_plugin::SettlePlan::Refund => {
+            refund_task_quota(state, billing);
+            record_task_settlement(state, billing, channel_id, client_path, 0, 0, true);
+        }
         // A per-call price keeps its reservation, but a submit-time adjustment
         // may have agreed on a different final price: move only that
         // difference, never the whole charge again.
@@ -3294,17 +3410,40 @@ fn settle_immediate_task(
             if agreed != billing.reserved_micros {
                 settle_task_usage(state, billing, "", agreed);
             }
+            record_task_settlement(state, billing, channel_id, client_path, agreed, 0, false);
         }
         // The completion hook reported how much the answer actually used, so
         // settle at what those tokens buy (`service/task_billing.go:381`).
         oxygenrouter_plugin::SettlePlan::SettleWithUsage => {
             match task_usage_quota(state, billing, usage_tokens) {
-                Some(actual) => settle_task_usage(state, billing, "", actual),
-                None => eprintln!(
-                    "[OxygenRouter] a synchronous task reported {usage_tokens} tokens with no \
-                     token price; the reservation of {} micros stands",
-                    billing.reserved_micros
-                ),
+                Some(actual) => {
+                    settle_task_usage(state, billing, "", actual);
+                    record_task_settlement(
+                        state,
+                        billing,
+                        channel_id,
+                        client_path,
+                        actual,
+                        usage_tokens,
+                        false,
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[OxygenRouter] a synchronous task reported {usage_tokens} tokens with no \
+                         token price; the reservation of {} micros stands",
+                        billing.reserved_micros
+                    );
+                    record_task_settlement(
+                        state,
+                        billing,
+                        channel_id,
+                        client_path,
+                        billing.reserved_micros,
+                        0,
+                        false,
+                    );
+                }
             }
         }
     }
@@ -3558,6 +3697,8 @@ fn settle_polled_task(
         // A task that failed costs nothing.
         oxygenrouter_plugin::SettlePlan::Refund => {
             refund_task_quota(state, billing);
+            let path = format!("/v1/tasks/{}", task.task_id);
+            record_task_settlement(state, billing, &task.channel_id, &path, 0, 0, true);
             mark_settled(state, task);
         }
         // The price was the contract: a per-call task keeps what it reserved,
@@ -3571,6 +3712,8 @@ fn settle_polled_task(
             if agreed != billing.reserved_micros {
                 settle_task_usage(state, billing, &task.task_id, agreed);
             }
+            let path = format!("/v1/tasks/{}", task.task_id);
+            record_task_settlement(state, billing, &task.channel_id, &path, agreed, 0, false);
             mark_settled(state, task);
         }
         // A success that reported usage settles at what the tokens actually
@@ -3579,13 +3722,35 @@ fn settle_polled_task(
             match task_usage_quota(state, billing, usage_tokens) {
                 Some(actual) => {
                     settle_task_usage(state, billing, &task.task_id, actual);
+                    let path = format!("/v1/tasks/{}", task.task_id);
+                    record_task_settlement(
+                        state,
+                        billing,
+                        &task.channel_id,
+                        &path,
+                        actual,
+                        usage_tokens,
+                        false,
+                    );
                     mark_settled(state, task);
                 }
-                None => eprintln!(
-                    "[OxygenRouter] task {} reported {usage_tokens} tokens with no token price; \
-                     the reservation of {} micros stands",
-                    task.task_id, billing.reserved_micros
-                ),
+                None => {
+                    eprintln!(
+                        "[OxygenRouter] task {} reported {usage_tokens} tokens with no token price; \
+                         the reservation of {} micros stands",
+                        task.task_id, billing.reserved_micros
+                    );
+                    let path = format!("/v1/tasks/{}", task.task_id);
+                    record_task_settlement(
+                        state,
+                        billing,
+                        &task.channel_id,
+                        &path,
+                        billing.reserved_micros,
+                        0,
+                        false,
+                    );
+                }
             }
         }
     }
