@@ -2086,15 +2086,25 @@ struct PluginInvocation<'a> {
 
 /// The channel a task flow talks to, and the credential that rides with it.
 ///
+/// `exclude` holds the channels already tried *in this submission*: a retry
+/// moves down the priority/weight order instead of picking a channel the
+/// attempt already burned, and a channel that has crossed the scheduler's
+/// auto-disable threshold is skipped exactly as the relay path skips it.
+///
 /// A task is bound to one channel for its whole life, not re-picked per poll: the
 /// upstream knows the task by an id it issued to *that* channel, so asking a
 /// different one about it would be asking a stranger.
-fn select_task_channel(state: &AppState, model: &str) -> Option<oxygenrouter_core::Channel> {
-    state
-        .db
-        .get_enabled_channels()
-        .ok()?
+async fn select_task_channel(
+    state: &AppState,
+    model: &str,
+    exclude: &[String],
+) -> Option<oxygenrouter_core::Channel> {
+    let channels = state.db.get_enabled_channels().ok()?;
+    let scheduler = state.scheduler.read().await;
+    channels
         .into_iter()
+        .filter(|channel| !exclude.iter().any(|id| id == &channel.id))
+        .filter(|channel| !scheduler.is_temporarily_disabled(&channel.id))
         .filter(|channel| {
             channel.model_list.is_empty()
                 || channel
@@ -2251,11 +2261,11 @@ async fn plugin_bridge(
     // The channel owns the upstream and the credential, so a task without one has
     // nowhere to go. This is the same refusal the relay path makes, worded for a
     // task so an operator knows it is a channel gap and not a plugin bug.
-    let Some(channel) = select_task_channel(&state, &binding.model) else {
+    let Some(channel) = select_task_channel(&state, &binding.model, &[]).await else {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!(
-                "no enabled channel serves {:?}, so plugin {plugin_key:?} has no upstream to submit to",
+                "no available channel serves {:?}, so plugin {plugin_key:?} has no upstream to submit to",
                 binding.model
             ),
         );
@@ -2327,64 +2337,104 @@ async fn plugin_bridge(
     // was not written (`controller/relay.go:486`).
     let mut reservation = TaskReservation::new(&state, task_billing);
 
-    // The descriptor is what the plugin wants sent; the guard checks it before a
-    // socket exists, so a plugin cannot point the channel credential anywhere the
-    // operator did not allow.
-    let descriptor = match build_submit_descriptor(
-        &state,
-        &plugin_key,
-        &flow_context,
-        &binding.model,
-        &decoded,
-    )
-    .await
-    {
-        Ok(descriptor) => descriptor,
-        Err(error) => return flow_error_response(&error),
-    };
-
+    // One transport serves every attempt: the client is host-owned, and the
+    // channel rides in the descriptor the plugin builds rather than in the
+    // client. A transport that cannot be constructed is the host's own failure
+    // to make the call the reference words `do_request_failed`
+    // (`relay_task.go:349`).
     let transport = match task_transport(&state) {
         Ok(transport) => transport,
-        // A transport that cannot be constructed is the host's own failure to
-        // make the call the reference words `do_request_failed`
-        // (`relay_task.go:349`).
         Err(reason) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &reason),
     };
-    let request = match oxygenrouter_plugin::build_outbound_request(&descriptor, &flow_context) {
-        Ok(request) => request,
-        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.message),
-    };
-    let requested_at = Instant::now();
-    let mut outcome = match oxygenrouter_plugin::send_submit(&transport, request).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            log_request(
-                state.as_ref(),
-                invocation.headers,
-                "POST",
-                client_path,
-                Some(binding.model.clone()),
-                Some(channel.id.clone()),
-                None,
-                Some(StatusCode::BAD_GATEWAY.as_u16()),
-                Some(error.message.clone()),
-                requested_at.elapsed().as_millis() as i64,
-            );
-            return flow_error_response(&error);
-        }
-    };
 
-    let answer = match oxygenrouter_plugin::interpret_submit(
-        &state.plugins,
-        &descriptor,
-        &flow_context,
-        context_value.clone(),
-        &mut outcome,
-    )
-    .await
-    {
-        Ok(answer) => answer,
-        Err(error) => return flow_error_response(&error),
+    // The reference tries a failed submission on another channel, up to
+    // `RetryTimes` more times (`controller/relay.go:479`), and only when the
+    // failure is the channel's to answer for: a failure after an accepted
+    // stream is never retried (`adaptor.go:456`), and neither is the host's own
+    // refusal of the plugin's answer. The reservation above is untouched by
+    // retries, exactly as the reference skips its pre-consume on every attempt
+    // after the first (`relay_task.go:334`).
+    let retry = task_retry_policy(&state);
+    let requested_at = Instant::now();
+    let mut channel = channel;
+    let mut tried: Vec<String> = Vec::new();
+    let mut attempt: u32 = 0;
+    let (channel, flow_context, answer) = loop {
+        tried.push(channel.id.clone());
+        // Everything channel-dependent is rebuilt per attempt: the base URL the
+        // plugin addresses and the credential that rides with it.
+        let attempt_context = oxygenrouter_plugin::TaskFlowContext {
+            base_url: channel.base_url.clone(),
+            authorization: task_authorization(&channel),
+            ..flow_context.clone()
+        };
+        let result = submit_attempt(
+            &state,
+            &transport,
+            &binding,
+            &channel,
+            &attempt_context,
+            &decoded,
+            &context_value,
+            invocation.headers,
+            client_path,
+            requested_at,
+        )
+        .await;
+        match result {
+            Ok(answer) => {
+                // The streak is shared with the relay path, so a task that
+                // reached its upstream also proves the channel is alive.
+                state
+                    .scheduler
+                    .read()
+                    .await
+                    .note_attempt_success(&channel.id);
+                break (channel, attempt_context, answer);
+            }
+            Err(error) => {
+                // The reference's `processChannelError`: a failure that is not
+                // the host's own refusal feeds the channel's failure streak.
+                if !error.local {
+                    let crossed = state
+                        .scheduler
+                        .read()
+                        .await
+                        .note_attempt_failure(&channel.id);
+                    if crossed {
+                        eprintln!(
+                            "[OxygenRouter] channel {} hit the auto-disable threshold on a task submission; excluding it from selection",
+                            channel.id
+                        );
+                    }
+                }
+                if !error.retryable || attempt >= retry.attempts {
+                    return flow_error_response(&error);
+                }
+                let Some(next) = select_task_channel(&state, &binding.model, &tried).await else {
+                    // Every channel this request may use has been tried; the
+                    // reference answers that as `get_channel_failed` (500), not
+                    // as the last upstream error.
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!(
+                            "no untried channel serves {:?}; the last failure was: {}",
+                            binding.model, error.message
+                        ),
+                    );
+                };
+                if retry.base_ms > 0 {
+                    let delay = oxygenrouter_proxy::retry::backoff_ms(
+                        attempt,
+                        retry.base_ms,
+                        retry.cap_ms,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                attempt += 1;
+                channel = next;
+            }
+        }
     };
 
     // The plugin sees the upstream's answer before it states the final price;
@@ -2596,6 +2646,89 @@ async fn resolve_request_files(
         });
     }
     Ok(files)
+}
+
+/// One submission attempt against one channel.
+///
+/// Everything channel-dependent happens here so a failed attempt can be
+/// repeated on another channel without repeating the once-only work: the
+/// reservation, the estimate, and the plugin/decoding checks. `Err` means the
+/// attempt failed; the caller owns the retry decision.
+#[allow(clippy::too_many_arguments)]
+async fn submit_attempt(
+    state: &AppState,
+    transport: &crate::task_transport::ReqwestTaskTransport,
+    binding: &oxygenrouter_plugin::ProtocolBinding,
+    channel: &oxygenrouter_core::Channel,
+    flow_context: &oxygenrouter_plugin::TaskFlowContext,
+    decoded: &serde_json::Value,
+    request_context: &serde_json::Value,
+    headers: &axum::http::HeaderMap,
+    client_path: &str,
+    requested_at: Instant,
+) -> Result<oxygenrouter_plugin::SubmitAnswer, oxygenrouter_plugin::FlowError> {
+    // The descriptor is what the plugin wants sent; the guard checks it before
+    // a socket exists, so a plugin cannot point the channel credential anywhere
+    // the operator did not allow.
+    let descriptor = build_submit_descriptor(
+        state,
+        &binding.plugin_key,
+        flow_context,
+        &binding.model,
+        decoded,
+    )
+    .await?;
+    let request = oxygenrouter_plugin::build_outbound_request(&descriptor, flow_context)?;
+    let mut outcome = match oxygenrouter_plugin::send_submit(transport, request).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log_request(
+                state,
+                headers,
+                "POST",
+                client_path,
+                Some(binding.model.clone()),
+                Some(channel.id.clone()),
+                None,
+                Some(error.status),
+                Some(error.message.clone()),
+                requested_at.elapsed().as_millis() as i64,
+            );
+            return Err(error);
+        }
+    };
+    oxygenrouter_plugin::interpret_submit(
+        &state.plugins,
+        &descriptor,
+        flow_context,
+        request_context.clone(),
+        &mut outcome,
+    )
+    .await
+}
+
+/// How many more channels a failed submission may try, and how long it waits.
+///
+/// Read from the settings table, which is the authority the relay scheduler is
+/// built from; `RetryBackoff = "none"` reproduces NewAPI's immediate retry.
+struct TaskRetryPolicy {
+    attempts: u32,
+    base_ms: u64,
+    cap_ms: u64,
+}
+
+fn task_retry_policy(state: &AppState) -> TaskRetryPolicy {
+    let attempts = state.db.typed_setting("RetryTimes", 3_i64).max(0) as u32;
+    let base_ms = state.db.typed_setting("RetryIntervalMs", 500_i64).max(0) as u64;
+    let immediate = state
+        .db
+        .typed_setting("RetryBackoff", "exponential".to_string())
+        .eq_ignore_ascii_case("none");
+    TaskRetryPolicy {
+        attempts,
+        base_ms: if immediate { 0 } else { base_ms },
+        cap_ms: base_ms.saturating_mul(60).max(30_000),
+    }
 }
 
 /// Ask the plugin what to send, and check it before a socket exists.
@@ -5174,6 +5307,7 @@ mod tests {
                 message: "boom".to_string(),
                 retryable,
                 status,
+                local: false,
             };
             let response = flow_error_response(&error);
             assert_eq!(response.status().as_u16(), status, "status {status}");
@@ -5249,6 +5383,79 @@ mod tests {
         guard.disarm();
         drop(guard);
         assert_eq!(state.db.wallet_balance(&user.id).unwrap(), 700);
+    }
+
+    /// The retry walk: a tried channel is excluded, and a channel that has
+    /// crossed the scheduler's failure threshold is not selectable until it
+    /// succeeds again.
+    #[test]
+    fn a_task_retry_walks_down_the_channels_it_has_not_tried() {
+        let state = test_state();
+        let mut primary = oxygenrouter_core::Channel::new(
+            "primary".to_string(),
+            "http://127.0.0.1:18081".to_string(),
+            "vendor-key".to_string(),
+            10,
+            1,
+            "task-model".to_string(),
+        );
+        primary.model_list = vec!["task-model".to_string()];
+        let mut backup = primary.clone();
+        backup.id = "backup-channel".to_string();
+        backup.name = "backup".to_string();
+        backup.priority = 5;
+        state.db.upsert_channel(&primary).expect("primary");
+        state.db.upsert_channel(&backup).expect("backup");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let first = rt
+            .block_on(select_task_channel(&state, "task-model", &[]))
+            .expect("first");
+        assert_eq!(first.id, primary.id, "the highest priority serves first");
+        let second = rt
+            .block_on(select_task_channel(
+                &state,
+                "task-model",
+                &[primary.id.clone()],
+            ))
+            .expect("second");
+        assert_eq!(second.id, backup.id, "a retry moves to the other channel");
+
+        // The scheduler's default threshold is five consecutive failures.
+        rt.block_on(async {
+            let scheduler = state.scheduler.read().await;
+            for _ in 0..5 {
+                scheduler.note_attempt_failure(&primary.id);
+            }
+        });
+        let after = rt
+            .block_on(select_task_channel(&state, "task-model", &[]))
+            .expect("after disable");
+        assert_eq!(after.id, backup.id, "a disabled channel is skipped");
+        rt.block_on(async {
+            state.scheduler.read().await.note_attempt_success(&primary.id);
+        });
+        let recovered = rt
+            .block_on(select_task_channel(&state, "task-model", &[]))
+            .expect("after recovery");
+        assert_eq!(recovered.id, primary.id, "a success resets the streak");
+    }
+
+    /// The retry budget and backoff come from the settings table, which is what
+    /// the relay scheduler is built from; `none` reproduces NewAPI's immediate
+    /// retry.
+    #[test]
+    fn the_task_retry_policy_reads_the_settings_table() {
+        let state = test_state();
+        state.db.set_setting("RetryTimes", "1").expect("limit");
+        state.db.set_setting("RetryIntervalMs", "250").expect("interval");
+        state.db.set_setting("RetryBackoff", "none").expect("backoff");
+        let policy = task_retry_policy(&state);
+        assert_eq!(policy.attempts, 1);
+        assert_eq!(policy.base_ms, 0, "an immediate retry does not sleep");
     }
 
     #[test]

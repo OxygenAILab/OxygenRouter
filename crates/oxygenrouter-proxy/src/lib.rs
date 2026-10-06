@@ -22,3 +22,6 @@ pub use upstream::{ModelContextExceeded, ProxyError, ProxyRequest, ProxyResult};
 /// Re-exported so downstream crates can name the usage type without depending on
 /// `oxygenrouter-relay` directly.
 pub use oxygenrouter_relay::Usage;
+/// Retry classification and backoff, re-exported for callers that run their own
+/// attempt loop (the task bridge) without depending on `oxygenrouter-relay`.
+pub use oxygenrouter_relay::retry;

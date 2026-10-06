@@ -123,6 +123,11 @@ pub struct FlowError {
     /// The status the client is answered with, taken from the reference's
     /// `TaskError.StatusCode`.
     pub status: u16,
+    /// Whether the failure is the host's own refusal of the plugin's answer
+    /// rather than the channel's fault. The reference's `LocalError` stops
+    /// retrying *and* keeps the channel's failure streak untouched
+    /// (`controller/relay.go:562,798`).
+    pub local: bool,
 }
 
 impl FlowError {
@@ -134,6 +139,7 @@ impl FlowError {
             message: message.into(),
             retryable: true,
             status: 500,
+            local: false,
         }
     }
 
@@ -144,6 +150,7 @@ impl FlowError {
             message: message.into(),
             retryable: true,
             status: 500,
+            local: false,
         }
     }
 
@@ -156,6 +163,7 @@ impl FlowError {
             message: message.into(),
             retryable: !accepted_stream,
             status: 502,
+            local: false,
         }
     }
 
@@ -168,6 +176,7 @@ impl FlowError {
             message: message.into(),
             retryable: false,
             status: 502,
+            local: true,
         }
     }
 
@@ -181,6 +190,7 @@ impl FlowError {
             message: message.into(),
             retryable: !matches!(status, 400 | 408 | 504 | 524),
             status,
+            local: false,
         }
     }
 }
@@ -1000,6 +1010,7 @@ mod tests {
         );
         assert_eq!(error.status, 500, "build_request_failed");
         assert!(error.retryable, "a 5xx may be tried on another channel");
+        assert!(!error.local, "the channel is not blamed for a build failure");
 
         // An empty URL, an off-host URL, and a model that is not the pinned one.
         assert!(validate_descriptor(&new_descriptor("   "), "acme-video", &ctx)
@@ -1220,6 +1231,7 @@ mod tests {
             error.retryable,
             "a 502 that was not an accepted stream is retried"
         );
+        assert!(!error.local);
 
         // A plugin answering the client itself would bypass the host's
         // accounting, so it is refused outright.
@@ -1245,6 +1257,7 @@ mod tests {
             !error.retryable,
             "a local refusal stops instead of moving channels"
         );
+        assert!(error.local, "the plugin's answer is the host's own refusal");
 
         // An SSE body for a JSON submission means the two sides disagree about
         // the encoding, which a retry would not fix.
@@ -1267,6 +1280,7 @@ mod tests {
         );
         assert!(!error.retryable);
         assert_eq!(error.status, 502);
+        assert!(error.local, "a JSON/SSE mismatch is not the channel's fault");
 
         // A transport failure is retryable; a rejection on an *accepted* stream
         // is not, because the upstream may already have done billable work.
@@ -1278,6 +1292,7 @@ mod tests {
         .expect_err("no scripted answer");
         assert!(error.retryable, "{}", error.message);
         assert_eq!(error.status, 500, "do_request_failed");
+        assert!(!error.local, "a socket failure is the channel's");
 
         let mut streaming = context();
         streaming.submit_response_types = vec!["sse".to_string()];
@@ -1297,6 +1312,7 @@ mod tests {
         // another channel (`relay_task.go:357`, `controller/relay.go:792`).
         assert!(error.retryable, "a 5xx is not an accepted stream");
         assert_eq!(error.status, 500, "the upstream status is passed through");
+        assert!(!error.local);
         });
     }
 
@@ -1431,6 +1447,7 @@ mod tests {
                     let error = answer.expect_err(name);
                     assert!(!error.retryable, "{name}: an accepted stream is not retried");
                     assert_eq!(error.status, 502, "{name}: plugin_submit_response_invalid");
+                    assert!(!error.local, "{name}: an accepted stream is not a local refusal");
                     continue;
                 }
                 let SubmitAnswer::Immediate { body, .. } = answer.expect(name) else {
@@ -1613,6 +1630,7 @@ mod tests {
                 );
                 assert!(!error.retryable, "{name}: an accepted stream is not retried");
                 assert_eq!(error.status, 502, "{name}: plugin_submit_response_invalid");
+                assert!(!error.local, "{name}: an accepted stream is not a local refusal");
             }
         });
     }

@@ -115,6 +115,30 @@ impl ChannelScheduler {
         self.failures.lock().get(channel_id).copied().unwrap_or(0)
     }
 
+    /// Record an attempt the caller performed itself.
+    ///
+    /// The task bridge shapes its own requests through a plugin, so it cannot
+    /// go through `dispatch`; without this the streak that protects every other
+    /// request would ignore every task attempt.
+    pub fn note_attempt_success(&self, channel_id: &str) {
+        self.note_success(channel_id);
+    }
+
+    /// Record a failed attempt and report whether the channel has now crossed
+    /// the auto-disable threshold.
+    pub fn note_attempt_failure(&self, channel_id: &str) -> bool {
+        self.note_failure(channel_id)
+    }
+
+    /// Whether the channel has crossed the auto-disable threshold.
+    ///
+    /// A caller that selects channels itself has to apply the same exclusion
+    /// `candidates` applies for the relay path.
+    pub fn is_temporarily_disabled(&self, channel_id: &str) -> bool {
+        self.disable_threshold > 0
+            && self.failure_count(channel_id) >= self.disable_threshold
+    }
+
     pub async fn dispatch(
         &self,
         req: &ProxyRequest,
