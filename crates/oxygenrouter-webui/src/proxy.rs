@@ -900,6 +900,16 @@ fn passthrough_wants_stream(
 fn json_error(status: StatusCode, msg: &str) -> Response {
     json_policy_error(status, "upstream_error", msg)
 }
+/// Answer a task submission with the status the flow itself carried.
+///
+/// The reference's task error owns its status (`dto.TaskError`), and retry is a
+/// separate decision taken from it (`controller/relay.go:792`); deriving the
+/// client's status from `retryable` answered 400 where the reference answers
+/// 502 whenever a failure was not retried.
+fn flow_error_response(error: &oxygenrouter_plugin::FlowError) -> Response {
+    let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    json_error(status, &error.message)
+}
 fn json_policy_error(status: StatusCode, code: &str, msg: &str) -> Response {
     let body = serde_json::json!({"error": {"message": msg, "type": "invalid_request_error", "code": code}});
     Response::builder()
@@ -2312,6 +2322,10 @@ async fn plugin_bridge(
         Ok(billing) => billing,
         Err(response) => return response,
     };
+    // From the reservation until the durable barrier, every failure returns the
+    // whole reservation: the reference's `defer` refunds whenever the task row
+    // was not written (`controller/relay.go:486`).
+    let mut reservation = TaskReservation::new(&state, task_billing);
 
     // The descriptor is what the plugin wants sent; the guard checks it before a
     // socket exists, so a plugin cannot point the channel credential anywhere the
@@ -2326,21 +2340,15 @@ async fn plugin_bridge(
     .await
     {
         Ok(descriptor) => descriptor,
-        Err(error) => {
-            return json_error(
-                if error.retryable {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                &error.message,
-            )
-        }
+        Err(error) => return flow_error_response(&error),
     };
 
     let transport = match task_transport(&state) {
         Ok(transport) => transport,
-        Err(reason) => return json_error(StatusCode::BAD_GATEWAY, &reason),
+        // A transport that cannot be constructed is the host's own failure to
+        // make the call the reference words `do_request_failed`
+        // (`relay_task.go:349`).
+        Err(reason) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &reason),
     };
     let request = match oxygenrouter_plugin::build_outbound_request(&descriptor, &flow_context) {
         Ok(request) => request,
@@ -2362,11 +2370,10 @@ async fn plugin_bridge(
                 Some(error.message.clone()),
                 requested_at.elapsed().as_millis() as i64,
             );
-            return json_error(StatusCode::BAD_GATEWAY, &error.message);
+            return flow_error_response(&error);
         }
     };
 
-    let mut task_billing = task_billing;
     let answer = match oxygenrouter_plugin::interpret_submit(
         &state.plugins,
         &descriptor,
@@ -2377,16 +2384,7 @@ async fn plugin_bridge(
     .await
     {
         Ok(answer) => answer,
-        Err(error) => {
-            return json_error(
-                if error.retryable {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                &error.message,
-            )
-        }
+        Err(error) => return flow_error_response(&error),
     };
 
     // The plugin sees the upstream's answer before it states the final price;
@@ -2397,7 +2395,7 @@ async fn plugin_bridge(
         oxygenrouter_plugin::SubmitAnswer::Immediate { task_data, .. } => task_data.clone(),
         oxygenrouter_plugin::SubmitAnswer::Pending(submission) => submission.task_data.clone(),
     };
-    if let Some(billing) = task_billing.as_mut() {
+    if let Some(billing) = reservation.billing_mut() {
         if let Err(response) =
             adjust_submit_billing(&state, billing, &flow_context, &context_value, &task_data).await
         {
@@ -2426,17 +2424,20 @@ async fn plugin_bridge(
                 body,
             )
             .await;
-            let key_id = task_billing.as_ref().map(|billing| billing.key_id.clone());
+            let key_id = reservation.billing().map(|billing| billing.key_id.clone());
             // A synchronous answer is already terminal, so its reservation settles
             // here rather than waiting for a poll that will never come.
             let response = settle_immediate_task(
                 &state,
-                task_billing.as_ref(),
+                reservation.billing(),
                 &channel.id,
                 client_path,
                 &result,
                 response,
             );
+            // Settlement owns the reservation now, whether it charged or
+            // refunded; the guard must not move the money a second time.
+            reservation.disarm();
             if response.status().is_success() {
                 let tokens = oxygenrouter_plugin::billable_tokens(&result);
                 log_task_submission(
@@ -2453,16 +2454,18 @@ async fn plugin_bridge(
             response
         }
         oxygenrouter_plugin::SubmitAnswer::Pending(submission) => {
-            let key_id = task_billing.as_ref().map(|billing| billing.key_id.clone());
+            let key_id = reservation.billing().map(|billing| billing.key_id.clone());
             let response = persist_task(
                 &state,
                 &binding,
                 &channel,
                 &flow_context,
                 &submission,
-                task_billing,
+                reservation.billing(),
             );
             if response.status().is_success() {
+                // The stored task owns the reservation from here on.
+                reservation.disarm();
                 log_task_submission(
                     &state,
                     invocation.headers,
@@ -2641,9 +2644,9 @@ async fn call_build_submit(
             flow_context.timeout,
         )
         .await
-        .map_err(|error| oxygenrouter_plugin::FlowError::fatal(error.to_string()))?;
+        .map_err(|error| oxygenrouter_plugin::FlowError::build(error.to_string()))?;
     serde_json::from_value(value).map_err(|error| {
-        oxygenrouter_plugin::FlowError::fatal(format!(
+        oxygenrouter_plugin::FlowError::build(format!(
             "buildSubmitRequest returned an unusable shape: {error}"
         ))
     })
@@ -2822,7 +2825,7 @@ fn persist_task(
     channel: &oxygenrouter_core::Channel,
     flow_context: &oxygenrouter_plugin::TaskFlowContext,
     submission: &oxygenrouter_plugin::SubmitOutcome,
-    billing: Option<oxygenrouter_core::TaskBilling>,
+    billing: Option<&oxygenrouter_core::TaskBilling>,
 ) -> Response {
     let now = Utc::now();
     let task_id = format!("task_{}", Uuid::new_v4().simple());
@@ -2833,12 +2836,10 @@ fn persist_task(
         // Attributed to whoever paid, so the console's per-user view and the
         // billing record cannot disagree about whose task this is.
         user_id: billing
-            .as_ref()
             .map(|billing| billing.user_id.clone())
             .unwrap_or_default(),
         channel_id: channel.id.clone(),
         api_key_id: billing
-            .as_ref()
             .map(|billing| billing.key_id.clone())
             .unwrap_or_default(),
         action: String::new(),
@@ -2865,7 +2866,7 @@ fn persist_task(
             }),
             // The reservation's facts, so the poll loop can settle without knowing
             // anything about the request that created the task.
-            billing,
+            billing: billing.cloned(),
         },
     };
     if let Err(error) = state.db.upsert_task(&record) {
@@ -3642,6 +3643,53 @@ fn task_session(billing: &oxygenrouter_core::TaskBilling) -> oxygenrouter_billin
     .trusted(billing.trusted)
 }
 
+/// A task's reservation, returned unless the submission became durable.
+///
+/// The reference defers exactly this: any failure between the pre-consume and
+/// the task row's insert refunds in full (`controller/relay.go:486`), so a
+/// failed *submission* costs nothing. Rust has no `defer`, so the reservation
+/// lives in a guard that every durable path disarms -- the settlement of an
+/// immediate answer, or a stored task that now owns it.
+struct TaskReservation<'a> {
+    state: &'a AppState,
+    billing: Option<oxygenrouter_core::TaskBilling>,
+    armed: bool,
+}
+
+impl<'a> TaskReservation<'a> {
+    fn new(state: &'a AppState, billing: Option<oxygenrouter_core::TaskBilling>) -> Self {
+        Self {
+            state,
+            billing,
+            armed: true,
+        }
+    }
+
+    fn billing(&self) -> Option<&oxygenrouter_core::TaskBilling> {
+        self.billing.as_ref()
+    }
+
+    fn billing_mut(&mut self) -> Option<&mut oxygenrouter_core::TaskBilling> {
+        self.billing.as_mut()
+    }
+
+    /// The reservation has been settled, or a stored task now owns it.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskReservation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(billing) = self.billing.as_ref() {
+            refund_task_quota(self.state, billing);
+        }
+    }
+}
+
 /// The ratios `extractUsage` reports for the estimate (`relay_task.go:305`).
 ///
 /// The reference runs this hook twice: once with `usagePurpose: "facts"` for
@@ -3920,14 +3968,14 @@ async fn adjust_submit_billing(
             billing.reserved_micros += added;
             Ok(())
         }
-        Err(error) => {
-            refund_task_quota(state, billing);
-            Err(json_policy_error(
-                StatusCode::FORBIDDEN,
-                "insufficient_quota",
-                &format!("insufficient quota for adjusted task cost: {error}"),
-            ))
-        }
+        // `reserve_more` rolls its own delta back, so only the original
+        // reservation is left; the caller's guard returns that one when this
+        // refusal unwinds (`controller/relay.go:486`).
+        Err(error) => Err(json_policy_error(
+            StatusCode::FORBIDDEN,
+            "insufficient_quota",
+            &format!("insufficient quota for adjusted task cost: {error}"),
+        )),
     }
 }
 
@@ -5107,6 +5155,100 @@ mod tests {
             cached_tokens: cached,
             ..Default::default()
         }
+    }
+
+    /// The status a failed task submission is answered with comes from the flow
+    /// itself, not from whether a retry is allowed: a refusal that may not move
+    /// to another channel is still 502, exactly as the reference's
+    /// `TaskError.StatusCode` says.
+    #[test]
+    fn a_flow_error_answers_with_its_own_status() {
+        for (status, retryable) in [
+            (502u16, false),
+            (502, true),
+            (500, true),
+            (429, true),
+            (400, false),
+        ] {
+            let error = oxygenrouter_plugin::FlowError {
+                message: "boom".to_string(),
+                retryable,
+                status,
+            };
+            let response = flow_error_response(&error);
+            assert_eq!(response.status().as_u16(), status, "status {status}");
+        }
+    }
+
+    /// The guard is what makes a failed submission free: the reference's
+    /// deferred refund returns the whole reservation whenever the task row was
+    /// not written (`controller/relay.go:486`). A disarmed guard must not move
+    /// money a second time, because settlement owns it by then.
+    #[test]
+    fn a_task_reservation_refunds_unless_it_was_disarmed() {
+        use oxygenrouter_core::{ApiKey, UserRole};
+
+        let state = test_state();
+        let user = state
+            .db
+            .create_user("guarded", "guarded@example.test", "password123", UserRole::User)
+            .expect("user");
+        state
+            .db
+            .admin_adjust_balance(&user.id, 1_000, "guard probe")
+            .expect("funding");
+        let key = ApiKey::new("sk-guarded".to_string(), "guarded-key".to_string())
+            .owned_by(&user.id)
+            .with_quota(1_000);
+        state.db.upsert_api_key(&key).expect("key");
+        let funding = oxygenrouter_billing::FundingSource::Wallet {
+            user_id: user.id.clone(),
+        };
+
+        let reserve = |amount: i64| {
+            let (session, reserved) = state
+                .billing
+                .begin(
+                    state.billing_store.as_ref(),
+                    &key.id,
+                    &funding,
+                    false,
+                    amount,
+                )
+                .expect("reservation");
+            let billing = oxygenrouter_core::TaskBilling {
+                key_id: key.id.clone(),
+                user_id: user.id.clone(),
+                group: "default".to_string(),
+                model: "guarded-model".to_string(),
+                reserved_micros: reserved,
+                base_micros: amount,
+                quota_micros: amount,
+                other_ratios: Vec::new(),
+                trusted: session.is_trusted(),
+                tiered: None,
+                from_subscription: false,
+                subscription_id: String::new(),
+                settled: false,
+            };
+            (session, billing)
+        };
+
+        // Armed: the submission unwound before its barrier, so the reservation
+        // comes back to both accounts.
+        let (session, billing) = reserve(300);
+        assert_eq!(state.db.wallet_balance(&user.id).unwrap(), 700);
+        drop(TaskReservation::new(&state, Some(billing)));
+        assert_eq!(state.db.wallet_balance(&user.id).unwrap(), 1_000);
+        assert_eq!(state.db.key_used_micros(&key.id).unwrap(), 0);
+        drop(session);
+
+        // Disarmed: settlement or a stored task owns the money now.
+        let (_session, billing) = reserve(300);
+        let mut guard = TaskReservation::new(&state, Some(billing));
+        guard.disarm();
+        drop(guard);
+        assert_eq!(state.db.wallet_balance(&user.id).unwrap(), 700);
     }
 
     #[test]

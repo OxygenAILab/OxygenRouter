@@ -105,37 +105,89 @@ pub trait TaskTransport: Send + Sync {
     fn execute(&self, request: OutboundRequest) -> TransportFuture<'_>;
 }
 
-/// Why a step of the flow failed, and whether retrying could help.
+/// Why a step of the flow failed, whether retrying could help, and what the
+/// client is answered with.
 ///
-/// The distinction is not cosmetic: a submission that failed *after* the
-/// upstream accepted an event stream may already have done billable work, so
-/// retrying it would spend twice, and the reference marks every such failure
-/// non-retryable (`adaptor.go:460,487`).
+/// The retry decision and the status are separate decisions in the reference:
+/// its task error carries its own status (`dto.TaskError`) and retry is decided
+/// from it independently (`controller/relay.go:792`). A submission that failed
+/// *after* the upstream accepted an event stream may already have done billable
+/// work, so it is never retried (`adaptor.go:456,460`), but the client is still
+/// answered 502 -- the two must not be conflated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowError {
     pub message: String,
+    /// Whether another channel may be tried. False once the answer was accepted
+    /// as an event stream, which is the reference's `NoRetry`.
     pub retryable: bool,
+    /// The status the client is answered with, taken from the reference's
+    /// `TaskError.StatusCode`.
+    pub status: u16,
 }
 
 impl FlowError {
-    pub fn retryable(message: impl Into<String>) -> Self {
+    /// The request could not be built, before a socket existed. The reference
+    /// answers 500 `build_request_failed` (`relay_task.go:342`), and a 5xx may
+    /// be tried on another channel.
+    pub fn build(message: impl Into<String>) -> Self {
         FlowError {
             message: message.into(),
             retryable: true,
+            status: 500,
         }
     }
 
-    pub fn fatal(message: impl Into<String>) -> Self {
+    /// The socket produced no response. The reference answers 500
+    /// `do_request_failed` (`relay_task.go:349`).
+    pub fn transport(message: impl Into<String>) -> Self {
+        FlowError {
+            message: message.into(),
+            retryable: true,
+            status: 500,
+        }
+    }
+
+    /// The upstream answered, but the submission could not be read out of its
+    /// answer. Every such failure is 502 in the reference
+    /// (`plugin_submit_response_invalid`, `read_response_body_failed`), and is
+    /// retryable only while the answer was not accepted as an event stream.
+    pub fn response(message: impl Into<String>, accepted_stream: bool) -> Self {
+        FlowError {
+            message: message.into(),
+            retryable: !accepted_stream,
+            status: 502,
+        }
+    }
+
+    /// A refusal the host makes because the plugin's answer cannot be acted on
+    /// at all. The reference marks these local, so they stop rather than move
+    /// to another channel, but they still carry 502
+    /// (`adaptor.go:461,505`).
+    pub fn refused(message: impl Into<String>) -> Self {
         FlowError {
             message: message.into(),
             retryable: false,
+            status: 502,
+        }
+    }
+
+    /// The upstream itself refused, and its status is what the client sees
+    /// (`relay_task.go:357`). Retry follows the reference's default ranges
+    /// (`setting/operation_setting/status_code_ranges.go`): 400, 408, 504 and
+    /// 524 stop; everything else -- including 401, 403 and 404 -- may be tried
+    /// on another channel.
+    pub fn upstream(status: u16, message: impl Into<String>) -> Self {
+        FlowError {
+            message: message.into(),
+            retryable: !matches!(status, 400 | 408 | 504 | 524),
+            status,
         }
     }
 }
 
 impl From<PluginError> for FlowError {
     fn from(error: PluginError) -> Self {
-        FlowError::fatal(error.to_string())
+        FlowError::build(error.to_string())
     }
 }
 
@@ -209,25 +261,25 @@ pub fn validate_descriptor(
         context.submit_response_types.clone()
     };
     if !allowed.iter().any(|kind| kind == response_type) {
-        return Err(FlowError::fatal(format!(
+        return Err(FlowError::build(format!(
             "plugin does not support submit response type {response_type:?}"
         )));
     }
     if descriptor.url.trim().is_empty() {
-        return Err(FlowError::fatal("plugin returned an empty submit URL"));
+        return Err(FlowError::build("plugin returned an empty submit URL"));
     }
     if let Err(reason) = validate_request_url(
         descriptor.url.trim(),
         &context.base_url,
         &context.allowed_hosts,
     ) {
-        return Err(FlowError::fatal(reason));
+        return Err(FlowError::build(reason));
     }
     // A descriptor that names a model must name the one this endpoint serves, or
     // the request would be routed and billed for a model the caller never asked
     // for.
     if !descriptor.model.trim().is_empty() && descriptor.model.trim() != resolved_model {
-        return Err(FlowError::fatal(
+        return Err(FlowError::build(
             "plugin submit model does not match the pinned endpoint model",
         ));
     }
@@ -240,7 +292,7 @@ pub fn build_outbound_request(
     context: &TaskFlowContext,
 ) -> Result<OutboundRequest, FlowError> {
     let body = build_request_body(descriptor, &context.files, context.max_inline_bytes)
-        .map_err(FlowError::fatal)?;
+        .map_err(FlowError::build)?;
     let mut headers: Vec<(String, String)> = descriptor
         .headers
         .iter()
@@ -276,7 +328,7 @@ pub async fn send_submit(
     transport
         .execute(request)
         .await
-        .map_err(FlowError::retryable)
+        .map_err(FlowError::transport)
 }
 
 /// Interpret a submission's answer through the plugin's own parser.
@@ -294,16 +346,20 @@ pub async fn interpret_submit(
     outcome: &mut HttpOutcome,
 ) -> Result<SubmitAnswer, FlowError> {
     let streaming = descriptor.response_type_or_default() == "sse";
+    // The reference accepts an answer as a stream when the submission declared
+    // SSE *or* the answer itself is an event stream, and every failure after
+    // that point is non-retryable (`adaptor.go:456`).
+    let accepted_stream = streaming || outcome.is_event_stream();
     if !streaming && outcome.is_event_stream() {
-        return Err(FlowError::fatal(
+        return Err(FlowError::refused(
             "unexpected SSE response for a JSON submission",
         ));
     }
     if !outcome.is_success() {
-        return Err(FlowError {
-            message: format!("upstream answered {}", outcome.status),
-            retryable: !streaming,
-        });
+        return Err(FlowError::upstream(
+            outcome.status,
+            format!("upstream answered {}", outcome.status),
+        ));
     }
 
     // An SSE submission is read through the plugin's per-event parser; what it
@@ -311,8 +367,9 @@ pub async fn interpret_submit(
     // the upstream had answered one JSON document (`submit_stream.go:21`).
     let body = if streaming {
         if !outcome.is_event_stream() {
-            return Err(FlowError::fatal(
+            return Err(FlowError::response(
                 "expected a text/event-stream submit response",
+                accepted_stream,
             ));
         }
         let delta = context
@@ -330,7 +387,7 @@ pub async fn interpret_submit(
         .await
         {
             Ok(body) => body,
-            Err(message) => return Err(FlowError::fatal(message)),
+            Err(message) => return Err(FlowError::response(message, accepted_stream)),
         }
     } else {
         outcome.body_for_hook()
@@ -346,26 +403,25 @@ pub async fn interpret_submit(
         .await;
     let parsed = match parsed {
         Ok(value) => value,
-        Err(error) => {
-            return Err(FlowError {
-                message: error.to_string(),
-                retryable: !streaming,
-            })
-        }
+        Err(error) => return Err(FlowError::response(error.to_string(), accepted_stream)),
     };
 
     if parsed.get("clientResponse").is_some() {
-        return Err(FlowError::fatal(
+        return Err(FlowError::refused(
             "parseSubmitResponse must not return clientResponse",
         ));
     }
     let submission: SubmitOutcome = serde_json::from_value(parsed).map_err(|error| {
-        FlowError::fatal(format!(
-            "parseSubmitResponse returned an unusable shape: {error}"
-        ))
+        FlowError::response(
+            format!("parseSubmitResponse returned an unusable shape: {error}"),
+            accepted_stream,
+        )
     })?;
     if submission.task_id.trim().is_empty() {
-        return Err(FlowError::fatal("plugin returned an empty taskId"));
+        return Err(FlowError::response(
+            "plugin returned an empty taskId",
+            accepted_stream,
+        ));
     }
     match submission.immediate.clone() {
         Some(immediate) => {
@@ -420,19 +476,19 @@ pub async fn build_query_request(
         )
         .await?;
     let descriptor: RequestDescriptor = serde_json::from_value(value).map_err(|error| {
-        FlowError::fatal(format!(
+        FlowError::build(format!(
             "buildQueryRequest returned an unusable shape: {error}"
         ))
     })?;
     if descriptor.url.trim().is_empty() {
-        return Err(FlowError::fatal("plugin returned an empty query URL"));
+        return Err(FlowError::build("plugin returned an empty query URL"));
     }
     validate_request_url(
         descriptor.url.trim(),
         &context.base_url,
         &context.allowed_hosts,
     )
-    .map_err(FlowError::fatal)?;
+    .map_err(FlowError::build)?;
 
     let mut request = build_outbound_request(&descriptor, context)?;
     // A poll is a read unless the plugin says otherwise, so silence means GET.
@@ -466,7 +522,10 @@ pub async fn interpret_task_result(
         )
         .await?;
     let mut result: TaskResult = serde_json::from_value(value).map_err(|error| {
-        FlowError::fatal(format!("parseTaskResult returned an unusable shape: {error}"))
+        FlowError::response(
+            format!("parseTaskResult returned an unusable shape: {error}"),
+            true,
+        )
     })?;
     // The completion usage hook runs at this boundary because the raw poll body
     // only exists here (`adaptor.go:805`). A hook that is absent, throws, or
@@ -939,7 +998,8 @@ mod tests {
             "{}",
             error.message
         );
-        assert!(!error.retryable);
+        assert_eq!(error.status, 500, "build_request_failed");
+        assert!(error.retryable, "a 5xx may be tried on another channel");
 
         // An empty URL, an off-host URL, and a model that is not the pinned one.
         assert!(validate_descriptor(&new_descriptor("   "), "acme-video", &ctx)
@@ -1155,7 +1215,11 @@ mod tests {
         .await
         .expect_err("must refuse");
         assert!(error.message.contains("empty taskId"), "{}", error.message);
-        assert!(!error.retryable, "a plugin bug is not worth retrying");
+        assert_eq!(error.status, 502, "plugin_submit_response_invalid");
+        assert!(
+            error.retryable,
+            "a 502 that was not an accepted stream is retried"
+        );
 
         // A plugin answering the client itself would bypass the host's
         // accounting, so it is refused outright.
@@ -1176,6 +1240,11 @@ mod tests {
         .await
         .expect_err("must refuse");
         assert!(error.message.contains("clientResponse"), "{}", error.message);
+        assert_eq!(error.status, 502);
+        assert!(
+            !error.retryable,
+            "a local refusal stops instead of moving channels"
+        );
 
         // An SSE body for a JSON submission means the two sides disagree about
         // the encoding, which a retry would not fix.
@@ -1197,6 +1266,7 @@ mod tests {
             error.message
         );
         assert!(!error.retryable);
+        assert_eq!(error.status, 502);
 
         // A transport failure is retryable; a rejection on an *accepted* stream
         // is not, because the upstream may already have done billable work.
@@ -1207,6 +1277,7 @@ mod tests {
         .await
         .expect_err("no scripted answer");
         assert!(error.retryable, "{}", error.message);
+        assert_eq!(error.status, 500, "do_request_failed");
 
         let mut streaming = context();
         streaming.submit_response_types = vec!["sse".to_string()];
@@ -1221,7 +1292,11 @@ mod tests {
         )
         .await
         .expect_err("must refuse");
-        assert!(!error.retryable, "an accepted stream is not retried");
+        // A non-2xx answer never reaches the parser, so it is not an accepted
+        // stream: the reference passes the upstream status through and may try
+        // another channel (`relay_task.go:357`, `controller/relay.go:792`).
+        assert!(error.retryable, "a 5xx is not an accepted stream");
+        assert_eq!(error.status, 500, "the upstream status is passed through");
         });
     }
 
@@ -1355,6 +1430,7 @@ mod tests {
                 if !valid {
                     let error = answer.expect_err(name);
                     assert!(!error.retryable, "{name}: an accepted stream is not retried");
+                    assert_eq!(error.status, 502, "{name}: plugin_submit_response_invalid");
                     continue;
                 }
                 let SubmitAnswer::Immediate { body, .. } = answer.expect(name) else {
@@ -1389,6 +1465,7 @@ mod tests {
                 error.message
             );
             assert!(!error.retryable);
+            assert_eq!(error.status, 502);
 
             // A streaming descriptor whose upstream answered JSON is refused
             // after acceptance, so a retry could pay twice.
@@ -1407,6 +1484,7 @@ mod tests {
                 error.message
             );
             assert!(!error.retryable);
+            assert_eq!(error.status, 502);
         });
     }
 
@@ -1534,6 +1612,7 @@ mod tests {
                     error.message
                 );
                 assert!(!error.retryable, "{name}: an accepted stream is not retried");
+                assert_eq!(error.status, 502, "{name}: plugin_submit_response_invalid");
             }
         });
     }
