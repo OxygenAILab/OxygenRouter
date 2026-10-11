@@ -98,6 +98,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/status", get(get_status))
         .route("/api/site", get(get_site))
+        // Public model/vendor rankings, matching the reference's
+        // `GET /api/rankings` (`router/api-router.go:43`), which defaults to the
+        // week and answers 400 for a period it does not know.
+        .route("/api/rankings", get(get_rankings))
         .route("/api/dashboard", get(get_dashboard))
         .route("/api/analytics/flow", get(get_analytics_flow))
         .route("/api/settings", get(get_settings))
@@ -314,6 +318,10 @@ const PUBLIC_ROUTES: &[&str] = &[
     // configuration a reader should not see: the operator chose these strings to
     // be displayed.
     "/api/site",
+    // The public rankings page, as the reference serves it: the header's
+    // rankings module defaults to public (`middleware/header_nav.go:17`), so a
+    // visitor can see the leaderboard before signing in.
+    "/api/rankings",
 ];
 
 /// Prefixes that only the instance owner may reach.
@@ -3921,6 +3929,70 @@ fn site_values(s: &AppState) -> SiteValues {
 
 async fn get_site(State(s): State<Arc<AppState>>) -> Json<ApiResponse<SiteValues>> {
     Json(ApiResponse::ok(site_values(&s)))
+}
+
+/// A built snapshot and when it stops being fresh.
+///
+/// The reference caches for five minutes per period so the aggregation query is
+/// not run per page view (`service/rankings.go:13,141`); the same bound applies
+/// here, keyed by period id.
+type RankingCache = parking_lot::Mutex<
+    std::collections::HashMap<&'static str, (std::time::Instant, crate::rankings::RankingsResponse)>,
+>;
+
+static RANKING_CACHE: once_cell::sync::Lazy<RankingCache> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+#[derive(serde::Deserialize)]
+struct RankingsQuery {
+    period: Option<String>,
+}
+
+/// Public model/vendor rankings for a period.
+///
+/// An unknown period is a 400 with the same reason the reference gives
+/// (`controller/rankings.go:17`): refusing by name is what lets a client fix the
+/// request instead of silently receiving the default period's numbers.
+async fn get_rankings(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<RankingsQuery>,
+) -> Response {
+    let requested = q.period.as_deref().unwrap_or("");
+    let Some(period) = crate::rankings::ranking_period(requested) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<crate::rankings::RankingsResponse>::err(format!(
+                "invalid ranking period: {requested}"
+            ))),
+        )
+            .into_response();
+    };
+
+    let ttl = std::time::Duration::from_secs(
+        crate::rankings::RANKING_CACHE_TTL_SECS.max(0) as u64,
+    );
+    if ttl > std::time::Duration::ZERO {
+        let cache = RANKING_CACHE.lock();
+        if let Some((built_at, snapshot)) = cache.get(period.id) {
+            if built_at.elapsed() < ttl {
+                return Json(ApiResponse::ok(snapshot.clone())).into_response();
+            }
+        }
+    }
+
+    match crate::rankings::build_snapshot(&s, period, Utc::now()) {
+        Ok(snapshot) => {
+            if ttl > std::time::Duration::ZERO {
+                RANKING_CACHE
+                    .lock()
+                    .insert(period.id, (std::time::Instant::now(), snapshot.clone()));
+            }
+            Json(ApiResponse::ok(snapshot)).into_response()
+        }
+        Err(reason) => {
+            Json(ApiResponse::<crate::rankings::RankingsResponse>::err(reason)).into_response()
+        }
+    }
 }
 
 async fn get_dashboard(

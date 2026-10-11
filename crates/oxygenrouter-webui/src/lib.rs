@@ -8,6 +8,7 @@ pub mod billing_store;
 pub mod embed;
 pub mod model_list;
 pub mod proxy;
+pub mod rankings;
 mod state;
 pub mod task_transport;
 

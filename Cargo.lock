@@ -1767,6 +1767,7 @@ dependencies = [
  "include_dir",
  "mime_guess",
  "multer",
+ "once_cell",
  "oxygenrouter-billing",
  "oxygenrouter-core",
  "oxygenrouter-plugin",

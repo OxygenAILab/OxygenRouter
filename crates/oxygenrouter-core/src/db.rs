@@ -1937,6 +1937,68 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
         conn.query_row("SELECT COUNT(*) FROM quota_data", [], |r| r.get(0))
     }
 
+    /// Tokens per model inside a window, largest first.
+    ///
+    /// The reference reads the same shape from its `quota_data`
+    /// (`model/usedata_rankings.go:21`): positive totals only, ordered by
+    /// tokens, which is what makes the ranking stable rather than a tie shuffle.
+    pub fn quota_tokens_by_model(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> SqliteResult<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model_name, SUM(token_used) AS total \
+             FROM quota_data WHERE model_name <> '' AND bucket_at >= ?1 AND bucket_at < ?2 \
+             GROUP BY model_name HAVING total > 0 ORDER BY total DESC, model_name ASC",
+        )?;
+        let rows = stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Tokens per model per bucket inside a window, oldest bucket first.
+    ///
+    /// `bucket_secs` is the width the caller wants the series cut into; the
+    /// caller-supplied width is what lets one query serve every period
+    /// (`model/usedata_rankings.go:34`).
+    pub fn quota_tokens_by_model_bucket(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        bucket_secs: i64,
+    ) -> SqliteResult<Vec<(String, i64, i64)>> {
+        let bucket_secs = bucket_secs.max(1);
+        let conn = self.conn.lock();
+        // `bucket_at` is an RFC3339 string, so the bucket is cut with
+        // `strftime` on the parsed epoch rather than by integer division of a
+        // timestamp column the way the reference's numeric column allows.
+        let mut stmt = conn.prepare(
+            "SELECT model_name, \
+                    (CAST(strftime('%s', bucket_at) AS INTEGER) / ?3) * ?3 AS bucket, \
+                    SUM(token_used) AS tokens \
+             FROM quota_data WHERE model_name <> '' AND bucket_at >= ?1 AND bucket_at < ?2 \
+             GROUP BY model_name, bucket HAVING tokens > 0 ORDER BY bucket ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                from.to_rfc3339(),
+                to.to_rfc3339(),
+                bucket_secs
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        rows.collect()
+    }
+
     // ── Count helpers (for system info) ─────────────────────────────────────
 
     pub fn count_logs(&self) -> SqliteResult<i64> {
@@ -4392,6 +4454,83 @@ mod tests {
             .quota_data_totals(hour - chrono::Duration::hours(2), hour)
             .unwrap();
         assert_eq!((c2, q2, t2), (0, 0, 0));
+    }
+
+    /// The rankings aggregation: tokens per model, largest first, and the same
+    /// rows cut into hourly buckets. Both mirror the reference's queries
+    /// (`model/usedata_rankings.go:21,34`), including their ordering contract.
+    #[test]
+    fn quota_rows_aggregate_by_model_and_by_bucket() {
+        let db = database();
+        let hour = {
+            use chrono::Timelike;
+            Utc::now()
+                .with_minute(0)
+                .unwrap()
+                .with_second(0)
+                .unwrap()
+                .with_nanosecond(0)
+                .unwrap()
+        };
+        let row = |model: &str, bucket: DateTime<Utc>, tokens: i64| crate::QuotaData {
+                id: Uuid::new_v4().to_string(),
+                bucket_at: bucket,
+                user_id: "u".into(),
+                username: "u".into(),
+                model_name: model.into(),
+                group_name: "default".into(),
+                channel_id: "c".into(),
+                token_id: "t".into(),
+                count: 1,
+                quota: tokens,
+                token_used: tokens,
+                created_at: Utc::now(),
+            };
+
+        // Two hours of usage: alpha's two buckets beat beta's two, and both
+        // beat a model that only appears in the previous window.
+        db.upsert_quota_data(&[
+            row("alpha", hour, 10),
+            row("alpha", hour + chrono::Duration::hours(1), 10),
+            row("beta", hour, 5),
+            row("beta", hour + chrono::Duration::hours(1), 5),
+            row("old", hour - chrono::Duration::hours(2), 99),
+        ])
+        .unwrap();
+
+        let window = (
+            hour,
+            hour + chrono::Duration::hours(2),
+        );
+        let totals = db.quota_tokens_by_model(window.0, window.1).unwrap();
+        assert_eq!(
+            totals,
+            vec![("alpha".to_string(), 20), ("beta".to_string(), 10)],
+            "ordered by tokens, and a model outside the window is absent"
+        );
+
+        let buckets = db
+            .quota_tokens_by_model_bucket(window.0, window.1, 3600)
+            .unwrap();
+        assert_eq!(
+            buckets,
+            vec![
+                ("alpha".to_string(), hour.timestamp() / 3600 * 3600, 10),
+                ("beta".to_string(), hour.timestamp() / 3600 * 3600, 5),
+                ("alpha".to_string(), (hour + chrono::Duration::hours(1)).timestamp() / 3600 * 3600, 10),
+                ("beta".to_string(), (hour + chrono::Duration::hours(1)).timestamp() / 3600 * 3600, 5),
+            ],
+            "one row per model per bucket, buckets ascending"
+        );
+
+        // A window with no rows is empty rather than an error.
+        let empty_from = hour - chrono::Duration::days(3);
+        let empty_to = hour - chrono::Duration::days(2);
+        assert!(db.quota_tokens_by_model(empty_from, empty_to).unwrap().is_empty());
+        assert!(db
+            .quota_tokens_by_model_bucket(empty_from, empty_to, 3600)
+            .unwrap()
+            .is_empty());
     }
 
     /// The token allowlist used to compare addresses as strings, so a subnet
