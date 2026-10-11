@@ -165,7 +165,16 @@ impl ChannelScheduler {
         let affinity = self.affinity.resolve(req, model, group_name);
 
         for attempt in 0..=limit {
-            let candidates = self.candidates(&tried, group_name, cross_group_retry && attempt > 0);
+            // The requested model, not the possibly-rewritten one: a channel's
+            // declaration is keyed by what the caller asked for, exactly as the
+            // reference keys its ability rows by the origin model
+            // (`model/ability.go:217`).
+            let candidates = self.candidates(
+                &tried,
+                model,
+                group_name,
+                cross_group_retry && attempt > 0,
+            );
             if candidates.is_empty() {
                 return Err(last_err.unwrap_or(ProxyError::NoChannel));
             }
@@ -293,6 +302,7 @@ impl ChannelScheduler {
     fn candidates(
         &self,
         exclude: &[String],
+        model: &str,
         group_name: Option<&str>,
         allow_cross_group: bool,
     ) -> Vec<Channel> {
@@ -304,6 +314,7 @@ impl ChannelScheduler {
         let failures = self.failures.lock();
         let mut candidates: Vec<Channel> = channels
             .into_iter()
+            .filter(|c| c.serves_model(model))
             .filter(|c| !exclude.contains(&c.id))
             .filter(|c| {
                 // A channel past the threshold is skipped until it succeeds again.
@@ -342,4 +353,68 @@ fn rand_i64() -> i64 {
         .hash(&mut hasher);
     std::thread::current().id().hash(&mut hasher);
     (hasher.finish() >> 1) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxygenrouter_core::Database;
+    use std::sync::Arc;
+
+    fn channel(name: &str, priority: i32, models: &[&str]) -> Channel {
+        let mut channel = Channel::new(
+            name.to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "k".to_string(),
+            priority,
+            1,
+            "test".to_string(),
+        );
+        channel.model_list = models.iter().map(|model| model.to_string()).collect();
+        channel
+    }
+
+    fn scheduler_with(channels: Vec<Channel>) -> ChannelScheduler {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("scheduler-test.db");
+        // `ChannelScheduler` holds only the selector, and the file must outlive
+        // this function for the selector to keep reading it.
+        std::mem::forget(dir);
+        let db = Arc::new(Database::new(&path).expect("database"));
+        for channel in channels {
+            db.upsert_channel(&channel).expect("channel");
+        }
+        ChannelScheduler::new(
+            ChannelSelector::new(db),
+            RelayClient::new("test".to_string(), 5_000),
+        )
+    }
+
+    /// A candidate serves only what it declares; an empty declaration is not a
+    /// wildcard (`model/ability.go:217`), and `*` is our explicit extension.
+    #[test]
+    fn candidates_only_include_the_channels_that_declare_the_model() {
+        let scheduler = scheduler_with(vec![
+            channel("undeclared", 100, &["other-model"]),
+            channel("declared", 1, &["wanted-model"]),
+            channel("wildcard", 0, &["*"]),
+            channel("empty", 50, &[]),
+        ]);
+
+        let candidates = scheduler.candidates(&[], "wanted-model", None, true);
+        let mut names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["declared", "wildcard"]);
+    }
+
+    #[test]
+    fn a_model_no_channel_declares_has_no_candidates() {
+        let scheduler = scheduler_with(vec![
+            channel("empty", 10, &[]),
+            channel("other", 5, &["x"]),
+        ]);
+        assert!(scheduler
+            .candidates(&[], "missing-model", None, true)
+            .is_empty());
+    }
 }

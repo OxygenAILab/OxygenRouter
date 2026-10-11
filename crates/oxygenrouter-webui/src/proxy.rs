@@ -2105,13 +2105,7 @@ async fn select_task_channel(
         .into_iter()
         .filter(|channel| !exclude.iter().any(|id| id == &channel.id))
         .filter(|channel| !scheduler.is_temporarily_disabled(&channel.id))
-        .filter(|channel| {
-            channel.model_list.is_empty()
-                || channel
-                    .model_list
-                    .iter()
-                    .any(|listed| listed == model || listed == "*")
-        })
+        .filter(|channel| channel.serves_model(model))
         .max_by_key(|channel| (channel.priority, channel.weight))
 }
 
@@ -2411,17 +2405,20 @@ async fn plugin_bridge(
                 if !error.retryable || attempt >= retry.attempts {
                     return flow_error_response(&error);
                 }
-                let Some(next) = select_task_channel(&state, &binding.model, &tried).await else {
-                    // Every channel this request may use has been tried; the
-                    // reference answers that as `get_channel_failed` (500), not
-                    // as the last upstream error.
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!(
-                            "no untried channel serves {:?}; the last failure was: {}",
-                            binding.model, error.message
-                        ),
-                    );
+                let next = match select_task_channel(&state, &binding.model, &tried).await {
+                    Some(next) => next,
+                    // Every channel this request may use has been tried. The
+                    // reference clamps its retry index to the last priority
+                    // tier (`model/channel_cache.go:165`), so a solo channel is
+                    // retried until the budget runs out and the client still
+                    // sees the upstream's own error, not a synthetic one.
+                    None => match select_task_channel(&state, &binding.model, &[]).await {
+                        Some(again) => again,
+                        // Every candidate was disabled by the failure streak
+                        // meanwhile; the last real error is what the client
+                        // gets, as the relay path does.
+                        None => return flow_error_response(&error),
+                    },
                 };
                 if retry.base_ms > 0 {
                     let delay = oxygenrouter_proxy::retry::backoff_ms(

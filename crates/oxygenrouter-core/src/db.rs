@@ -4465,16 +4465,12 @@ impl ChannelSelector {
         None
     }
 
-    pub fn select_channel(&self, _model: &str) -> SqliteResult<Option<Channel>> {
+    pub fn select_channel(&self, model: &str) -> SqliteResult<Option<Channel>> {
         let channels = self.db.get_enabled_channels()?;
-        if channels.is_empty() {
-            return Ok(None);
-        }
-        let best = channels
+        Ok(channels
             .into_iter()
-            .max_by_key(|c| (c.priority, c.weight))
-            .unwrap();
-        Ok(Some(best))
+            .filter(|channel| channel.serves_model(model))
+            .max_by_key(|channel| (channel.priority, channel.weight)))
     }
 }
 

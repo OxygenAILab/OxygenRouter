@@ -173,6 +173,51 @@ impl Channel {
             updated_at: now,
         }
     }
+
+    /// Whether this channel declared the model it is being asked for.
+    ///
+    /// The reference creates one ability row per declared model
+    /// (`model/ability.go:217`), so a channel serves exactly what it lists --
+    /// an empty list serves nothing, and a request whose model is empty matches
+    /// nothing. `*` is this host's explicit wildcard, not a reference feature.
+    pub fn serves_model(&self, model: &str) -> bool {
+        let model = model.trim();
+        !model.is_empty()
+            && self.model_list.iter().any(|listed| {
+                let listed = listed.trim();
+                listed == model || listed == "*"
+            })
+    }
+}
+
+#[cfg(test)]
+mod channel_scope_tests {
+    use super::*;
+
+    fn channel(models: &[&str]) -> Channel {
+        let mut channel = Channel::new(
+            "scope".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "k".to_string(),
+            1,
+            1,
+            "test".to_string(),
+        );
+        channel.model_list = models.iter().map(|model| model.to_string()).collect();
+        channel
+    }
+
+    #[test]
+    fn a_channel_serves_only_what_it_declares() {
+        assert!(channel(&["a", "b"]).serves_model("a"));
+        assert!(!channel(&["a", "b"]).serves_model("c"));
+        // An empty declaration is not a wildcard: the reference creates no
+        // ability rows for it, so the channel serves no model at all.
+        assert!(!channel(&[]).serves_model("a"));
+        // `*` is our explicit wildcard; an empty request model matches nothing.
+        assert!(channel(&["*"]).serves_model("a"));
+        assert!(!channel(&["*"]).serves_model("  "));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
