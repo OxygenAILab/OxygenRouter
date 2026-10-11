@@ -350,9 +350,23 @@ mod tests {
 
     #[test]
     fn public_addresses_are_allowed_by_default() {
-        let policy = SsrfPolicy::public_only();
-        assert!(policy.validate_url("https://api.openai.com/v1/chat/completions").is_ok());
-        assert!(policy.validate_url("http://93.184.216.34/").is_ok());
+        // A literal public address needs no resolver.
+        assert!(SsrfPolicy::public_only()
+            .validate_url("http://93.184.216.34/")
+            .is_ok());
+        // A hostname is checked on its own merits, with resolution off: a live
+        // lookup would make this test depend on the sandbox's resolver, and a
+        // proxy that answers with a benchmarking-range address (Clash's fake-ip
+        // pool is 198.18.0.0/15) is correctly refused by the default policy --
+        // a resolver artifact, not a policy result. The resolution path's own
+        // refusal is pinned deterministically by the `localhost` case below.
+        let policy = SsrfPolicy {
+            resolve_dns: false,
+            ..SsrfPolicy::public_only()
+        };
+        assert!(policy
+            .validate_url("https://api.openai.com/v1/chat/completions")
+            .is_ok());
     }
 
     #[test]
