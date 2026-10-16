@@ -348,6 +348,18 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_quota_data_bucket ON quota_data(bucket_at DESC);
 
+            -- Daily check-in claims. The unique index is the once-a-day guard;
+            -- a read-then-write check in the handler would let two simultaneous
+            -- taps both pass before either wrote.
+            CREATE TABLE IF NOT EXISTS checkins (
+                id                  TEXT PRIMARY KEY,
+                user_id             TEXT NOT NULL,
+                checkin_date        TEXT NOT NULL,
+                quota_awarded_micros INTEGER NOT NULL,
+                created_at          TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_checkins_user_date ON checkins(user_id, checkin_date);
+
             -- Uploaded plugins. A plugin may have several versions and one of
             -- them active, which is why the source lives beside the version
             -- rather than in the plugin's own row: activating a different build
@@ -3227,6 +3239,112 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
         Ok(entry)
     }
 
+    // ── Daily check-in ───────────────────────────────────────────────────────
+
+    /// Claim one day's check-in award: record it and credit it in one
+    /// transaction.
+    ///
+    /// `INSERT OR IGNORE` plus the unique index is the race-free guard: two
+    /// simultaneous claims both reach the insert and exactly one changes a row,
+    /// so the loser is told it already claimed rather than being credited
+    /// twice. A credit failure rolls the record back with the transaction, so a
+    /// claim is never recorded without its award.
+    pub fn claim_checkin(
+        &self,
+        user_id: &str,
+        date: &str,
+        award_micros: i64,
+    ) -> SqliteResult<crate::CheckinOutcome> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let checkin = crate::Checkin {
+            id: Uuid::new_v4().to_string(),
+            user_id: user_id.to_string(),
+            checkin_date: date.to_string(),
+            quota_awarded_micros: award_micros,
+            created_at: Utc::now(),
+        };
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO checkins (id,user_id,checkin_date,quota_awarded_micros,created_at) \
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                checkin.id,
+                checkin.user_id,
+                checkin.checkin_date,
+                checkin.quota_awarded_micros,
+                checkin.created_at.to_rfc3339()
+            ],
+        )?;
+        if inserted == 0 {
+            return Ok(crate::CheckinOutcome::AlreadyClaimed);
+        }
+        Self::credit_tx(
+            &tx,
+            user_id,
+            award_micros,
+            "checkin",
+            "Daily check-in",
+            None,
+        )?;
+        tx.commit()?;
+        Ok(crate::CheckinOutcome::Claimed(checkin))
+    }
+
+    /// One user's check-in rows for a month, newest first.
+    ///
+    /// The month is bounded by `-01`/`-31` exactly as the reference does
+    /// (`model/checkin.go:35`): string comparison over `YYYY-MM-DD` is already
+    /// the date order, and the day bound can over-reach without including
+    /// another month.
+    pub fn list_checkins(&self, user_id: &str, month: &str) -> SqliteResult<Vec<crate::Checkin>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,user_id,checkin_date,quota_awarded_micros,created_at FROM checkins \
+             WHERE user_id=?1 AND checkin_date>=?2 AND checkin_date<=?3 \
+             ORDER BY checkin_date DESC",
+        )?;
+        let rows = stmt.query_map(
+            params![user_id, format!("{month}-01"), format!("{month}-31")],
+            |r| {
+                Ok(crate::Checkin {
+                    id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    checkin_date: r.get(2)?,
+                    quota_awarded_micros: r.get(3)?,
+                    created_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(4)?)
+                        .map(|v| v.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// A user's check-in totals plus the requested month's records.
+    pub fn checkin_stats(
+        &self,
+        user_id: &str,
+        month: &str,
+        today: &str,
+    ) -> SqliteResult<crate::CheckinStats> {
+        let records = self.list_checkins(user_id, month)?;
+        let conn = self.conn.lock();
+        let (total_checkins, total_quota_micros, today_count): (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(quota_awarded_micros),0), \
+                    COALESCE(SUM(CASE WHEN checkin_date=?2 THEN 1 ELSE 0 END),0) \
+             FROM checkins WHERE user_id=?1",
+            params![user_id, today],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(crate::CheckinStats {
+            total_quota_micros,
+            total_checkins,
+            checkin_count: records.len() as i64,
+            checked_in_today: today_count > 0,
+            records,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Billing: atomic quota movement
     //
@@ -4531,6 +4649,56 @@ mod tests {
             .quota_tokens_by_model_bucket(empty_from, empty_to, 3600)
             .unwrap()
             .is_empty());
+    }
+
+    /// A check-in pays once per user per day and credits the same transaction
+    /// that records it; the stats roll-up reads both scopes back correctly.
+    #[test]
+    fn a_checkin_credits_once_per_day() {
+        let db = database();
+        let user = db
+            .create_user("checkin", "checkin@example.test", "password123", UserRole::User)
+            .unwrap();
+        let before = db.wallet_balance(&user.id).unwrap();
+
+        match db.claim_checkin(&user.id, "2026-10-17", 5_000).unwrap() {
+            crate::CheckinOutcome::Claimed(checkin) => {
+                assert_eq!(checkin.checkin_date, "2026-10-17");
+                assert_eq!(checkin.quota_awarded_micros, 5_000);
+            }
+            crate::CheckinOutcome::AlreadyClaimed => panic!("the first claim was refused"),
+        }
+        assert_eq!(db.wallet_balance(&user.id).unwrap(), before + 5_000);
+
+        // The same day cannot pay twice, and the refusal costs nothing.
+        assert!(matches!(
+            db.claim_checkin(&user.id, "2026-10-17", 9_999).unwrap(),
+            crate::CheckinOutcome::AlreadyClaimed
+        ));
+        assert_eq!(db.wallet_balance(&user.id).unwrap(), before + 5_000);
+
+        // Another day pays again, and another user is unaffected by this one.
+        db.claim_checkin(&user.id, "2026-10-18", 1_000).unwrap();
+        assert_eq!(db.wallet_balance(&user.id).unwrap(), before + 6_000);
+        let other = db
+            .create_user("other", "other@example.test", "password123", UserRole::User)
+            .unwrap();
+        db.claim_checkin(&other.id, "2026-10-17", 2_000).unwrap();
+        assert_eq!(db.wallet_balance(&user.id).unwrap(), before + 6_000);
+
+        let stats = db.checkin_stats(&user.id, "2026-10", "2026-10-18").unwrap();
+        assert_eq!(stats.total_checkins, 2);
+        assert_eq!(stats.checkin_count, 2);
+        assert_eq!(stats.total_quota_micros, 6_000);
+        assert!(stats.checked_in_today);
+        assert_eq!(stats.records.len(), 2);
+        // Newest first, and a month with no claims reports zero for the month
+        // while the lifetime totals still stand.
+        assert_eq!(stats.records[0].checkin_date, "2026-10-18");
+        let quiet = db.checkin_stats(&user.id, "2026-09", "2026-10-18").unwrap();
+        assert_eq!(quiet.checkin_count, 0);
+        assert_eq!(quiet.total_checkins, 2);
+        assert!(quiet.records.is_empty());
     }
 
     /// The token allowlist used to compare addresses as strings, so a subnet

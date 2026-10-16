@@ -136,6 +136,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/user/2fa/enable", post(two_fa_enable))
         .route("/api/user/2fa/disable", post(two_fa_disable))
         .route("/api/user/2fa/backup_codes", post(two_fa_backup_codes))
+        // Daily check-in, matching the reference's self-service group
+        // (`router/api-router.go:136`): reading the status and claiming both
+        // need the caller's own session.
+        .route("/api/user/checkin", get(checkin_status))
+        .route("/api/user/checkin", post(claim_checkin))
         .route("/api/wallet", get(wallet))
         .route("/api/subscriptions/me", get(my_subscriptions))
         .route("/api/subscriptions/subscribe", post(subscribe))
@@ -1252,6 +1257,100 @@ async fn two_fa_backup_codes(
     }
     Json(ApiResponse::ok(serde_json::json!({"backup_codes": codes}))).into_response()
 }
+
+/// What the check-in endpoint reports before and after a claim.
+#[derive(serde::Serialize)]
+struct CheckinStatusPayload {
+    enabled: bool,
+    min_quota: i64,
+    max_quota: i64,
+    stats: oxygenrouter_core::CheckinStats,
+}
+
+#[derive(serde::Deserialize)]
+struct CheckinQuery {
+    month: Option<String>,
+}
+
+/// The check-in switch, range, and this caller's standing.
+///
+/// A disabled feature is refused by name rather than answered with an empty
+/// month, matching the reference (`controller/checkin.go:19`): a client can tell
+/// "the operator turned this off" from "you have not checked in".
+async fn checkin_status(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<CheckinQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if !s.db.typed_setting("CheckinEnabled", false) {
+        return Json(ApiResponse::<CheckinStatusPayload>::err(
+            "check-in is not enabled",
+        ))
+        .into_response();
+    }
+    let month = q
+        .month
+        .filter(|month| !month.trim().is_empty())
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m").to_string());
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    match s.db.checkin_stats(&user.id, &month, &today) {
+        Ok(stats) => Json(ApiResponse::ok(CheckinStatusPayload {
+            enabled: true,
+            min_quota: s.db.typed_setting("CheckinMinQuota", 2_000_i64),
+            max_quota: s.db.typed_setting("CheckinMaxQuota", 20_000_i64),
+            stats,
+        }))
+        .into_response(),
+        Err(error) => {
+            Json(ApiResponse::<CheckinStatusPayload>::err(error.to_string())).into_response()
+        }
+    }
+}
+
+/// Claim today's award once.
+///
+/// The award is drawn here and the claim is made atomically in storage, so a
+/// double tap is answered "already checked in today" rather than paying twice
+/// (`model/checkin.go:55`).
+async fn claim_checkin(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user = match auth_user(&s, &headers) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if !s.db.typed_setting("CheckinEnabled", false) {
+        return Json(ApiResponse::<serde_json::Value>::err(
+            "check-in is not enabled",
+        ))
+        .into_response();
+    }
+    let min = s.db.typed_setting("CheckinMinQuota", 2_000_i64);
+    let max = s.db.typed_setting("CheckinMaxQuota", 20_000_i64);
+    let award = oxygenrouter_core::checkin::random_award(min, max);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    match s.db.claim_checkin(&user.id, &today, award) {
+        Ok(oxygenrouter_core::CheckinOutcome::Claimed(checkin)) => {
+            Json(ApiResponse::ok(serde_json::json!({
+                "quota_awarded_micros": checkin.quota_awarded_micros,
+                "checkin_date": checkin.checkin_date,
+            })))
+            .into_response()
+        }
+        Ok(oxygenrouter_core::CheckinOutcome::AlreadyClaimed) => {
+            Json(ApiResponse::<serde_json::Value>::err(
+                "already checked in today",
+            ))
+            .into_response()
+        }
+        Err(error) => {
+            Json(ApiResponse::<serde_json::Value>::err(error.to_string())).into_response()
+        }
+    }
+}
+
 async fn wallet(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let user = match auth_user(&s, &headers) {
         Ok(user) => user,
@@ -4503,6 +4602,8 @@ mod access_tests {
         assert_eq!(required_access("/api/wallet"), Access::User);
         assert_eq!(required_access("/api/auth/me"), Access::User);
         assert_eq!(required_access("/api/user/sessions"), Access::User);
+        // Check-in is self-service: signed in, never anonymous.
+        assert_eq!(required_access("/api/user/checkin"), Access::User);
     }
 
     #[test]

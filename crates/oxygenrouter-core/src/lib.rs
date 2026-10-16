@@ -17,6 +17,7 @@
 
 pub mod authz;
 pub mod artifact_access;
+pub mod checkin;
 mod config;
 mod db;
 mod models;

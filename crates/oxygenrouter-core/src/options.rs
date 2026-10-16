@@ -133,6 +133,14 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     // The reference pairs the switch with an interval (`model/usedata.go:47`),
     // because the counters are held in memory and only written out periodically.
     schema!("DataExportInterval", Operations, Int, "5", "Minutes between usage-summary flushes"),
+    // Daily check-in, matching the reference's `checkin_setting`
+    // (`setting/operation_setting/checkin_setting.go:12`): off by default, with
+    // a quota range the award is drawn from. The reference's defaults are in
+    // *its* quota units, so the range is expressed here in micros -- the unit
+    // this instance's wallet uses -- as the USD values its comment states.
+    schema!("CheckinEnabled", Operations, Bool, "false", "Let users claim a daily quota award"),
+    schema!("CheckinMinQuota", Operations, Int, "2000", "Smallest daily check-in award, in micros (0.002 USD)"),
+    schema!("CheckinMaxQuota", Operations, Int, "20000", "Largest daily check-in award, in micros (0.02 USD)"),
     schema!("UserAgent", Bootstrap, String, "OxygenRouter/0.1.0", "User-Agent sent upstream"),
     // Security
     schema!("LocalApiToken", Security, String, "", "Bearer token required from local clients", secret),

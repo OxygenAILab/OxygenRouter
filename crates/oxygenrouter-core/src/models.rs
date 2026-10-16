@@ -956,6 +956,48 @@ pub struct LedgerEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// One claimed daily check-in.
+///
+/// The grain is `(user_id, checkin_date)`, enforced by a unique index: the
+/// reference keeps a `checkins` table with the same pair
+/// (`model/checkin.go:15`), and that index is what makes "once a day" a
+/// database guarantee rather than a check the handler can race.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkin {
+    pub id: String,
+    pub user_id: String,
+    /// `YYYY-MM-DD`, in the instance's local day.
+    pub checkin_date: String,
+    pub quota_awarded_micros: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// What one claim attempt produced.
+#[derive(Debug, Clone)]
+pub enum CheckinOutcome {
+    /// The award was credited and recorded.
+    Claimed(Checkin),
+    /// This user already claimed today. A caller answers with the reference's
+    /// message rather than a storage error.
+    AlreadyClaimed,
+}
+
+/// A user's check-in roll-up for one month, plus the lifetime totals.
+///
+/// Field-for-field the reference's `GetUserCheckinStats`
+/// (`model/checkin.go:168`), minus the internal row ids it deliberately omits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckinStats {
+    /// Lifetime micros won from check-ins.
+    pub total_quota_micros: i64,
+    /// Lifetime claims.
+    pub total_checkins: i64,
+    /// Claims inside the requested month.
+    pub checkin_count: i64,
+    pub checked_in_today: bool,
+    pub records: Vec<Checkin>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionPlan {
     pub id: String,
