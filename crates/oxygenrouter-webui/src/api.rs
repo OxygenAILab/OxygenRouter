@@ -47,6 +47,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vendors/:id", get(get_vendor))
         .route("/api/vendors/:id", put(update_vendor))
         .route("/api/vendors/:id", delete(delete_vendor))
+        // Group management, matching the reference's `/group` and
+        // `/prefill_group` admin groups (`router/api-router.go:350,356`).
+        .route("/api/group", get(list_groups))
+        .route(
+            "/api/prefill_group",
+            get(list_prefill_groups).post(create_prefill_group),
+        )
+        .route("/api/prefill_group", put(update_prefill_group))
+        .route("/api/prefill_group/:id", delete(delete_prefill_group))
         .route("/api/channels/batch", patch(batch_update_channels))
         .route("/api/channels/batch", delete(batch_delete_channels))
         .route("/api/log/stats", get(log_stats))
@@ -136,6 +145,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/user/2fa/enable", post(two_fa_enable))
         .route("/api/user/2fa/disable", post(two_fa_disable))
         .route("/api/user/2fa/backup_codes", post(two_fa_backup_codes))
+        // Which groups this caller may pick, with the ratio each would bill at.
+        .route("/api/user/groups", get(user_groups))
         // Daily check-in, matching the reference's self-service group
         // (`router/api-router.go:136`): reading the status and claiming both
         // need the caller's own session.
@@ -369,6 +380,11 @@ const ADMIN_PREFIXES: &[&str] = &[
     "/api/channels",
     "/api/models-metadata",
     "/api/vendors",
+    // Group administration: the ratio table's shape and the reusable picker
+    // lists are shared infrastructure, so the reference gates both on AdminAuth
+    // (`router/api-router.go:350,356`).
+    "/api/group",
+    "/api/prefill_group",
     "/api/model-maps",
     "/api/rules",
     "/api/admin",
@@ -2797,6 +2813,142 @@ async fn delete_vendor(
     })
 }
 
+/// Every group the pricing engine knows, plus the instance's default group.
+///
+/// Sorted and de-duplicated: the pack's names and the operator's overrides can
+/// both contain the same group, and a selector must not show it twice.
+fn known_groups(s: &AppState) -> Vec<String> {
+    let pricing = s.billing.pricing();
+    let mut names = pricing.read().group_names();
+    let fallback = s.default_group();
+    if !names.iter().any(|name| name == &fallback) {
+        names.push(fallback);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The console's group list (admin), matching `controller/group.go:14`.
+async fn list_groups(State(s): State<Arc<AppState>>) -> Json<ApiResponse<Vec<String>>> {
+    Json(ApiResponse::ok(known_groups(&s)))
+}
+
+/// The groups a signed-in caller may choose, with the ratio they would be
+/// billed at and the operator's description.
+///
+/// The reference intersects the ratio table with a per-user usable-group map
+/// (`controller/group.go:26`). This instance has no per-user group overrides
+/// yet, so the caller sees every configured group; the description comes from
+/// `UserUsableGroups` and falls back to the group's own name, which is the
+/// reference's fallback too (`setting/user_usable_group.go:45`).
+async fn user_groups(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = auth_user(&s, &headers) {
+        return response;
+    }
+    let descriptions: std::collections::HashMap<String, String> = s
+        .db
+        .get_setting("UserUsableGroups")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let names = known_groups(&s);
+    let pricing = s.billing.pricing();
+    let guard = pricing.read();
+    let mut groups = serde_json::Map::new();
+    for name in names {
+        let desc = descriptions
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        groups.insert(
+            name.clone(),
+            serde_json::json!({"ratio": guard.group_ratio(&name), "desc": desc}),
+        );
+    }
+    Json(ApiResponse::ok(groups)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PrefillGroupQuery {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+/// Reusable named lists for the console's pickers (admin), newest first.
+async fn list_prefill_groups(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<PrefillGroupQuery>,
+) -> Json<ApiResponse<Vec<oxygenrouter_core::PrefillGroup>>> {
+    Json(match s.db.list_prefill_groups(q.kind.as_deref()) {
+        Ok(groups) => ApiResponse::ok(groups),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+async fn create_prefill_group(
+    State(s): State<Arc<AppState>>,
+    Json(mut input): Json<oxygenrouter_core::PrefillGroup>,
+) -> Json<ApiResponse<oxygenrouter_core::PrefillGroup>> {
+    if input.name.trim().is_empty() {
+        return Json(ApiResponse::err("group name is required"));
+    }
+    if input.kind.trim().is_empty() {
+        return Json(ApiResponse::err("group type is required"));
+    }
+    match s.db.prefill_group_name_taken(&input.name, "") {
+        Ok(true) => return Json(ApiResponse::err("a group with that name already exists")),
+        Err(error) => return Json(ApiResponse::err(error.to_string())),
+        Ok(false) => {}
+    }
+    if input.id.is_empty() {
+        input.id = uuid::Uuid::new_v4().to_string();
+    }
+    let now = Utc::now();
+    input.created_at = now;
+    input.updated_at = now;
+    Json(match s.db.upsert_prefill_group(&input) {
+        Ok(()) => ApiResponse::ok(input),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+async fn update_prefill_group(
+    State(s): State<Arc<AppState>>,
+    Json(mut input): Json<oxygenrouter_core::PrefillGroup>,
+) -> Json<ApiResponse<oxygenrouter_core::PrefillGroup>> {
+    if input.id.trim().is_empty() {
+        return Json(ApiResponse::err("group id is required"));
+    }
+    if input.name.trim().is_empty() {
+        return Json(ApiResponse::err("group name is required"));
+    }
+    if input.kind.trim().is_empty() {
+        return Json(ApiResponse::err("group type is required"));
+    }
+    match s.db.prefill_group_name_taken(&input.name, &input.id) {
+        Ok(true) => return Json(ApiResponse::err("a group with that name already exists")),
+        Err(error) => return Json(ApiResponse::err(error.to_string())),
+        Ok(false) => {}
+    }
+    input.updated_at = Utc::now();
+    Json(match s.db.upsert_prefill_group(&input) {
+        Ok(()) => ApiResponse::ok(input),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
+async fn delete_prefill_group(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<&'static str>> {
+    Json(match s.db.delete_prefill_group(&id) {
+        Ok(_) => ApiResponse::ok("deleted"),
+        Err(error) => ApiResponse::err(error.to_string()),
+    })
+}
+
 /// Model names discovered on channels that have no metadata row yet.
 async fn missing_model_metadata(
     State(s): State<Arc<AppState>>,
@@ -4604,6 +4756,12 @@ mod access_tests {
         assert_eq!(required_access("/api/user/sessions"), Access::User);
         // Check-in is self-service: signed in, never anonymous.
         assert_eq!(required_access("/api/user/checkin"), Access::User);
+        // Group administration is shared infrastructure; the caller-scoped
+        // list is the only group route a plain user may reach.
+        assert_eq!(required_access("/api/group"), Access::Admin);
+        assert_eq!(required_access("/api/prefill_group"), Access::Admin);
+        assert_eq!(required_access("/api/prefill_group/abc"), Access::Admin);
+        assert_eq!(required_access("/api/user/groups"), Access::User);
     }
 
     #[test]

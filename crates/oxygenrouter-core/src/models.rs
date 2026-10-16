@@ -824,6 +824,33 @@ pub struct Vendor {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A reusable named list for console pickers (models, tags, endpoints).
+///
+/// The reference keeps these as `prefill_groups` rows with a unique name, a
+/// `type` discriminant, and a JSON `items` array (`model/prefill_group.go:78`),
+/// which is what lets a channel or key form remember a recurring set instead of
+/// the operator retyping it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefillGroup {
+    #[serde(default)]
+    pub id: String,
+    // Defaulted so a missing field reaches the handler's own readable refusal
+    // instead of surfacing as an extractor-level deserialization error.
+    #[serde(default)]
+    pub name: String,
+    /// `model` / `tag` / `endpoint`, matching the reference's discriminator.
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub items: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Multi-key management view for a single key slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelKeyStatus {

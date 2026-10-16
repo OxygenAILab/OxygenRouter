@@ -169,6 +169,10 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     // changed nothing, and the setting that did work was invisible.
     schema!("ModelRatio", Models, String, "{}", "Per-model price ratio overrides (JSON)"),
     schema!("GroupRatio", Models, String, "{}", "Per-group price multipliers (JSON)"),
+    // The reference keeps the human labels for a group in their own map
+    // (`setting/user_usable_group.go:12`), separate from the ratio table, so a
+    // group can be renamed in the console without touching its price.
+    schema!("UserUsableGroups", Models, String, "{}", "Per-group display descriptions (JSON)"),
     // The key keeps its lowercase spelling because it *is* the storage key the
     // pricing loader has always read; renaming it to match this file's convention
     // would strand every value an existing instance has already stored here.

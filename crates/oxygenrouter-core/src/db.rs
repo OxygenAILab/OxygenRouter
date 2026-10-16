@@ -98,6 +98,25 @@ fn map_vendor(row: &rusqlite::Row<'_>) -> SqliteResult<Vendor> {
 /// Columns every vendor query selects, in the order [`map_vendor`] reads them.
 const VENDOR_COLUMNS: &str = "id,name,description,icon,status,created_at,updated_at";
 
+fn map_prefill_group(row: &rusqlite::Row<'_>) -> SqliteResult<crate::PrefillGroup> {
+    Ok(crate::PrefillGroup {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        items: json_value::<Vec<String>>(&row.get::<_, String>(3)?),
+        description: row.get(4)?,
+        created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        updated_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+/// Columns every prefill-group query selects, in [`map_prefill_group`]'s order.
+const PREFILL_GROUP_COLUMNS: &str = "id,name,kind,items,description,created_at,updated_at";
+
 fn json_object(value: &str) -> serde_json::Value {
     serde_json::from_str(value)
         .ok()
@@ -359,6 +378,20 @@ impl Database {
                 created_at          TEXT NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_checkins_user_date ON checkins(user_id, checkin_date);
+
+            -- Reusable named lists for console pickers. The unique name is what
+            -- the reference's duplicate check leans on (`model/prefill_group.go:66`):
+            -- a check-then-insert can race, the index cannot.
+            CREATE TABLE IF NOT EXISTS prefill_groups (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                kind        TEXT NOT NULL,
+                items       TEXT NOT NULL DEFAULT '[]',
+                description TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_prefill_groups_kind ON prefill_groups(kind);
 
             -- Uploaded plugins. A plugin may have several versions and one of
             -- them active, which is why the source lives beside the version
@@ -2198,6 +2231,82 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
     pub fn delete_vendor(&self, id: &str) -> SqliteResult<()> {
         self.conn.lock().execute("DELETE FROM vendors WHERE id=?1", params![id])?;
         Ok(())
+    }
+
+    // ── Prefill groups ──────────────────────────────────────────────────────
+
+    /// Reusable named lists, newest first, optionally filtered by kind.
+    pub fn list_prefill_groups(
+        &self,
+        kind: Option<&str>,
+    ) -> SqliteResult<Vec<crate::PrefillGroup>> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {PREFILL_GROUP_COLUMNS} FROM prefill_groups \
+             WHERE (?1 = '' OR kind = ?1) ORDER BY updated_at DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![kind.unwrap_or("").trim()], map_prefill_group)?;
+        rows.collect()
+    }
+
+    pub fn get_prefill_group(&self, id: &str) -> SqliteResult<Option<crate::PrefillGroup>> {
+        let conn = self.conn.lock();
+        let sql = format!("SELECT {PREFILL_GROUP_COLUMNS} FROM prefill_groups WHERE id=?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(map_prefill_group(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether another row already holds this name.
+    ///
+    /// The reference checks before writing (`model/prefill_group.go:66`); the
+    /// unique index is what makes the check advisory rather than the guard, so a
+    /// racing insert still fails instead of duplicating a name.
+    pub fn prefill_group_name_taken(
+        &self,
+        name: &str,
+        exclude_id: &str,
+    ) -> SqliteResult<bool> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM prefill_groups WHERE name=?1 AND id<>?2",
+            params![name, exclude_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn upsert_prefill_group(&self, group: &crate::PrefillGroup) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            r#"INSERT INTO prefill_groups (id,name,kind,items,description,created_at,updated_at)
+               VALUES (?1,?2,?3,?4,?5,?6,?7)
+               ON CONFLICT(id) DO UPDATE SET
+                   name=excluded.name,
+                   kind=excluded.kind,
+                   items=excluded.items,
+                   description=excluded.description,
+                   updated_at=excluded.updated_at"#,
+            params![
+                group.id,
+                group.name,
+                group.kind,
+                serde_json::to_string(&group.items).unwrap_or_else(|_| "[]".to_string()),
+                group.description,
+                group.created_at.to_rfc3339(),
+                group.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_prefill_group(&self, id: &str) -> SqliteResult<usize> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM prefill_groups WHERE id=?1", params![id])
     }
 
     /// Distinct model names seen across all channels (for the "missing metadata" view).
@@ -4699,6 +4808,47 @@ mod tests {
         assert_eq!(quiet.checkin_count, 0);
         assert_eq!(quiet.total_checkins, 2);
         assert!(quiet.records.is_empty());
+    }
+
+    /// Prefill groups round-trip, filter by kind, and report name clashes
+    /// without counting the row being edited.
+    #[test]
+    fn prefill_groups_round_trip_and_detect_duplicate_names() {
+        let db = database();
+        let now = Utc::now();
+        let group = crate::PrefillGroup {
+            id: "g1".to_string(),
+            name: "text-models".to_string(),
+            kind: "model".to_string(),
+            items: vec!["gpt-4o".to_string(), "claude-3".to_string()],
+            description: "common text models".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        db.upsert_prefill_group(&group).unwrap();
+
+        let listed = db.list_prefill_groups(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].items, vec!["gpt-4o", "claude-3"]);
+        assert_eq!(db.list_prefill_groups(Some("model")).unwrap().len(), 1);
+        assert_eq!(db.list_prefill_groups(Some("tag")).unwrap().len(), 0);
+
+        // The check excludes the row being edited, so saving an unchanged name
+        // is not a self-conflict.
+        assert!(db.prefill_group_name_taken("text-models", "").unwrap());
+        assert!(!db.prefill_group_name_taken("text-models", "g1").unwrap());
+
+        let mut updated = group.clone();
+        updated.items = vec!["gpt-4o-mini".to_string()];
+        updated.description = "trimmed".to_string();
+        db.upsert_prefill_group(&updated).unwrap();
+        let stored = db.get_prefill_group("g1").unwrap().unwrap();
+        assert_eq!(stored.items, vec!["gpt-4o-mini"]);
+        assert_eq!(stored.description, "trimmed");
+        assert_eq!(stored.name, "text-models", "a rename-less save keeps the name");
+
+        assert_eq!(db.delete_prefill_group("g1").unwrap(), 1);
+        assert!(db.list_prefill_groups(None).unwrap().is_empty());
     }
 
     /// The token allowlist used to compare addresses as strings, so a subnet

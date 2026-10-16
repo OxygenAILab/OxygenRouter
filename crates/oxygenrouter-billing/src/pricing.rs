@@ -214,6 +214,23 @@ impl Pricing {
             || self.defaults.pricing.group_ratio.contains_key(group)
     }
 
+    /// Every group the engine knows: the shipped pack's names plus overrides.
+    ///
+    /// The reference builds its group list from the same two layers
+    /// (`controller/group.go:15` reads the group-ratio copy), so a console that
+    /// offers a group cannot offer one the router would price with a default.
+    pub fn group_names(&self) -> Vec<String> {
+        let names: std::collections::BTreeSet<String> = self
+            .defaults
+            .pricing
+            .group_ratio
+            .keys()
+            .chain(self.ratio_overrides.group_ratio.keys())
+            .cloned()
+            .collect();
+        names.into_iter().collect()
+    }
+
     /// Build the legacy `PriceData` snapshot for a model in a given group.
     pub fn price_data(&self, model: &str, group: &str) -> PriceData {
         let table = |overrides: &HashMap<String, f64>,
@@ -462,6 +479,27 @@ mod tests {
         pricing.set_group_ratio("vip", 0.5);
         assert_eq!(pricing.group_ratio("vip"), 0.5);
         assert!(pricing.has_group("vip"));
+    }
+
+    /// The console's group list is the pack's names plus overrides, sorted, so a
+    /// configured group is always offered and a shipped one is never lost.
+    #[test]
+    fn group_names_are_the_pack_plus_overrides() {
+        let mut pricing = embedded();
+        let before = pricing.group_names();
+        assert!(!before.is_empty(), "the pack ships at least one group");
+        assert!(before.windows(2).all(|pair| pair[0] <= pair[1]), "sorted");
+        assert!(!before.contains(&"brand-new".to_string()));
+
+        pricing.set_group_ratio("brand-new", 2.0);
+        let after = pricing.group_names();
+        assert!(after.contains(&"brand-new".to_string()));
+        assert_eq!(after.len(), before.len() + 1);
+        // Setting an existing group again does not duplicate its name.
+        if let Some(existing) = before.first().cloned() {
+            pricing.set_group_ratio(&existing, 3.0);
+            assert_eq!(pricing.group_names().len(), after.len());
+        }
     }
 
     #[test]
