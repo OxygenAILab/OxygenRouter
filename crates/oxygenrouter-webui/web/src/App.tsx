@@ -29,7 +29,7 @@ import {
 import { I18nProvider, useI18n } from "./lib/i18nContext";
 import { ThemeProvider, useTheme } from "./lib/themeContext";
 import { ToastProvider } from "./lib/toast";
-import { AuthProvider, useAuth } from "./lib/auth";
+import { AuthProvider, isAdmin, useAuth } from "./lib/auth";
 import { api } from "./lib/api";
 import CommandPalette from "./components/CommandPalette";
 import ChannelsPage from "./pages/ChannelsPage";
@@ -102,7 +102,7 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
   // Account-scoped, so it appears only for a signed-in caller.
   if (user) navItems.push({ path: `${BASE}/security`, label: t.nav.security, icon: ShieldCheck, key: "security", count: null });
   if (user?.role === "root") navItems.push({ path: `${BASE}/model-pricing`, label: t.nav.modelPricing, icon: Calculator, key: "model-pricing", count: null });
-  if (user?.role === "admin") navItems.push({ path: `${BASE}/admin/users`, label: t.nav.users, icon: UserRound, key: "admin-users", count: null }, { path: `${BASE}/admin/billing`, label: t.nav.billing, icon: ShieldCheck, key: "admin-billing", count: null });
+  if (isAdmin(user)) navItems.push({ path: `${BASE}/admin/users`, label: t.nav.users, icon: UserRound, key: "admin-users", count: null }, { path: `${BASE}/admin/billing`, label: t.nav.billing, icon: ShieldCheck, key: "admin-billing", count: null });
   return (
     <aside className={`app-sidebar ${open ? "is-open" : ""} ${collapsed ? "is-collapsed" : ""}`}>
       <button className="mobile-close btn-ghost" onClick={onClose} aria-label="Close navigation">
@@ -200,7 +200,13 @@ function TopBar() {
     subscriptions: t.nav.subscriptions,
     admin: t.nav.users,
   };
-  const current = labelMap[label] || t.nav.overview;
+  // `/ui/admin/billing` shares the `admin` segment with `/ui/admin/users`, so the
+  // label comes from the second segment when it is the billing workspace; a
+  // single lookup by first segment labelled it "Users".
+  const current =
+    path.startsWith("admin/billing")
+      ? t.nav.billing
+      : labelMap[label] || t.nav.overview;
   const { user, logout, loading } = useAuth();
   return (
     <header className="app-topbar">

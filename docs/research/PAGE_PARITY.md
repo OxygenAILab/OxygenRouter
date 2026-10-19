@@ -51,7 +51,7 @@ Status vocabulary:
 | `/usage-logs`, `/usage-logs/audit` | `/ui/logs`, `GET /api/audit-logs` | route | audit has an API, the console has no audit view |
 | `/wallet` | `/ui/wallet` | route | |
 | `/subscriptions` | `/ui/subscriptions`, `/ui/plans` | route | |
-| `/redemption-codes` | — (API `POST /api/redemption/redeem`) | **missing page** | |
+| `/redemption-codes` | admin CRUD inside `/ui/admin/billing`, and the redeem form on `/ui/wallet` | live | a code created in the browser on 2026-10-19; the admin gate was checking `role === "admin"` and so refused the instance's own root account — see `isAdmin` |
 | `/profile` | — (fields on `/ui/settings`) | partial | |
 | `/security` | `/ui/security` over `/api/user/{2fa,sessions,token}` | live | driven live on 2026-10-19: sessions revoked, token generated/rotated/revoked, two-factor enabled with an independently generated TOTP code and then disabled |
 | `/users` | `/ui/admin/users` | route | |
@@ -87,7 +87,9 @@ workspace is not a superset section-by-section:
 4. **Task plugins page** — `/api/plugin/task*` exists (upload, activate,
    dry-run).
 5. **Redemption codes page** — redeem endpoint exists; admin CRUD exists at
-   `/api/admin/redemption-codes`.
+   `/api/admin/redemption-codes`. **Covered**: the admin CRUD lives in
+   `/ui/admin/billing` and the redeem form on `/ui/wallet`; the remaining work
+   here was the root gate, now fixed.
 6. **Audit log view** — `/api/audit-logs` exists.
 7. **Content sections** — announcements, FAQ, API info addresses, chat presets.
 8. **Perf metrics** (`/api/perf-metrics[/summary]`) — the reference's

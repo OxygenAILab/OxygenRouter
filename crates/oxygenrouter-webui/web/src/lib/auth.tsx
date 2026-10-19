@@ -21,3 +21,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   return <AuthContext.Provider value={{ user, token, loading, login, register, logout }}>{children}</AuthContext.Provider>;
 }
 export function useAuth() { const value = React.useContext(AuthContext); if (!value) throw new Error("useAuth must be used within AuthProvider"); return value; }
+
+/**
+ * Whether a signed-in account may reach the admin surfaces.
+ *
+ * The server's `Access::Admin` means "admin or root", and the instance's own
+ * bootstrap account is a root — so a page that checked for `role === "admin"`
+ * refused the owner. Every admin gate goes through this one function rather
+ * than repeating the comparison, which is how the two drifted apart.
+ */
+export function isAdmin(user: { role: string } | null | undefined): boolean {
+  return user?.role === "admin" || user?.role === "root";
+}
