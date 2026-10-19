@@ -86,6 +86,22 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     ),
     schema!("FaqEnabled", Site, Bool, "true", "Show the FAQ on the overview"),
     schema!("Faq", Site, String, "[]", "FAQ entries (JSON array of {question, answer})"),
+    // The instance's own addresses, shown to a visitor beside the endpoint box.
+    // Shape mirrors the reference's `console_setting.api_info`
+    // (`{id, url, route, description, color}`).
+    schema!("ApiInfoEnabled", Site, Bool, "true", "Show the API address list"),
+    schema!(
+        "ApiInfo",
+        Site,
+        String,
+        "[]",
+        "API addresses (JSON array of {url, route, description, color})"
+    ),
+    // Legal and about copy, served publicly like the reference's `/api/about`,
+    // `/api/user-agreement` and `/api/privacy-policy`.
+    schema!("About", Site, String, "", "About this instance (plain text)"),
+    schema!("UserAgreement", Site, String, "", "Terms of use (plain text)"),
+    schema!("PrivacyPolicy", Site, String, "", "Privacy policy (plain text)"),
     // Auth
     schema!("RegistrationEnabled", Auth, Bool, "true", "Allow new users to register"),
     schema!("PasswordLoginEnabled", Auth, Bool, "true", "Allow password based sign-in"),

@@ -283,6 +283,18 @@ export interface SiteValues {
   /** Already parsed by the server; empty when the block is switched off. */
   announcements: Announcement[];
   faq: FaqEntry[];
+  /** The instance's own addresses, already parsed and switch-gated. */
+  api_info: ApiInfo[];
+}
+
+/** One address the operator advertises, in the reference's shape. */
+export interface ApiInfo {
+  id?: number;
+  url: string;
+  route: string;
+  description: string;
+  /** A colour name: blue | green | cyan | purple | orange | red. */
+  color?: string;
 }
 
 /** One operator announcement, in the reference's shape. */
@@ -839,6 +851,12 @@ export const api = {
   },
   site: {
     get: () => apiFetch<SiteValues>('/site'),
+  },
+  legal: {
+    // Public copy: the instance's own about, terms and privacy text.
+    about: () => apiFetch<string>('/about'),
+    terms: () => apiFetch<string>('/user-agreement'),
+    privacy: () => apiFetch<string>('/privacy-policy'),
   },
   status: {
     get: () => apiFetch<SystemStatus>('/status'),

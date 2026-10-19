@@ -115,6 +115,7 @@ export const STRINGS = {
       announcements: "Announcements",
       noAnnouncements: "No announcements yet",
       faq: "Frequently asked",
+      apiAddresses: "API addresses",
       uptime: {
         title: "Service Uptime",
         subtitle: "Availability reported by Uptime Kuma",
@@ -461,6 +462,19 @@ export const STRINGS = {
       startFailed: "The cleanup was not started",
       cleared: "Cleared {n} runs",
       clearFailed: "History was not cleared",
+    },
+    static: {
+      about: "About",
+      terms: "Terms of use",
+      privacy: "Privacy policy",
+      subtitle: "Written by the operator of this instance",
+      back: "Back to the overview",
+      empty: "Nothing has been written here yet.",
+    },
+    notFound: {
+      title: "Page not found",
+      body: "That console path does not exist on this instance.",
+      back: "Back to the overview",
     },
     plugins: {
       title: "Task plugins",
@@ -949,6 +963,7 @@ export const STRINGS = {
       announcements: "公告",
       noAnnouncements: "目前暂无公告",
       faq: "常见问题",
+      apiAddresses: "API 地址",
       uptime: {
         title: "服务可用性",
         subtitle: "由 Uptime Kuma 上报的监控状态",
@@ -1296,6 +1311,19 @@ export const STRINGS = {
       startFailed: "清理未启动",
       cleared: "已清空 {n} 条记录",
       clearFailed: "记录未清空",
+    },
+    static: {
+      about: "关于",
+      terms: "使用条款",
+      privacy: "隐私政策",
+      subtitle: "由本实例的运营者撰写",
+      back: "返回概览",
+      empty: "此处尚未撰写内容。",
+    },
+    notFound: {
+      title: "页面不存在",
+      body: "本实例没有这个控制台路径。",
+      back: "返回概览",
     },
     plugins: {
       title: "任务插件",
@@ -1786,6 +1814,7 @@ export type Strings = {
     announcements: string;
     noAnnouncements: string;
     faq: string;
+    apiAddresses: string;
     uptime: {
       title: string;
       subtitle: string;
@@ -2085,6 +2114,19 @@ export type Strings = {
     clearBody: string;
     cleared: string;
     clearFailed: string;
+  };
+  static: {
+    about: string;
+    terms: string;
+    privacy: string;
+    subtitle: string;
+    back: string;
+    empty: string;
+  };
+  notFound: {
+    title: string;
+    body: string;
+    back: string;
   };
   perf: {
     title: string;

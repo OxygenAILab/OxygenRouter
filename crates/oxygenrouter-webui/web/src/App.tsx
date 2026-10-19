@@ -62,6 +62,8 @@ import TaskPluginsPage from "./pages/TaskPluginsPage";
 import AuditPage from "./pages/AuditPage";
 import PerfMetricsPage from "./pages/PerfMetricsPage";
 import SystemTasksPage from "./pages/SystemTasksPage";
+import StaticPage from "./pages/StaticPage";
+import NotFoundPage from "./pages/NotFoundPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -216,6 +218,10 @@ function TopBar() {
     "perf-metrics": t.nav.perf,
     "system-tasks": t.nav.systemTasks,
     "system-settings": t.nav.systemSettings,
+    // The instance's own copy, reachable from the overview footer.
+    about: t.static.about,
+    terms: t.static.terms,
+    privacy: t.static.privacy,
     playground: t.nav.playground,
     system: t.nav.system,
     settings: t.nav.settings,
@@ -370,6 +376,11 @@ function Shell() {
             <Route path="/ui/subscriptions" element={<SubscriptionsPage />} />
             <Route path="/ui/admin/users" element={<AdminUsersPage />} />
             <Route path="/ui/admin/billing" element={<AdminBillingPage />} />
+            <Route path="/ui/about" element={<StaticPage kind="about" />} />
+            <Route path="/ui/terms" element={<StaticPage kind="terms" />} />
+            <Route path="/ui/privacy" element={<StaticPage kind="privacy" />} />
+            {/* An unknown console path is shown as unknown rather than silently            rendered as the overview: a stale link should look wrong, not slow. */}
+            <Route path="/ui/*" element={<NotFoundPage />} />
             <Route path="*" element={<Navigate to="/ui/overview" replace />} />
           </Routes>
         </main>

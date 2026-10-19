@@ -107,6 +107,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/status", get(get_status))
         .route("/api/site", get(get_site))
+        // The instance's own copy, at the paths the reference serves it on
+        // (`router/api-router.go:31-33`): about, terms and privacy are public
+        // because a signed-out visitor is who reads them.
+        .route("/api/about", get(get_about))
+        .route("/api/user-agreement", get(get_user_agreement))
+        .route("/api/privacy-policy", get(get_privacy_policy))
         // The public price catalogue. Its payload keeps the reference's sibling
         // shape (`data` plus `vendors`/`group_ratio`/…), so it is serialised
         // directly rather than through `ApiResponse`; see `pricing_public`.
@@ -392,6 +398,10 @@ const PUBLIC_ROUTES: &[&str] = &[
     // configuration a reader should not see: the operator chose these strings to
     // be displayed.
     "/api/site",
+    // The instance's own copy, as the reference serves it above `UserAuth`.
+    "/api/about",
+    "/api/user-agreement",
+    "/api/privacy-policy",
     // The public rankings page, as the reference serves it: the header's
     // rankings module defaults to public (`middleware/header_nav.go:17`), so a
     // visitor can see the leaderboard before signing in.
@@ -4271,6 +4281,8 @@ struct SiteValues {
     /// typo in it must not take the page down.
     announcements: Vec<serde_json::Value>,
     faq: Vec<serde_json::Value>,
+    /// The instance's own addresses, already parsed and gated by its switch.
+    api_info: Vec<serde_json::Value>,
 }
 
 /// Read the four display values, each falling back to the schema's default.
@@ -4300,6 +4312,11 @@ fn site_values(s: &AppState) -> SiteValues {
     } else {
         Vec::new()
     };
+    let api_info = if s.db.typed_setting("ApiInfoEnabled", true) {
+        json_list("ApiInfo")
+    } else {
+        Vec::new()
+    };
     SiteValues {
         site_name: s.db.typed_setting("SiteName", "OxygenRouter".to_string()),
         notice: s.db.typed_setting("Notice", String::new()),
@@ -4310,11 +4327,33 @@ fn site_values(s: &AppState) -> SiteValues {
         server_address: s.db.typed_setting("ServerAddress", String::new()),
         announcements,
         faq,
+        api_info,
     }
 }
 
 async fn get_site(State(s): State<Arc<AppState>>) -> Json<ApiResponse<SiteValues>> {
     Json(ApiResponse::ok(site_values(&s)))
+}
+
+/// One of the three pieces of instance copy the reference serves publicly.
+///
+/// An unset option answers an empty string rather than 404: the page that reads
+/// it renders its own "nothing written yet" state, and a 404 would read as a
+/// missing feature rather than unwritten copy.
+fn copy_value(state: &AppState, key: &str) -> Json<ApiResponse<String>> {
+    Json(ApiResponse::ok(state.db.typed_setting(key, String::new())))
+}
+
+async fn get_about(State(s): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
+    copy_value(&s, "About")
+}
+
+async fn get_user_agreement(State(s): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
+    copy_value(&s, "UserAgreement")
+}
+
+async fn get_privacy_policy(State(s): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
+    copy_value(&s, "PrivacyPolicy")
 }
 
 /// `GET /api/pricing` — the public price catalogue.
@@ -5057,6 +5096,9 @@ mod access_tests {
             // sidebar render before any credential exists. Listed here so opening
             // it was a decision rather than a side effect.
             "/api/site",
+            "/api/about",
+            "/api/user-agreement",
+            "/api/privacy-policy",
         ] {
             assert_eq!(required_access(path), Access::Public, "{path}");
         }

@@ -1580,6 +1580,51 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* The instance's own copy: static pages, the address list and the 404 view. */
+.static-copy { padding: 18px; max-width: 78ch; }
+.static-copy p { margin: 0 0 10px; font-size: 13px; line-height: 1.85; color: var(--md-on-surface); }
+.static-copy p.is-blank { height: 6px; margin: 0; }
+.footer-links { display: inline-flex; gap: 14px; }
+.footer-links a { color: var(--md-on-surface-variant); text-decoration: none; }
+.footer-links a:hover { color: var(--md-on-surface); text-decoration: underline; text-underline-offset: 3px; }
+.api-info-list { display: grid; padding: 4px 18px 14px; }
+.api-info-entry {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--md-on-surface);
+  text-decoration: none;
+}
+.api-info-entry:last-child { border-bottom: 0; }
+.api-info-entry:hover .api-info-route { text-decoration: underline; text-underline-offset: 3px; }
+.api-info-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--md-info); }
+.api-info-dot.is-green { background: var(--md-success); }
+.api-info-dot.is-cyan { background: var(--accent-cyan); }
+.api-info-dot.is-purple { background: var(--accent-purple); }
+.api-info-dot.is-orange { background: var(--accent-amber); }
+.api-info-dot.is-red { background: var(--md-error); }
+.api-info-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.api-info-route { font-size: 12px; font-weight: 500; }
+.api-info-text small { color: var(--md-on-surface-variant); font-size: 11px; }
+.api-info-url { flex: 0 0 auto; color: var(--md-on-surface-variant); font-size: 11px; }
+.not-found {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 60vh;
+  text-align: center;
+  color: var(--md-on-surface-variant);
+}
+.not-found h1 { margin: 0; font-size: 20px; color: var(--md-on-surface); }
+
+@media (max-width: 720px) {
+  .api-info-url { display: none; }
+}
+
 /* Maintenance page: the run control and its progress. */
 .task-days { width: 84px; }
 .task-status {

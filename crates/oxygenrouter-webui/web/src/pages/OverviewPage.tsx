@@ -172,6 +172,7 @@ export default function OverviewPage() {
   const notice = site?.notice?.trim() ?? "";
   const announcements = site?.announcements ?? [];
   const faq = site?.faq ?? [];
+  const apiInfo = site?.api_info ?? [];
   const baseUrl =
     site?.server_address?.trim() ||
     (status?.listen_host && status.listen_port
@@ -456,6 +457,34 @@ export default function OverviewPage() {
         </section>
       </div>
 
+      {/* The addresses the operator advertises, shown once they have listed any. */}
+      {apiInfo.length > 0 && (
+        <section className="dashboard-section">
+          <div className="section-heading">
+            <h2>{t.dashboard.apiAddresses}</h2>
+            <span className="section-meta">{apiInfo.length}</span>
+          </div>
+          <div className="api-info-list">
+            {apiInfo.map((entry, index) => (
+              <a
+                className="api-info-entry"
+                key={`${entry.url}-${index}`}
+                href={entry.url}
+                target="_blank"
+                rel="noreferrer"
+              >
+                <span className={`api-info-dot is-${entry.color ?? "blue"}`} aria-hidden />
+                <span className="api-info-text">
+                  <span className="api-info-route">{entry.route}</span>
+                  <small>{entry.description}</small>
+                </span>
+                <span className="api-info-url font-mono">{entry.url}</span>
+              </a>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* The operator's own answers, shown once they have written any. */}
       {faq.length > 0 && (
         <section className="dashboard-section">
@@ -477,6 +506,14 @@ export default function OverviewPage() {
       {/* Watermark footer */}
       <div className="watermark-footer">
         <span>GitHub@OxygenAILab | OxygenAILab@StarsailsClover</span>
+        {/* The instance's own copy, one link each. They are console routes, so a
+            visitor without a session reaches them through the public read
+            behind them. */}
+        <span className="footer-links">
+          <Link to="/ui/about">{t.static.about}</Link>
+          <Link to="/ui/terms">{t.static.terms}</Link>
+          <Link to="/ui/privacy">{t.static.privacy}</Link>
+        </span>
       </div>
     </div>
   );
