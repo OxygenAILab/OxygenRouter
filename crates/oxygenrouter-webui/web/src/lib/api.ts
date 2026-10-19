@@ -312,6 +312,40 @@ export interface FaqEntry {
   answer: string;
 }
 
+/** Ratio sync: comparing this instance's prices with another instance's. */
+export interface SyncableChannel {
+  id: string;
+  name: string;
+  base_url: string;
+  endpoint: string;
+}
+
+export interface FieldDifference {
+  field: string;
+  local?: number;
+  upstream?: number;
+}
+
+export interface ModelDifference {
+  model_name: string;
+  differences: FieldDifference[];
+}
+
+export interface UpstreamReport {
+  name: string;
+  base_url: string;
+  endpoint: string;
+  ok: boolean;
+  error?: string;
+  upstream_models: number;
+  models: ModelDifference[];
+}
+
+export interface RatioSyncReport {
+  upstreams: UpstreamReport[];
+  new_models: string[];
+}
+
 /** One maintenance-task run (`/api/system-task*`). */
 export interface SystemTask {
   id: number;
@@ -922,7 +956,14 @@ export const api = {
       apiFetch<SystemTask>(`/system-task/log-cleanup?target_timestamp=${targetTimestamp}`, { method: "POST" }),
     get: (taskId: string) => apiFetch<SystemTask>(`/system-task/${encodeURIComponent(taskId)}`),
     clearHistory: (type = "log_cleanup") => apiFetch<number>(`/system-task/history?type=${type}`, { method: "DELETE" }),
-  },  perfMetrics: {
+  },
+  ratioSync: {
+    // Root-only: this reads another instance's price table over the network.
+    channels: () => apiFetch<SyncableChannel[]>("/ratio_sync/channels"),
+    fetch: (input: { channel_ids?: string[]; upstreams?: Array<{ name?: string; base_url: string; endpoint?: string }> }) =>
+      apiFetch<RatioSyncReport>("/ratio_sync/fetch", { method: "POST", body: JSON.stringify(input) }),
+  },
+  perfMetrics: {
     // Public, like the reference's pricing module: these figures sit beside the
     // price list.
     summary: (hours = 24) => apiFetch<PerfSummaryAll>(`/perf-metrics/summary?hours=${hours}`),

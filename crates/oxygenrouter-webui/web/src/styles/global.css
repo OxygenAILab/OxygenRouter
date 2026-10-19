@@ -1580,6 +1580,26 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* Price comparison: the source picker and the difference table. */
+.ratio-sources { display: grid; gap: 6px; }
+.ratio-source {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-thumb);
+  background: var(--md-surface);
+  cursor: pointer;
+}
+.ratio-source.is-selected { border-color: var(--accent); background: var(--md-surface-container-low); }
+.ratio-source input { accent-color: var(--accent); }
+.ratio-source-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ratio-source-text small { color: var(--md-on-surface-variant); font-size: 10px; }
+.ratio-report { display: grid; gap: 2px; padding: 10px 18px 4px; }
+.ratio-report-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 30px; }
+.ratio-new-models { display: flex; flex-wrap: wrap; gap: 6px; padding: 14px 18px 16px; }
+
 /* The instance's own copy: static pages, the address list and the 404 view. */
 .static-copy { padding: 18px; max-width: 78ch; }
 .static-copy p { margin: 0 0 10px; font-size: 13px; line-height: 1.85; color: var(--md-on-surface); }

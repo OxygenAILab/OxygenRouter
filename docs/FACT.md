@@ -1012,6 +1012,32 @@ reference's own panel is a pure reader too, but our route does not follow
 redirects (a redirect would silently move every poll somewhere else) and refuses
 a group whose slug is not a single path segment.
 
+### Ratio sync preview (2026-10-19)
+
+`GET /api/ratio_sync/channels` and `POST /api/ratio_sync/fetch` mirror the
+reference's preview half of `controller/ratio_sync.go`: enabled channels and
+explicit HTTP sources are read concurrently, and the console reports field-by-
+field differences without writing a price table. Only the fields this instance
+actually stores are compared — `model_ratio`, `completion_ratio`, `cache_ratio`,
+`create_cache_ratio` and `image_ratio` — while an absent upstream field is
+skipped rather than treated as zero. Models that only the source prices are
+returned separately as new models, and one unreachable source leaves the
+remaining reports intact.
+
+`/ui/ratio-sync` is root-only and links to the versioned pricing editor for the
+actual save. Applying the reference's full field/source matrix remains open:
+official preset, models.dev and OpenRouter conversion, `model_price` and audio
+fields, and the reference's richer `differences` / `prices` response.
+
+Verified live (`.devlogs/live_task/check_ratio_sync.ps1` against the
+`ratio_upstream.py` mock on 18093): an explicit upstream produced the
+`gpt-4o` `model_ratio` / `completion_ratio` / `cache_ratio` differences and the
+`brand-new-model` source-only row; the pricing snapshot still had no configured
+ratio afterward; a dead source was isolated; a channel could be named as the
+source; the empty request answered `400`; anonymous read `401`; plain-user read
+`403`. The page was driven in the browser and showed six field differences plus
+one source-only model. Workspace suite: 654/0; frontend production build passed.
+
 ## Open questions
 - _None recorded_
 

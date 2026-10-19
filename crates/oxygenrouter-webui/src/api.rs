@@ -134,6 +134,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/system-task/current",
             get(crate::system_tasks::current_task),
         )
+        // Ratio sync, matching the reference's `/ratio_sync` group (`router/api-router.go:247-250`).
+        // A preview: `/fetch` reports differences and writes nothing.
+        .route(
+            "/api/ratio_sync/channels",
+            get(crate::ratio_sync::list_syncable_channels),
+        )
+        .route(
+            "/api/ratio_sync/fetch",
+            post(crate::ratio_sync::fetch_upstreams),
+        )
         .route("/api/system-task/list", get(crate::system_tasks::list_tasks))
         .route(
             "/api/system-task/history",
@@ -451,14 +461,15 @@ const ROOT_PREFIXES: &[&str] = &[
     // (`router/api-router.go:322`). This entry was removed once because nothing
     // served it; it is back because `/api/system-task/*` now does.
     "/api/system-task",
-    // Two of the three this list used to carry -- `/api/ratio_sync` and
-    // `/api/custom-oauth-provider` -- were removed rather than given empty
-    // endpoints. Each promised a subsystem the reference has and this instance
-    // does not: syncing upstream price tables, and operator-registered OAuth
-    // providers. Listing them here claimed those trees existed and were
-    // root-protected when there was nothing behind them at all, which is the
-    // exact shape of defect this project keeps finding: a promise in one place
-    // and nothing in the other. They belong here again when the subsystem does.
+    // The price-table comparison, also `RootAuth` upstream.
+    "/api/ratio_sync",
+    // One prefix this list used to carry -- `/api/custom-oauth-provider` -- was
+    // removed rather than given an empty endpoint: it promised a subsystem the
+    // reference has and this instance does not, namely operator-registered OAuth
+    // providers. Listing it here claimed that tree existed and was
+    // root-protected when there was nothing behind it, which is the exact shape
+    // of defect this project keeps finding: a promise in one place and nothing
+    // in the other. It belongs here again when the subsystem does.
     // Who changed what. Sensitive precisely because it is complete, and it names
     // the accounts that hold power.
     "/api/audit-logs",
@@ -5608,6 +5619,7 @@ mod classification_audit_tests {
             include_str!("pricing_public.rs"),
             include_str!("perf_metrics.rs"),
             include_str!("system_tasks.rs"),
+            include_str!("ratio_sync.rs"),
         );
         let mut out = Vec::new();
         let mut rest = source;

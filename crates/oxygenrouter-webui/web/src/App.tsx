@@ -7,6 +7,7 @@ import {
   Calculator,
   ChevronRight,
   Cpu,
+  Download,
   FileText,
   Gauge,
   Info,
@@ -64,6 +65,7 @@ import PerfMetricsPage from "./pages/PerfMetricsPage";
 import SystemTasksPage from "./pages/SystemTasksPage";
 import StaticPage from "./pages/StaticPage";
 import NotFoundPage from "./pages/NotFoundPage";
+import RatioSyncPage from "./pages/RatioSyncPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -123,6 +125,7 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
     { path: `${BASE}/audit`, label: t.nav.audit, icon: ScrollText, key: "audit", count: null },
     // Rewriting the instance's own history is the owner's, like the audit trail.
     { path: `${BASE}/system-tasks`, label: t.nav.systemTasks, icon: Wrench, key: "system-tasks", count: null },
+    { path: `${BASE}/ratio-sync`, label: t.nav.ratioSync, icon: Download, key: "ratio-sync", count: null },
   );
   if (isAdmin(user)) navItems.push({ path: `${BASE}/admin/users`, label: t.nav.users, icon: UserRound, key: "admin-users", count: null }, { path: `${BASE}/admin/billing`, label: t.nav.billing, icon: ShieldCheck, key: "admin-billing", count: null });
   return (
@@ -217,6 +220,7 @@ function TopBar() {
     audit: t.nav.audit,
     "perf-metrics": t.nav.perf,
     "system-tasks": t.nav.systemTasks,
+    "ratio-sync": t.nav.ratioSync,
     "system-settings": t.nav.systemSettings,
     // The instance's own copy, reachable from the overview footer.
     about: t.static.about,
@@ -360,6 +364,7 @@ function Shell() {
             <Route path="/ui/audit" element={<AuditPage />} />
             <Route path="/ui/perf-metrics" element={<PerfMetricsPage />} />
             <Route path="/ui/system-tasks" element={<SystemTasksPage />} />
+            <Route path="/ui/ratio-sync" element={<RatioSyncPage />} />
             {/* The reference publishes the catalogue at `/pricing`; an existing
                 link keeps working rather than landing on the SPA fallback. */}
             <Route path="/pricing" element={<Navigate to="/ui/pricing" replace />} />

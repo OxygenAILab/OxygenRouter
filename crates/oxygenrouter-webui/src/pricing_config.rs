@@ -137,6 +137,17 @@ pub struct PricingMaps {
     raw: BTreeMap<String, String>,
 }
 
+impl PricingMaps {
+    /// The models the operator has set a ratio for.
+    ///
+    /// The three tables stay private so nothing outside this module can rewrite
+    /// them without going through `apply`; this is the one read another module
+    /// needs, for the price-table comparison.
+    pub fn ratio_names(&self) -> Vec<String> {
+        self.ratio.keys().cloned().collect()
+    }
+}
+
 /// Read the three price tables from the option store.
 ///
 /// A blob that is not a JSON object is an error rather than a silent empty

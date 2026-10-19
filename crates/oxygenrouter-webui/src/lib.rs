@@ -12,6 +12,7 @@ pub mod pricing_config;
 pub mod pricing_public;
 pub mod proxy;
 pub mod rankings;
+pub mod ratio_sync;
 mod state;
 pub mod system_tasks;
 pub mod task_transport;

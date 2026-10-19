@@ -511,8 +511,13 @@ with all three client dialects.
 - ✅ **Pricing config**: snapshot / preview / convert / versioned batch update /
   reset at `/api/option/model_pricing*`, with a console editor page. Verified
   live against a charge (see `docs/FACT.md`).
-- ❌ **Ratio sync**: from official preset / models.dev / channels (OpenRouter + models.dev
-  conversion).
+- 🔶 **Ratio sync**: root-only `/api/ratio_sync/{channels,fetch}` plus
+  `/ui/ratio-sync` compare enabled channels and explicit HTTP sources across
+  five ratio fields, report source-only models, survive one dead source, and
+  write nothing (saving stays in the versioned pricing editor). Live-verified
+  2026-10-19 with `.devlogs/live_task/check_ratio_sync.ps1`. Official preset,
+  models.dev / OpenRouter conversion, the remaining price fields, and the
+  reference's full selection response are still missing.
 - ✅ **Perf metrics**: latency / success rate / throughput by model, group and
   hour, at `/api/perf-metrics[/summary]` and `/ui/perf-metrics` (the root-only
   `/api/performance/*` diagnostics remain a separate surface). Time to first

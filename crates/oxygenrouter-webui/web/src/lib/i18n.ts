@@ -56,6 +56,7 @@ export const STRINGS = {
       audit: "Audit trail",
       perf: "Performance",
       systemTasks: "Maintenance",
+      ratioSync: "Price comparison",
       security: "Security",
       pricing: "Pricing",
       wallet: "Wallet",
@@ -470,6 +471,30 @@ export const STRINGS = {
       subtitle: "Written by the operator of this instance",
       back: "Back to the overview",
       empty: "Nothing has been written here yet.",
+    },
+    ratioSync: {
+      title: "Price comparison",
+      description: "See how another instance's price table differs from this one",
+      openEditor: "Open the pricing editor",
+      sources: "Sources",
+      previewNote: "A preview: nothing is written until you save it in the editor",
+      noChannels: "No channel can be used as a source yet.",
+      manualPlaceholder: "or paste an instance URL…",
+      compare: "Compare",
+      compared: "Read {n} sources",
+      compareFailed: "The comparison did not run",
+      results: "Differences",
+      differences: "differences",
+      models: "models",
+      changed: "changed",
+      noDifferences: "No price differs from this instance.",
+      newModels: "Priced only by the source",
+      newModelsHint: "Nothing here prices these models yet",
+      source: "Source",
+      model: "Model",
+      field: "Field",
+      local: "Here",
+      upstream: "There",
     },
     notFound: {
       title: "Page not found",
@@ -904,6 +929,7 @@ export const STRINGS = {
       audit: "审计日志",
       perf: "性能指标",
       systemTasks: "维护任务",
+      ratioSync: "价目对比",
       security: "账户安全",
       pricing: "价格目录",
       wallet: "钱包",
@@ -1319,6 +1345,30 @@ export const STRINGS = {
       subtitle: "由本实例的运营者撰写",
       back: "返回概览",
       empty: "此处尚未撰写内容。",
+    },
+    ratioSync: {
+      title: "价目对比",
+      description: "查看另一个实例的价目表与本实例的差异",
+      openEditor: "打开定价编辑器",
+      sources: "同步来源",
+      previewNote: "仅为预览：在编辑器里保存前不会写入任何价格",
+      noChannels: "暂无可作为来源的渠道。",
+      manualPlaceholder: "或粘贴一个实例地址…",
+      compare: "开始对比",
+      compared: "已读取 {n} 个来源",
+      compareFailed: "对比未执行",
+      results: "差异明细",
+      differences: "处差异",
+      models: "个模型",
+      changed: "个有变化",
+      noDifferences: "没有与本实例不同的价格。",
+      newModels: "仅来源定价的模型",
+      newModelsHint: "本实例尚未为这些模型定价",
+      source: "来源",
+      model: "模型",
+      field: "字段",
+      local: "本机",
+      upstream: "对端",
     },
     notFound: {
       title: "页面不存在",
@@ -1756,6 +1806,7 @@ export type Strings = {
     audit: string;
     perf: string;
     systemTasks: string;
+    ratioSync: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -2127,6 +2178,30 @@ export type Strings = {
     title: string;
     body: string;
     back: string;
+  };
+  ratioSync: {
+    title: string;
+    description: string;
+    openEditor: string;
+    sources: string;
+    previewNote: string;
+    noChannels: string;
+    manualPlaceholder: string;
+    compare: string;
+    compared: string;
+    compareFailed: string;
+    results: string;
+    differences: string;
+    models: string;
+    changed: string;
+    noDifferences: string;
+    newModels: string;
+    newModelsHint: string;
+    source: string;
+    model: string;
+    field: string;
+    local: string;
+    upstream: string;
   };
   perf: {
     title: string;
