@@ -1,0 +1,114 @@
+# Page parity: NewAPI's console vs this instance
+
+> GitHub@OxygenAILab | OxygenAILab@StarsailsClover
+
+The goal this document serves is "page-by-page parity with NewAPI, verified live".
+It is the checklist that decides when that is true, so every row names both the
+reference page and the evidence for this instance's state.
+
+## Method
+
+| List | Source |
+|---|---|
+| Reference client routes | `web/src/routes/**` of `QuantumNous/new-api` @ `c2b7a9a` (TanStack Router file routes; 64 route files, 5 of them error pages) |
+| Reference settings sections | `web/src/features/system-settings/*/section-registry.tsx` — **40 sections** in 8 groups |
+| Our console routes | `crates/oxygenrouter-webui/web/src/App.tsx` `path="/ui/..."` — **20 routes** |
+| Our API surface | `crates/oxygenrouter-webui/src/api.rs` route table + `Access` classification |
+
+Status vocabulary:
+
+* **live** — driven against a running instance in this repository's fixture
+  harness (`.devlogs/live_task/`) or rendered in the browser during review.
+* **route** — the page or endpoint exists in source; not driven end to end this
+  session.
+* **missing** — no counterpart. This is the work list.
+
+## 1. Public (signed-out) pages
+
+| Reference route | Reference page | Ours | Status |
+|---|---|---|---|
+| `/` | landing / home content | `/ui/overview` (same page signed in or out) | live |
+| `/pricing`, `/pricing/:modelId` | public price catalogue and per-model detail | — | **missing** |
+| `/rankings` | public model rankings | API `GET /api/rankings` exists (`rankings.rs`), no page | **missing page** |
+| `/about` | about copy | — | **missing** |
+| `/privacy-policy`, `/user-agreement` | legal copy | — | **missing** |
+| `/setup` | first-run setup wizard | bootstrap admin is created on first start (`ensure_bootstrap_admin`) | different by design |
+| `(auth)/sign-in`, `/sign-up` | sign in / register | `/ui/sign-in`, `/ui/sign-up` | route |
+| `(auth)/forgot-password`, `/reset`, `/user/reset` | password reset by email | — | **missing** |
+| `(auth)/otp` | one-time-code step | sign-in accepts a 2FA code in the same form | different by design |
+| `(auth)/oauth`, `/oauth/:provider` | six OAuth providers | — | **missing** |
+| `(errors)/401,403,404,500,503`, `_authenticated/errors/$error` | error pages | SPA fallback only | **missing** |
+
+## 2. Signed-in pages
+
+| Reference route | Ours | Status | Notes |
+|---|---|---|---|
+| `/dashboard`, `/dashboard/$section` | `/ui/overview`, `/ui/analytics` | live | uptime panel and pricing page driven in the browser on 2026-10-19 |
+| `/channels` | `/ui/channels` | route | channel CRUD, key rotation, model fetch |
+| `/keys` | `/ui/keys` | route | create / edit / reveal |
+| `/models`, `/models/$section` | `/ui/models`, `/ui/model-registry`, `/ui/model-pricing` | live | pricing page driven live; registry route exists |
+| `/playground` | `/ui/playground` | route | |
+| `/usage-logs`, `/usage-logs/audit` | `/ui/logs`, `GET /api/audit-logs` | route | audit has an API, the console has no audit view |
+| `/wallet` | `/ui/wallet` | route | |
+| `/subscriptions` | `/ui/subscriptions`, `/ui/plans` | route | |
+| `/redemption-codes` | — (API `POST /api/redemption/redeem`) | **missing page** | |
+| `/profile` | — (fields on `/ui/settings`) | partial | |
+| `/security` | — (API: `/api/user/2fa/*`, `/api/user/sessions`, `/api/user/token`) | **missing page** | |
+| `/users` | `/ui/admin/users` | route | |
+| `/task-plugins` | — (API: `/api/plugin/task*`) | **missing page** | |
+| `/system-info` | `/ui/system` | route | |
+| `/chat`, `/chat2link` | — | **missing** | reference's own chat UI, not a gateway feature |
+
+## 3. Settings workspace
+
+The reference splits its admin settings into 8 groups and 40 sections; this
+instance serves one option catalogue (`OPTION_SCHEMA`, 50 keys) behind
+`/ui/system-settings`. Functionally the same settings are reachable, but the
+workspace is not a superset section-by-section:
+
+| Group | Sections | Ours |
+|---|---|---|
+| site | 4 | partly (`SiteName`, `Notice`, `Footer`, `ServerAddress`) |
+| auth | 5 | partly (registration, password policy, session TTL) |
+| billing | 6 | partly (`QuotaPerUnit`, pre-consume, trust quota, currency) |
+| models | 5 | partly (pricing tables, model sync interval) |
+| operations | 7 | partly (log retention, data export, check-in) |
+| security | 3 | partly (fetch/SSRF policy, audit log, login attempts) |
+| request-policies | 3 | **missing** (the reference's request-policy editor) |
+| content | 7 | partly (uptime groups landed; announcements/FAQ/API info missing) |
+
+## 4. Work list, in the order that unblocks the most
+
+1. **Rankings page** — the public leaderboard; the API is already live
+   (`rankings.rs`), so this is one page.
+2. **Public pricing page** (`/ui/pricing`, per-model detail) — reuses
+   `/api/option/model_pricing` for the operator view; the public view needs a
+   read-only projection without the tables' raw blobs.
+3. **Security page** (`/ui/security`) — 2FA, sessions and access token all have
+   endpoints and no UI.
+4. **Task plugins page** — `/api/plugin/task*` exists (upload, activate,
+   dry-run).
+5. **Redemption codes page** — redeem endpoint exists; admin CRUD exists at
+   `/api/admin/redemption-codes`.
+6. **Audit log view** — `/api/audit-logs` exists.
+7. **Content sections** — announcements, FAQ, API info addresses, chat presets.
+8. **Perf metrics** (`/api/perf-metrics[/summary]`) — the reference's
+   latency/throughput page; needs recording on the relay path first.
+9. **Ratio sync** (`/api/ratio_sync`) — upstream price-table sync.
+10. **System tasks** (`/api/system-task/*`) — scheduled log cleanup with
+    progress; the reference's five routes.
+11. **Legal / about / error pages** — static copy and error views.
+12. **OAuth + password reset** — the only auth surfaces still missing.
+
+## 5. What "superset" will mean here
+
+A page counts as done when, in addition to existing, it has been driven against
+a live instance and its effect observed:
+
+* a page load with real data (browser, screenshot in the session log), and
+* a probe in `.devlogs/live_task/` that asserts the behaviour the page exists
+  for, or
+* an existing probe that covers it, named in this table.
+
+Rows marked **missing** are the honest remainder; the objective is not met while
+any of them remains.

@@ -941,6 +941,41 @@ OpenAI-compatible adaptor is covered as soon as it is registered. Reverting
 `Ollama`'s `request_url` or `convert_request` to the old verbatim behaviour makes
 it fail (mutation-verified).
 
+### Per-model pricing editor (2026-10-19)
+
+`GET`/`PATCH /api/option/model_pricing`, `POST /api/option/model_pricing/preview`,
+`POST /api/option/model_pricing/convert` and `POST /api/option/reset_model_pricing`
+(plus the reference's own misspelled `POST /api/option/rest_model_ratio` alias)
+give the console an editor for the three price tables the billing engine reads:
+`ModelRatio`, `billing_expr` and `billing_mode`. The reference gates that whole
+group on `RootAuth` (`router/api-router.go:203-214`), so all five routes are root
+here too.
+
+Two properties are deliberate:
+
+| Property | Why |
+|---|---|
+| `effective` comes from the engine, not a second table | The preview builds a throwaway pricing set, applies the instance's tables, applies the draft, and reads back `mode` / `expression` / `price_data`. A hand-written defaults table drifts silently, and the drift only shows up as a bill that disagrees with the console |
+| Every save names a version, and the three tables move in one transaction | The version is a sha256 of the model's stored values, so a stale tab is refused with `409` instead of overwriting; the transaction prevents an expression landing while the mode still says `ratio` |
+
+The conversion preview turns a legacy ratio into the equivalent tiered
+expression: ratio unit → USD per million (`ratio * 1e6 / QuotaPerUnit`), then one
+term per component the ratio path would charge, with `cr`/`cc`/`img` written only
+when their multiplier is not 1 — the engine folds those tokens into `p` when the
+term is absent (`expr.rs`, the auto-exclusion rule). A model already on the
+expression path, a per-call price, or an unpriced model returns an
+`unsupported_reason` rather than a wrong expression.
+
+Verified live (`.devlogs/live_task/check_pricing.ps1` against the mock chat
+upstream on 18092): a fresh model reported an empty `configured` and a `version`
+equal to `empty_version`; preview and convert stored nothing; a ratio of 3.0
+previewed as `$6.00 / M` for input and output; convert produced
+`tier("base", p * 6 + c * 6)`; a stale save answered `409`; reset restored the
+inherited price; an anonymous read answered `401` and a plain user's read `403`;
+and a real chat request (10 prompt / 2 completion tokens) was charged **36
+micros, exactly what the preview predicted**. Workspace suite 640/0, and the
+console page was driven in the browser (search, edit, preview).
+
 ### Uptime-Kuma status panel (2026-10-19)
 
 The overview can show the health of the services behind the gateway, read from

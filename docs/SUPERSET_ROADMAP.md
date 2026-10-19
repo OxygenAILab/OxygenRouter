@@ -508,7 +508,9 @@ with all three client dialects.
 - ✅ **Vendor metadata** CRUD (list/search/get/create/update/delete on
   `/api/vendors`, with a derived `model_count`). Merge/multi-select operations
   (`/api/vendors/operations`) are not implemented.
-- ❌ **Pricing config**: snapshot/preview/convert/batch-update/reset.
+- ✅ **Pricing config**: snapshot / preview / convert / versioned batch update /
+  reset at `/api/option/model_pricing*`, with a console editor page. Verified
+  live against a charge (see `docs/FACT.md`).
 - ❌ **Ratio sync**: from official preset / models.dev / channels (OpenRouter + models.dev
   conversion).
 - ❌ **Perf metrics page**: latency/throughput by model/group/hour. (The
