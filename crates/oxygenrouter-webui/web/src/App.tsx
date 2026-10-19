@@ -227,6 +227,8 @@ function TopBar() {
     "404": t.notFound.title,
     "500": t.errors.serverTitle,
     "503": t.errors.maintenanceTitle,
+    "sign-in": t.saas.signIn,
+    "sign-up": t.saas.signUp,
     "system-settings": t.nav.systemSettings,
     // The instance's own copy, reachable from the overview footer.
     about: t.static.about,
