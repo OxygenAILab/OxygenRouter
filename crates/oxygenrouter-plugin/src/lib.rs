@@ -1059,6 +1059,12 @@ impl PluginHost {
     }
 
     /// Call one hook, passing and receiving JSON.
+    ///
+    /// Dispatches the same way the internal callers do: a driver hook is a
+    /// top-level export, anything else is a protocol member. Calling
+    /// `call_with_args` directly here meant the console's dry run could not call
+    /// a single driver hook — it answered `has no protocol member
+    /// "buildSubmitRequest"` for a plugin that exports exactly that function.
     pub async fn call_hook(
         &self,
         key: &str,
@@ -1066,7 +1072,7 @@ impl PluginHost {
         input: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, PluginError> {
-        self.call_with_args(key, hook, &[input], timeout).await
+        self.call_hook_args(key, hook, &[input], timeout).await
     }
 
     /// `protocols.<protocol>.decodeRequest(ctx)` — the client request, turned
@@ -3745,6 +3751,26 @@ export function parseTaskResult() {{ return {{}}; }}
 
     /// A plugin that throws at *call* time is reported, and a member that does
     /// not exist is distinguished from one that failed.
+    ///
+    /// The dry-run endpoint reaches plugins through `call_hook`, so a driver hook
+    /// has to dispatch as an export there too. It did not: `call_hook` went
+    /// straight to the protocol-member path, and every driver hook came back as
+    /// `has no protocol member "<hook>"`.
+    #[test]
+    fn a_driver_hook_is_reachable_through_call_hook() {
+        let host = PluginHost::start();
+        runtime().block_on(async {
+            host.load(DEMO.to_string(), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("load");
+            let value = host
+                .call_hook("demo", "buildSubmitRequest", serde_json::json!({}), DEFAULT_CALL_TIMEOUT)
+                .await
+                .expect("a driver hook must be callable");
+            assert_eq!(value, serde_json::json!({}));
+        });
+    }
+
     #[test]
     fn call_time_failures_are_reported() {
         let host = PluginHost::start();
