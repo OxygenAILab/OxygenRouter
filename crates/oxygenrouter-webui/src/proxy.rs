@@ -1028,6 +1028,27 @@ async fn read_body(req: Request) -> (axum::http::HeaderMap, Vec<u8>) {
     (headers, body_bytes.to_vec())
 }
 
+/// Fold one finished relay request into the performance counters.
+///
+/// The switch is the same one that governs the usage summary: both are kept
+/// aggregates rather than the raw log, so "do not aggregate my traffic" has to
+/// mean both or it means neither.
+fn record_perf(
+    state: &AppState,
+    model: &str,
+    group: &str,
+    duration_ms: i64,
+    status: u16,
+    output_tokens: i64,
+) {
+    if !state.data_export_enabled() {
+        return;
+    }
+    state
+        .perf
+        .record(model, group, duration_ms, status < 400, output_tokens);
+}
+
 fn log_request(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1665,8 +1686,18 @@ async fn dispatch(
     drop(scheduler);
     let duration_ms = start.elapsed().as_millis() as i64;
 
+    // The group a request bills in is also the group it is measured in, so the
+    // performance row and the wallet row describe the same traffic. A
+    // channel-only deployment has no reservation, and then the instance default
+    // is the group the request used.
+    let perf_group = reservation
+        .as_ref()
+        .map(|(_, _, _, _, group, _)| group.clone())
+        .unwrap_or_else(|| state.default_group());
+
     match result {
         Ok(r) => {
+            record_perf(&state, &model, &perf_group, duration_ms, r.status, r.usage.completion_tokens);
             let total_tokens = r.usage.total_tokens;
             let tokens_used = if total_tokens > 0 {
                 Some(total_tokens)
@@ -1756,6 +1787,9 @@ async fn dispatch(
         }
         Err(e) => {
             let status = e.status();
+            // A failed request is a data point, not a gap: half of what this
+            // metric exists for is the failure rate.
+            record_perf(&state, &model, &perf_group, duration_ms, status, 0);
             // A failed request must cost nothing: return the reservation.
             if let Some((session, _reserved, key_id, user_id, _group, funding)) = &reservation {
                 if let Err(error) =

@@ -367,6 +367,23 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_quota_data_bucket ON quota_data(bucket_at DESC);
 
+            -- Per-model, per-group hourly performance, the durable half of the
+            -- console's latency/throughput view. The unique key makes the flush
+            -- an accumulation rather than a duplicate insert, and it is enforced
+            -- here rather than by the writer remembering to look first.
+            CREATE TABLE IF NOT EXISTS perf_metrics (
+                model_name       TEXT NOT NULL,
+                group_name       TEXT NOT NULL,
+                bucket_ts        INTEGER NOT NULL,
+                request_count    INTEGER NOT NULL DEFAULT 0,
+                success_count    INTEGER NOT NULL DEFAULT 0,
+                total_latency_ms INTEGER NOT NULL DEFAULT 0,
+                output_tokens    INTEGER NOT NULL DEFAULT 0,
+                generation_ms    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (model_name, group_name, bucket_ts)
+            );
+            CREATE INDEX IF NOT EXISTS idx_perf_metrics_bucket ON perf_metrics(bucket_ts DESC);
+
             -- Daily check-in claims. The unique index is the once-a-day guard;
             -- a read-then-write check in the handler would let two simultaneous
             -- taps both pass before either wrote.
@@ -1952,6 +1969,106 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
                 quota: r.get(9)?,
                 token_used: r.get(10)?,
                 created_at: parse(r.get(11)?),
+            })
+        })?;
+        rows.collect()
+    }
+
+    // ── Relay performance (perf_metrics) ─────────────────────────────────────
+
+    /// Add one batch of hourly performance rows, accumulating into existing
+    /// buckets.
+    ///
+    /// One transaction for the batch: a crash halfway through would leave the
+    /// counters of one hour split across a write that happened and one that did
+    /// not, which a reader cannot detect afterwards.
+    pub fn upsert_perf_metrics(&self, rows: &[crate::PerfMetric]) -> SqliteResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for row in rows {
+            tx.execute(
+                r#"INSERT INTO perf_metrics
+                     (model_name,group_name,bucket_ts,request_count,success_count,total_latency_ms,output_tokens,generation_ms)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                   ON CONFLICT(model_name,group_name,bucket_ts)
+                   DO UPDATE SET request_count    = request_count + excluded.request_count,
+                                 success_count    = success_count + excluded.success_count,
+                                 total_latency_ms = total_latency_ms + excluded.total_latency_ms,
+                                 output_tokens    = output_tokens + excluded.output_tokens,
+                                 generation_ms    = generation_ms + excluded.generation_ms"#,
+                params![
+                    row.model_name,
+                    row.group_name,
+                    row.bucket_ts,
+                    row.request_count,
+                    row.success_count,
+                    row.total_latency_ms,
+                    row.output_tokens,
+                    row.generation_ms
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hourly rows for one model inside a window, oldest first.
+    ///
+    /// `group` narrows the read when an operator asks about one group; `None`
+    /// returns every group the model ran in.
+    pub fn list_perf_metrics(
+        &self,
+        model: &str,
+        group: Option<&str>,
+        from: i64,
+        to: i64,
+    ) -> SqliteResult<Vec<crate::PerfMetric>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model_name,group_name,bucket_ts,request_count,success_count,total_latency_ms,output_tokens,generation_ms \
+             FROM perf_metrics \
+             WHERE model_name=?1 AND bucket_ts >= ?2 AND bucket_ts <= ?3 AND (?4 IS NULL OR group_name = ?4) \
+             ORDER BY bucket_ts ASC",
+        )?;
+        let rows = stmt.query_map(params![model, from, to, group], |r| {
+            Ok(crate::PerfMetric {
+                model_name: r.get(0)?,
+                group_name: r.get(1)?,
+                bucket_ts: r.get(2)?,
+                request_count: r.get(3)?,
+                success_count: r.get(4)?,
+                total_latency_ms: r.get(5)?,
+                output_tokens: r.get(6)?,
+                generation_ms: r.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Every model's hourly rows inside a window, oldest first.
+    pub fn list_perf_metric_buckets(
+        &self,
+        from: i64,
+        to: i64,
+    ) -> SqliteResult<Vec<crate::PerfMetric>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model_name,group_name,bucket_ts,request_count,success_count,total_latency_ms,output_tokens,generation_ms \
+             FROM perf_metrics WHERE bucket_ts >= ?1 AND bucket_ts <= ?2 ORDER BY bucket_ts ASC",
+        )?;
+        let rows = stmt.query_map(params![from, to], |r| {
+            Ok(crate::PerfMetric {
+                model_name: r.get(0)?,
+                group_name: r.get(1)?,
+                bucket_ts: r.get(2)?,
+                request_count: r.get(3)?,
+                success_count: r.get(4)?,
+                total_latency_ms: r.get(5)?,
+                output_tokens: r.get(6)?,
+                generation_ms: r.get(7)?,
             })
         })?;
         rows.collect()

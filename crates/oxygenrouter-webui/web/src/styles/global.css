@@ -1580,6 +1580,30 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* Performance page: the hourly series and the per-group breakdown. */
+.perf-charts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 14px 18px 4px;
+}
+.perf-chart { min-width: 0; }
+.perf-group-list { display: grid; gap: 2px; padding: 10px 18px 16px; }
+.perf-group-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 70px 80px 90px 80px;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  border-bottom: 1px solid var(--hairline);
+}
+.perf-group-row:last-child { border-bottom: 0; }
+.perf-group-row span:not(:first-child) { text-align: right; color: var(--md-on-surface-variant); }
+
+@media (max-width: 900px) {
+  .perf-charts { grid-template-columns: 1fr; }
+}
+
 /* Operator copy on the overview: announcements and the FAQ. */
 .announcement-list { display: grid; margin: 0; padding: 4px 0; list-style: none; }
 .announcement-item {

@@ -453,6 +453,32 @@ pub struct AuditLog {
     pub created_at: DateTime<Utc>,
 }
 
+/// One hour of relay performance, summed across requests.
+///
+/// The reference keeps this in its own `perf_metrics` table rather than deriving
+/// it from the request log, because a log is pruned on `LogRetentionDays` and a
+/// long-range chart built by scanning it silently loses its left edge. The grain
+/// is the same: one row per hour per (model, group).
+///
+/// Deliberately absent: the reference's `ttft_sum_ms` / `ttft_count`. This
+/// instance buffers a streamed upstream body before it translates it, so it has
+/// no first-token timestamp to record — a column filled with zeros would look
+/// like a measured zero.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfMetric {
+    pub model_name: String,
+    pub group_name: String,
+    /// Unix seconds, aligned to the hour the requests started in.
+    pub bucket_ts: i64,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub total_latency_ms: i64,
+    pub output_tokens: i64,
+    /// Time spent producing the answer, which is the whole latency for a
+    /// buffered reply.
+    pub generation_ms: i64,
+}
+
 /// One hour of usage, summed across requests.
 ///
 /// `DataExportEnabled` was advertised as "Aggregate usage into quota_data for

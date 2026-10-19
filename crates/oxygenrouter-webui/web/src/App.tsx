@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Cpu,
   FileText,
+  Gauge,
   Info,
   Key,
   MessageSquare,
@@ -58,6 +59,7 @@ import PricingPage from "./pages/PricingPage";
 import SecurityPage from "./pages/SecurityPage";
 import TaskPluginsPage from "./pages/TaskPluginsPage";
 import AuditPage from "./pages/AuditPage";
+import PerfMetricsPage from "./pages/PerfMetricsPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -87,6 +89,8 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
     { path: `${BASE}/rankings`, label: t.nav.rankings, icon: Trophy, key: "rankings", count: null },
     // Also public: the price list is what a visitor compares against.
     { path: `${BASE}/pricing`, label: t.nav.pricing, icon: Receipt, key: "pricing", count: null },
+    // Also public, like the pricing list it sits beside.
+    { path: `${BASE}/perf-metrics`, label: t.nav.perf, icon: Gauge, key: "perf-metrics", count: null },
     { path: `${BASE}/channels`, label: t.nav.channels, icon: Server, key: "channels", count: enabledChannels > 0 ? enabledChannels : null, total: totalChannels },
     { path: `${BASE}/keys`, label: t.nav.keys, icon: Key, key: "keys", count: totalKeys > 0 ? totalKeys : null },
     { path: `${BASE}/routes`, label: t.nav.routes, icon: RouteIcon, key: "routes", count: totalMaps > 0 ? totalMaps : null },
@@ -205,6 +209,7 @@ function TopBar() {
     security: t.nav.security,
     "task-plugins": t.nav.plugins,
     audit: t.nav.audit,
+    "perf-metrics": t.nav.perf,
     "system-settings": t.nav.systemSettings,
     playground: t.nav.playground,
     system: t.nav.system,
@@ -342,6 +347,7 @@ function Shell() {
             <Route path="/ui/security" element={<SecurityPage />} />
             <Route path="/ui/task-plugins" element={<TaskPluginsPage />} />
             <Route path="/ui/audit" element={<AuditPage />} />
+            <Route path="/ui/perf-metrics" element={<PerfMetricsPage />} />
             {/* The reference publishes the catalogue at `/pricing`; an existing
                 link keeps working rather than landing on the SPA fallback. */}
             <Route path="/pricing" element={<Navigate to="/ui/pricing" replace />} />

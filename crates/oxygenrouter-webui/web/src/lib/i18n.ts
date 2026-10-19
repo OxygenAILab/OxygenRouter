@@ -54,6 +54,7 @@ export const STRINGS = {
       rankings: "Rankings",
       plugins: "Task Plugins",
       audit: "Audit trail",
+      perf: "Performance",
       security: "Security",
       pricing: "Pricing",
       wallet: "Wallet",
@@ -411,6 +412,28 @@ export const STRINGS = {
       clearBody: "The trail is the only record of administrative actions. Clearing it cannot be undone.",
       cleared: "Cleared {n} entries",
       clearFailed: "The trail was not cleared",
+    },
+    perf: {
+      title: "Performance",
+      description: "Latency, success rate and throughput by model",
+      range: "Window",
+      model: "Model",
+      requests: "Requests",
+      successRate: "Success rate",
+      avgLatency: "Average latency",
+      avgTps: "Tokens / second",
+      window: "Inside the selected window",
+      successDetail: "Request-weighted across every bucket",
+      latencyDetail: "Mean time to complete a request",
+      tpsDetail: "Output tokens per second of generation",
+      byModel: "By model",
+      clickHint: "Select a model for its hourly series",
+      empty: "No traffic recorded in this window.",
+      searchPlaceholder: "Search a model…",
+      groups: "Groups",
+      latencySeries: "Average latency per hour",
+      tpsSeries: "Success rate per hour",
+      noSeries: "No bucket in this window.",
     },
     plugins: {
       title: "Task plugins",
@@ -838,6 +861,7 @@ export const STRINGS = {
       rankings: "排行榜",
       plugins: "任务插件",
       audit: "审计日志",
+      perf: "性能指标",
       security: "账户安全",
       pricing: "价格目录",
       wallet: "钱包",
@@ -1196,6 +1220,28 @@ export const STRINGS = {
       clearBody: "审计日志是管理操作的唯一记录，清空后无法恢复。",
       cleared: "已清空 {n} 条记录",
       clearFailed: "日志未清空",
+    },
+    perf: {
+      title: "性能指标",
+      description: "各模型的延迟、成功率与吞吐",
+      range: "时间范围",
+      model: "模型",
+      requests: "请求数",
+      successRate: "成功率",
+      avgLatency: "平均延迟",
+      avgTps: "Token / 秒",
+      window: "所选时间窗内",
+      successDetail: "按请求数加权",
+      latencyDetail: "完成一次请求的平均耗时",
+      tpsDetail: "生成阶段每秒输出 token 数",
+      byModel: "按模型",
+      clickHint: "选择模型查看逐小时曲线",
+      empty: "该时间窗暂无流量。",
+      searchPlaceholder: "搜索模型…",
+      groups: "分组",
+      latencySeries: "每小时平均延迟",
+      tpsSeries: "每小时成功率",
+      noSeries: "该时间窗暂无数据桶。",
     },
     plugins: {
       title: "任务插件",
@@ -1626,6 +1672,7 @@ export type Strings = {
     security: string;
     plugins: string;
     audit: string;
+    perf: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -1983,6 +2030,28 @@ export type Strings = {
     clearBody: string;
     cleared: string;
     clearFailed: string;
+  };
+  perf: {
+    title: string;
+    description: string;
+    range: string;
+    model: string;
+    requests: string;
+    successRate: string;
+    avgLatency: string;
+    avgTps: string;
+    window: string;
+    successDetail: string;
+    latencyDetail: string;
+    tpsDetail: string;
+    byModel: string;
+    clickHint: string;
+    empty: string;
+    searchPlaceholder: string;
+    groups: string;
+    latencySeries: string;
+    tpsSeries: string;
+    noSeries: string;
   };
   plugins: {
     title: string;

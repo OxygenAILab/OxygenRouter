@@ -43,7 +43,7 @@ Status vocabulary:
 
 | Reference route | Ours | Status | Notes |
 |---|---|---|---|
-| `/dashboard`, `/dashboard/$section` | `/ui/overview`, `/ui/analytics` | live | uptime panel and pricing page driven in the browser on 2026-10-19 |
+| `/dashboard`, `/dashboard/$section` | `/ui/overview`, `/ui/analytics`, `/ui/perf-metrics` | live | uptime panel, pricing page and the performance view were driven in the browser on 2026-10-19 |
 | `/channels` | `/ui/channels` | route | channel CRUD, key rotation, model fetch |
 | `/keys` | `/ui/keys` | route | create / edit / reveal |
 | `/models`, `/models/$section` | `/ui/models`, `/ui/model-registry`, `/ui/model-pricing` | live | pricing page driven live; registry route exists |
@@ -96,8 +96,10 @@ workspace is not a superset section-by-section:
 7. **Content sections** — announcements and the FAQ are done (2026-10-19,
    `/api/site`, with the overview rendering both); API info addresses and the
    chat/drawing presets are still open.
-8. **Perf metrics** (`/api/perf-metrics[/summary]`) — the reference's
-   latency/throughput page; needs recording on the relay path first.
+8. ~~**Perf metrics**~~ — done 2026-10-19: `perf_metrics` storage, recording on
+   the relay path, `/api/perf-metrics[/summary]` and `/ui/perf-metrics`. Time to
+   first token stays unmeasured (streaming is buffered), so that field is
+   omitted rather than reported as a measured zero.
 9. **Ratio sync** (`/api/ratio_sync`) — upstream price-table sync.
 10. **System tasks** (`/api/system-task/*`) — scheduled log cleanup with
     progress; the reference's five routes.

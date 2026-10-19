@@ -293,13 +293,25 @@ async fn main() {
                 }
                 last_flush = Some(std::time::Instant::now());
                 let rows = state.usage.take();
-                if rows.is_empty() {
-                    continue;
+                if !rows.is_empty() {
+                    let count = rows.len();
+                    match state.db.upsert_quota_data(&rows) {
+                        Ok(()) => println!("[OxygenRouter] usage summary: flushed {count} buckets"),
+                        Err(error) => {
+                            eprintln!("[OxygenRouter] usage summary flush failed: {error}")
+                        }
+                    }
                 }
-                let count = rows.len();
-                match state.db.upsert_quota_data(&rows) {
-                    Ok(()) => println!("[OxygenRouter] usage summary: flushed {count} buckets"),
-                    Err(error) => eprintln!("[OxygenRouter] usage summary flush failed: {error}"),
+                // The performance counters ride the same tick: they are one more
+                // table of hourly aggregates, and a second timer would only give
+                // the two readers different ideas of when "an hour" was written.
+                let perf = state.perf.take();
+                if !perf.is_empty() {
+                    let count = perf.len();
+                    match state.db.upsert_perf_metrics(&perf) {
+                        Ok(()) => println!("[OxygenRouter] perf metrics: flushed {count} buckets"),
+                        Err(error) => eprintln!("[OxygenRouter] perf metrics flush failed: {error}"),
+                    }
                 }
             }
         });

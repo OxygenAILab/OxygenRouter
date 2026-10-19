@@ -36,6 +36,87 @@ impl Default for UsageAccumulator {
     }
 }
 
+/// Hourly performance counters, held in memory until the periodic flush.
+///
+/// The same bargain as [`UsageAccumulator`]: a busy gateway must not pay a
+/// transaction per request for a table that only ever feeds a chart. One row per
+/// (hour, model, group) accumulates latency, outcomes and output tokens, and the
+/// timer writes the whole batch out.
+///
+/// A request that failed still counts: the failure rate is half of what the
+/// metric is for, and a table that only contained successes would report a
+/// 100% success rate by construction.
+pub struct PerfAccumulator {
+    buckets: parking_lot::Mutex<std::collections::HashMap<String, oxygenrouter_core::PerfMetric>>,
+}
+
+impl Default for PerfAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PerfAccumulator {
+    pub fn new() -> Self {
+        Self {
+            buckets: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Fold one finished request in.
+    ///
+    /// `generation_ms` is the latency for now: this instance buffers a streamed
+    /// reply before translating it, so the time spent producing the answer is
+    /// the time the request took. When streaming becomes incremental the caller
+    /// can pass the shorter figure, and the column already means that.
+    pub fn record(
+        &self,
+        model: &str,
+        group: &str,
+        latency_ms: i64,
+        success: bool,
+        output_tokens: i64,
+    ) {
+        if model.trim().is_empty() {
+            return;
+        }
+        let bucket_ts = bucket_hour(chrono::Utc::now()).timestamp();
+        let latency_ms = latency_ms.max(0);
+        let key = format!("{bucket_ts}\u{1}{model}\u{1}{group}");
+        let mut buckets = self.buckets.lock();
+        let entry = buckets
+            .entry(key)
+            .or_insert_with(|| oxygenrouter_core::PerfMetric {
+                model_name: model.to_string(),
+                group_name: group.to_string(),
+                bucket_ts,
+                request_count: 0,
+                success_count: 0,
+                total_latency_ms: 0,
+                output_tokens: 0,
+                generation_ms: 0,
+            });
+        entry.request_count += 1;
+        if success {
+            entry.success_count += 1;
+        }
+        entry.total_latency_ms += latency_ms;
+        entry.output_tokens += output_tokens.max(0);
+        entry.generation_ms += latency_ms;
+    }
+
+    /// How many buckets are waiting, for the diagnostics endpoint.
+    pub fn pending(&self) -> usize {
+        self.buckets.lock().len()
+    }
+
+    /// Drain the counters. The caller writes them and never looks back.
+    pub fn take(&self) -> Vec<oxygenrouter_core::PerfMetric> {
+        let mut buckets = self.buckets.lock();
+        buckets.drain().map(|(_, row)| row).collect()
+    }
+}
+
 impl UsageAccumulator {
     pub fn new() -> Self {
         Self {
@@ -190,6 +271,8 @@ pub struct AppState {
     audit_log_enabled: AtomicBool,
     /// Hourly usage counters awaiting the periodic flush into `quota_data`.
     pub usage: UsageAccumulator,
+    /// Hourly performance counters awaiting the same flush, into `perf_metrics`.
+    pub perf: PerfAccumulator,
     /// The JavaScript plugin runtime.
     ///
     /// One host per process; uploads are validated against it and the console
@@ -241,6 +324,7 @@ impl AppState {
             record_ip_log: AtomicBool::new(false),
             audit_log_enabled: AtomicBool::new(true),
             usage: UsageAccumulator::new(),
+            perf: PerfAccumulator::new(),
             plugins: oxygenrouter_plugin::PluginHost::start(),
             data_export_enabled: AtomicBool::new(true),
         }

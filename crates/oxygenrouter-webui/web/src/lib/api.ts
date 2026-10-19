@@ -300,6 +300,48 @@ export interface FaqEntry {
   answer: string;
 }
 
+/** Relay performance, by model and hour (`GET /api/perf-metrics*`). */
+export interface PerfBucketPoint {
+  ts: number;
+  avg_latency_ms: number;
+  success_rate: number;
+  avg_tps: number;
+  request_count: number;
+}
+
+export interface PerfSummary {
+  avg_latency_ms: number;
+  success_rate: number;
+  avg_tps: number;
+  request_count: number;
+}
+
+export interface PerfGroupSeries extends PerfSummary {
+  group: string;
+  series: PerfBucketPoint[];
+}
+
+export interface PerfModelQuery {
+  model_name: string;
+  window_start: number;
+  window_end: number;
+  summary: PerfSummary;
+  series: PerfBucketPoint[];
+  groups: PerfGroupSeries[];
+}
+
+export interface PerfModelSummary extends PerfSummary {
+  model_name: string;
+  recent_success_series: Array<{ ts: number; success_rate: number }>;
+}
+
+export interface PerfSummaryAll {
+  window_start: number;
+  window_end: number;
+  summary: PerfSummary;
+  models: PerfModelSummary[];
+}
+
 /** One recorded administrative action (`GET /api/audit-logs`). */
 export interface AuditLog {
   id: string;
@@ -828,6 +870,16 @@ export const api = {
     // the page, which is honest about what the endpoint does.
     list: (limit = 200) => apiFetch<AuditLog[]>(`/audit-logs?limit=${limit}`),
     clear: () => apiFetch<number>("/audit-logs", { method: "DELETE" }),
+  },
+  perfMetrics: {
+    // Public, like the reference's pricing module: these figures sit beside the
+    // price list.
+    summary: (hours = 24) => apiFetch<PerfSummaryAll>(`/perf-metrics/summary?hours=${hours}`),
+    model: (model: string, hours = 24, group?: string) => {
+      const query = new URLSearchParams({ model, hours: String(hours) });
+      if (group) query.set("group", group);
+      return apiFetch<PerfModelQuery>(`/perf-metrics?${query}`);
+    },
   },
   account: {
     sessions: {

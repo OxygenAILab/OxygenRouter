@@ -111,6 +111,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // shape (`data` plus `vendors`/`group_ratio`/…), so it is serialised
         // directly rather than through `ApiResponse`; see `pricing_public`.
         .route("/api/pricing", get(get_pricing))
+        // Relay performance by model and hour. The reference serves its
+        // `/perf-metrics` group to any visitor (the pricing module is public by
+        // default), and the numbers are aggregates over traffic this instance
+        // already advertises through `/api/pricing`.
+        .route("/api/perf-metrics", get(get_perf_metrics))
+        .route("/api/perf-metrics/summary", get(get_perf_metrics_summary))
         // The Uptime-Kuma panel on the overview. Public for the same reason the
         // reference serves it above `UserAuth`: the panel renders for a
         // signed-out visitor too, and it carries nothing but the monitor names
@@ -371,10 +377,17 @@ const PUBLIC_ROUTES: &[&str] = &[
     // visitor can see the leaderboard before signing in.
     "/api/rankings",
             "/api/pricing",
+            "/api/perf-metrics",
+            "/api/perf-metrics/summary",
     // The public price catalogue, as the reference serves it: its pricing module
     // is public by default (`middleware/header_nav.go`), and an operator's price
     // list is exactly what a visitor is meant to compare against.
     "/api/pricing",
+    // Relay performance. Public for the same reason the reference's
+    // `HeaderNavModulePublicOrUserAuth("pricing")` group is: the pricing page
+    // shows these figures beside the price list.
+    "/api/perf-metrics",
+    "/api/perf-metrics/summary",
     // The Uptime-Kuma panel, likewise public above `UserAuth` in the reference
     // (`router/api-router.go:27`). It exposes only the monitor names an operator
     // chose to publish, and it answers an empty list unless they switched the
@@ -4290,6 +4303,53 @@ async fn get_pricing(State(s): State<Arc<AppState>>) -> Response {
     match crate::pricing_public::build(&s) {
         Ok(catalogue) => Json(catalogue).into_response(),
         Err(error) => pricing_error::<serde_json::Value>(error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PerfMetricsQuery {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    hours: Option<i64>,
+}
+
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+/// `GET /api/perf-metrics?model=<name>[&group=][&hours=24]`
+///
+/// One model's hourly latency, success rate and throughput. `model` is required
+/// and refused by name rather than answering an empty series for "".
+async fn get_perf_metrics(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<PerfMetricsQuery>,
+) -> Response {
+    let Some(model) = non_empty(&q.model) else {
+        return pricing_error::<crate::perf_metrics::ModelQuery>(
+            "model is required".to_string(),
+        );
+    };
+    match crate::perf_metrics::query(&s, model, non_empty(&q.group), q.hours.unwrap_or(24)) {
+        Ok(result) => Json(ApiResponse::ok(result)).into_response(),
+        Err(error) => pricing_error::<crate::perf_metrics::ModelQuery>(error),
+    }
+}
+
+/// `GET /api/perf-metrics/summary[?hours=24]` — every model, busiest first.
+async fn get_perf_metrics_summary(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<PerfMetricsQuery>,
+) -> Response {
+    match crate::perf_metrics::summary_all(&s, q.hours.unwrap_or(24)) {
+        Ok(result) => Json(ApiResponse::ok(result)).into_response(),
+        Err(error) => pricing_error::<crate::perf_metrics::SummaryAll>(error),
     }
 }
 

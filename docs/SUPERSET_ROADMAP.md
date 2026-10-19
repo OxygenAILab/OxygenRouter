@@ -513,10 +513,11 @@ with all three client dialects.
   live against a charge (see `docs/FACT.md`).
 - ❌ **Ratio sync**: from official preset / models.dev / channels (OpenRouter + models.dev
   conversion).
-- ❌ **Perf metrics page**: latency/throughput by model/group/hour. (The
-  root-only diagnostics at `/api/performance/{stats,reset_stats}` are a
-  different surface; the reference's user-visible `/api/perf-metrics` group is
-  still missing.)
+- ✅ **Perf metrics**: latency / success rate / throughput by model, group and
+  hour, at `/api/perf-metrics[/summary]` and `/ui/perf-metrics` (the root-only
+  `/api/performance/*` diagnostics remain a separate surface). Time to first
+  token is omitted rather than reported as zero, because streaming is still
+  buffered.
 - ✅ **Rankings**: usage snapshot by period (`/api/rankings`, `rankings.rs`).
 - ✅ **Check-in**: daily quota award (`/api/user/checkin`, `core/checkin.rs`).
 - ✅ **Prefill groups**, **group management** (all/usable/groups+ratios).
