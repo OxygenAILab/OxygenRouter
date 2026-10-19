@@ -14,6 +14,7 @@ import {
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
+  Receipt,
   Route as RouteIcon,
   Server,
   Settings,
@@ -51,6 +52,7 @@ import AdminUsersPage from "./pages/AdminUsersPage";
 import AdminBillingPage from "./pages/AdminBillingPage";
 import ModelPricingPage from "./pages/ModelPricingPage";
 import RankingsPage from "./pages/RankingsPage";
+import PricingPage from "./pages/PricingPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -78,6 +80,8 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
     // Public, like the reference's rankings module: the API answers a signed-out
     // visitor, so the page is not hidden behind a role.
     { path: `${BASE}/rankings`, label: t.nav.rankings, icon: Trophy, key: "rankings", count: null },
+    // Also public: the price list is what a visitor compares against.
+    { path: `${BASE}/pricing`, label: t.nav.pricing, icon: Receipt, key: "pricing", count: null },
     { path: `${BASE}/channels`, label: t.nav.channels, icon: Server, key: "channels", count: enabledChannels > 0 ? enabledChannels : null, total: totalChannels },
     { path: `${BASE}/keys`, label: t.nav.keys, icon: Key, key: "keys", count: totalKeys > 0 ? totalKeys : null },
     { path: `${BASE}/routes`, label: t.nav.routes, icon: RouteIcon, key: "routes", count: totalMaps > 0 ? totalMaps : null },
@@ -182,6 +186,7 @@ function TopBar() {
     "model-registry": t.nav.modelsMeta,
     "model-pricing": t.nav.modelPricing,
     rankings: t.nav.rankings,
+    pricing: t.nav.pricing,
     "system-settings": t.nav.systemSettings,
     playground: t.nav.playground,
     system: t.nav.system,
@@ -309,6 +314,10 @@ function Shell() {
             <Route path="/ui/logs" element={<LogsPage />} />
             <Route path="/ui/models" element={<ModelsPage />} />
             <Route path="/ui/rankings" element={<RankingsPage />} />
+            <Route path="/ui/pricing" element={<PricingPage />} />
+            {/* The reference publishes the catalogue at `/pricing`; an existing
+                link keeps working rather than landing on the SPA fallback. */}
+            <Route path="/pricing" element={<Navigate to="/ui/pricing" replace />} />
             <Route path="/ui/model-registry" element={<ModelMetadataPage />} />
             <Route path="/ui/model-pricing" element={<ModelPricingPage />} />
             <Route path="/ui/system" element={<SystemInfoPage />} />

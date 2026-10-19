@@ -21,7 +21,7 @@ use oxygenrouter_billing::{BillingUsage, Charge, EvalContext};
 
 /// The set of OpenAI/Anthropic-style endpoints this proxy implements.
 /// Returned in 404 responses to help SDKs auto-discover.
-const SUPPORTED_ENDPOINTS: &[&str] = &[
+pub(crate) const SUPPORTED_ENDPOINTS: &[&str] = &[
     // OpenAI text and multimodal
     "POST /v1/chat/completions",
     "POST /v1/completions",

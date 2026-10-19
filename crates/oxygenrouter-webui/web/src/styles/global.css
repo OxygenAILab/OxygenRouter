@@ -1581,6 +1581,27 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
 }
 
 /* Rankings page: leaderboard, vendor share and history. */
+.pricing-facts { display: grid; gap: 1px; background: var(--md-outline-variant); border-radius: var(--radius-thumb); overflow: hidden; }
+.pricing-fact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--md-surface);
+  font-size: 12px;
+}
+.pricing-fact span { color: var(--md-on-surface-variant); }
+.pricing-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pricing-model-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pricing-model-cell small {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--md-on-surface-variant);
+  font-size: 10px;
+}
+.pricing-group-picker { display: flex; align-items: center; gap: 8px; color: var(--md-on-surface-variant); }
 .rankings-split {
   display: grid;
   grid-template-columns: 1fr 1fr;

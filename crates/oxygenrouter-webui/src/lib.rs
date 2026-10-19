@@ -8,6 +8,7 @@ pub mod billing_store;
 pub mod embed;
 pub mod model_list;
 pub mod pricing_config;
+pub mod pricing_public;
 pub mod proxy;
 pub mod rankings;
 mod state;

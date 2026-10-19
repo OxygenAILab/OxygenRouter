@@ -282,6 +282,48 @@ export interface SiteValues {
   server_address: string;
 }
 
+/** One model in the public price catalogue (`GET /api/pricing`). */
+export interface PublicPricing {
+  model_name: string;
+  description?: string;
+  icon?: string;
+  tags?: string;
+  vendor?: string;
+  /** 0 per token, 1 per call. */
+  quota_type: number;
+  model_ratio: number;
+  model_price: number;
+  completion_ratio: number;
+  cache_ratio?: number;
+  create_cache_ratio?: number;
+  image_ratio?: number;
+  input_price_per_million: number;
+  output_price_per_million: number;
+  enable_groups: string[];
+  supported_endpoint_types: string[];
+  billing_mode?: string;
+  billing_expr?: string;
+  pricing_version: string;
+}
+
+export interface PublicVendor {
+  id: string;
+  name: string;
+  description?: string;
+  icon?: string;
+}
+
+export interface PricingCatalogue {
+  success: boolean;
+  data: PublicPricing[];
+  vendors: PublicVendor[];
+  group_ratio: Record<string, number>;
+  usable_group: Record<string, string>;
+  supported_endpoint: Record<string, { method: string; path: string }>;
+  auto_groups: string[];
+  pricing_version: string;
+}
+
 /** One row of the public model leaderboard (`GET /api/rankings`). */
 export interface RankedModel {
   rank: number;
@@ -667,6 +709,17 @@ export const api = {
   rankings: {
     get: (period: "today" | "week" | "month" = "week") =>
       apiFetch<RankingsResponse>(`/rankings?period=${period}`),
+  },
+  pricing: {
+    // The catalogue's own envelope carries siblings next to `data`, so this one
+    // reads the raw document instead of going through `apiFetch`.
+    get: async (): Promise<PricingCatalogue> => {
+      const headers = new Headers();
+      if (sessionToken) headers.set("Authorization", `Bearer ${sessionToken}`);
+      const res = await fetch(`${API_BASE}/pricing`, { headers });
+      if (!res.ok) throw new Error(`Request failed (${res.status})`);
+      return (await res.json()) as PricingCatalogue;
+    },
   },
   modelPricing: {
     snapshot: (models: string[] = []) => {

@@ -107,6 +107,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/status", get(get_status))
         .route("/api/site", get(get_site))
+        // The public price catalogue. Its payload keeps the reference's sibling
+        // shape (`data` plus `vendors`/`group_ratio`/…), so it is serialised
+        // directly rather than through `ApiResponse`; see `pricing_public`.
+        .route("/api/pricing", get(get_pricing))
         // The Uptime-Kuma panel on the overview. Public for the same reason the
         // reference serves it above `UserAuth`: the panel renders for a
         // signed-out visitor too, and it carries nothing but the monitor names
@@ -366,6 +370,11 @@ const PUBLIC_ROUTES: &[&str] = &[
     // rankings module defaults to public (`middleware/header_nav.go:17`), so a
     // visitor can see the leaderboard before signing in.
     "/api/rankings",
+            "/api/pricing",
+    // The public price catalogue, as the reference serves it: its pricing module
+    // is public by default (`middleware/header_nav.go`), and an operator's price
+    // list is exactly what a visitor is meant to compare against.
+    "/api/pricing",
     // The Uptime-Kuma panel, likewise public above `UserAuth` in the reference
     // (`router/api-router.go:27`). It exposes only the monitor names an operator
     // chose to publish, and it answers an empty list unless they switched the
@@ -4217,6 +4226,18 @@ fn site_values(s: &AppState) -> SiteValues {
 
 async fn get_site(State(s): State<Arc<AppState>>) -> Json<ApiResponse<SiteValues>> {
     Json(ApiResponse::ok(site_values(&s)))
+}
+
+/// `GET /api/pricing` — the public price catalogue.
+///
+/// Answers the reference's shape (see `crate::pricing_public`). A table that
+/// cannot be read is reported rather than answered as an empty catalogue: an
+/// empty list would read as "nothing costs anything".
+async fn get_pricing(State(s): State<Arc<AppState>>) -> Response {
+    match crate::pricing_public::build(&s) {
+        Ok(catalogue) => Json(catalogue).into_response(),
+        Err(error) => pricing_error::<serde_json::Value>(error),
+    }
 }
 
 /// A built snapshot and when it stops being fresh.

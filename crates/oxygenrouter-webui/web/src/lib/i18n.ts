@@ -52,6 +52,7 @@ export const STRINGS = {
       modelsMeta: "Model Registry",
       modelPricing: "Model Pricing",
       rankings: "Rankings",
+      pricing: "Pricing",
       wallet: "Wallet",
       plans: "Plans",
       subscriptions: "Subscriptions",
@@ -388,6 +389,33 @@ export const STRINGS = {
       updated: "Model metadata updated",
       deleted: "Model metadata deleted",
     },
+    pricing: {
+      title: "Pricing",
+      description: "What every model this instance serves costs",
+      model: "Model",
+      vendor: "Vendor",
+      mode: "Billing",
+      inputPrice: "Input",
+      outputPrice: "Output",
+      perCall: "Per call",
+      call: "call",
+      searchPlaceholder: "Search a model, vendor or tag…",
+      group: "Billing group",
+      groups: "Groups",
+      endpoints: "Served by",
+      noEndpoints: "No channel declares this model yet.",
+      catalogue: "Catalogue",
+      models: "models",
+      version: "version",
+      empty: "No model is priced yet.",
+      expression: "Billing expression",
+      modelRatio: "Model ratio",
+      completionRatio: "Completion ratio",
+      cacheRatio: "Cache ratio",
+      createCacheRatio: "Cache write ratio",
+      imageRatio: "Image ratio",
+      defaultGroup: "default",
+    },
     rankings: {
       title: "Model Rankings",
       description: "Which models and vendors this instance actually serves",
@@ -713,6 +741,7 @@ export const STRINGS = {
       modelsMeta: "模型注册表",
       modelPricing: "模型定价",
       rankings: "排行榜",
+      pricing: "价格目录",
       wallet: "钱包",
       plans: "套餐",
       subscriptions: "订阅",
@@ -1050,6 +1079,33 @@ export const STRINGS = {
       updated: "模型元数据已更新",
       deleted: "模型元数据已删除",
     },
+    pricing: {
+      title: "价格目录",
+      description: "本实例所服务模型的计价",
+      model: "模型",
+      vendor: "供应商",
+      mode: "计价方式",
+      inputPrice: "输入",
+      outputPrice: "输出",
+      perCall: "每次调用",
+      call: "次",
+      searchPlaceholder: "搜索模型、供应商或标签…",
+      group: "计费分组",
+      groups: "可用分组",
+      endpoints: "服务渠道",
+      noEndpoints: "暂无渠道声明该模型。",
+      catalogue: "价目表",
+      models: "个模型",
+      version: "版本",
+      empty: "暂无定价模型。",
+      expression: "计费表达式",
+      modelRatio: "模型倍率",
+      completionRatio: "补全倍率",
+      cacheRatio: "缓存倍率",
+      createCacheRatio: "缓存写入倍率",
+      imageRatio: "图片倍率",
+      defaultGroup: "default",
+    },
     rankings: {
       title: "模型排行榜",
       description: "本实例实际服务的模型与供应商",
@@ -1376,6 +1432,7 @@ export type Strings = {
     modelsMeta: string;
     modelPricing: string;
     rankings: string;
+    pricing: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -1713,6 +1770,33 @@ export type Strings = {
     created: string;
     updated: string;
     deleted: string;
+  };
+  pricing: {
+    title: string;
+    description: string;
+    model: string;
+    vendor: string;
+    mode: string;
+    inputPrice: string;
+    outputPrice: string;
+    perCall: string;
+    call: string;
+    searchPlaceholder: string;
+    group: string;
+    groups: string;
+    endpoints: string;
+    noEndpoints: string;
+    catalogue: string;
+    models: string;
+    version: string;
+    empty: string;
+    expression: string;
+    modelRatio: string;
+    completionRatio: string;
+    cacheRatio: string;
+    createCacheRatio: string;
+    imageRatio: string;
+    defaultGroup: string;
   };
   rankings: {
     title: string;
