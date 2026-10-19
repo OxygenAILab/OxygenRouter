@@ -1629,17 +1629,46 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
 .api-info-route { font-size: 12px; font-weight: 500; }
 .api-info-text small { color: var(--md-on-surface-variant); font-size: 11px; }
 .api-info-url { flex: 0 0 auto; color: var(--md-on-surface-variant); font-size: 11px; }
-.not-found {
+.not-found,
+.error-page {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 12px;
-  min-height: 60vh;
+  min-height: calc(100dvh - 120px);
+  padding: 48px 24px;
   text-align: center;
   color: var(--md-on-surface-variant);
 }
-.not-found h1 { margin: 0; font-size: 20px; color: var(--md-on-surface); }
+.not-found h1,
+.error-page h1 { margin: 0; font-size: 20px; color: var(--md-on-surface); }
+.error-page p { max-width: 420px; margin: 0; font-size: 13px; line-height: 1.6; }
+.error-page-code {
+  font-family: var(--font-mono);
+  font-size: 96px;
+  font-weight: 700;
+  line-height: 0.9;
+  color: var(--md-on-surface);
+}
+.error-page-icon {
+  display: grid;
+  place-items: center;
+  color: var(--md-primary);
+}
+.error-page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+@media (max-width: 640px) {
+  .error-page-code { font-size: 72px; }
+  .error-page-actions { width: 100%; flex-direction: column; }
+  .error-page-actions > * { width: 100%; }
+}
 
 @media (max-width: 720px) {
   .api-info-url { display: none; }

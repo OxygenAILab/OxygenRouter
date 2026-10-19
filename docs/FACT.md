@@ -1038,6 +1038,21 @@ source; the empty request answered `400`; anonymous read `401`; plain-user read
 `403`. The page was driven in the browser and showed six field differences plus
 one source-only model. Workspace suite: 654/0; frontend production build passed.
 
+### Error pages (2026-10-20)
+
+The console now draws the five status views the reference exposes: `/ui/401`,
+`/ui/403`, `/ui/404`, `/ui/500` and `/ui/503`. Each uses one `ErrorPage`
+component, shows the status and a recovery action, and keeps the shell
+navigation available; an unknown `/ui/*` path reuses the 404 view instead of
+silently rendering the overview. The breadcrumb is status-aware, and the
+top-level reference aliases are intentionally not advertised because the proxy
+does not serve SPA fallback for them.
+
+Verified in the browser on 2026-10-20: all five routes rendered their expected
+code, title and two actions, and the 503 screenshot is retained as
+`.devlogs/live_task/error-503.png` (the other four are alongside it). The
+frontend production build passed after the change.
+
 ## Open questions
 - _None recorded_
 

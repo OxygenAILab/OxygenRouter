@@ -12,7 +12,7 @@ reference page and the evidence for this instance's state.
 |---|---|
 | Reference client routes | `web/src/routes/**` of `QuantumNous/new-api` @ `c2b7a9a` (TanStack Router file routes; 64 route files, 5 of them error pages) |
 | Reference settings sections | `web/src/features/system-settings/*/section-registry.tsx` — **40 sections** in 8 groups |
-| Our console routes | `crates/oxygenrouter-webui/web/src/App.tsx` `path="/ui/..."` — **20 routes** |
+| Our console routes | `crates/oxygenrouter-webui/web/src/App.tsx` `path="/ui/..."` — **37 routes** |
 | Our API surface | `crates/oxygenrouter-webui/src/api.rs` route table + `Access` classification |
 
 Status vocabulary:
@@ -37,7 +37,7 @@ Status vocabulary:
 | `(auth)/forgot-password`, `/reset`, `/user/reset` | password reset by email | — | **missing** |
 | `(auth)/otp` | one-time-code step | sign-in accepts a 2FA code in the same form | different by design |
 | `(auth)/oauth`, `/oauth/:provider` | six OAuth providers | — | **missing** |
-| `(errors)/401,403,404,500,503`, `_authenticated/errors/$error` | error pages | `/ui/*` unknown paths render a "page not found" view rather than redirecting to the overview | partial |
+| `(errors)/401,403,404,500,503`, `_authenticated/errors/$error` | error pages | `/ui/401`, `/ui/403`, `/ui/404`, `/ui/500`, `/ui/503`; unknown `/ui/*` paths render the 404 view | live |
 
 ## 2. Signed-in pages
 
@@ -112,10 +112,12 @@ workspace is not a superset section-by-section:
    fields), and its richer response/selection shape are still open.
 10. ~~**System tasks**~~ — done 2026-10-19: the five `/api/system-task/*` routes
     over a `log_cleanup` runner with durable progress, plus `/ui/system-tasks`.
-11. ~~**Legal / about**~~ — done 2026-10-19: the three option keys, the three
-    reference paths and three console pages, linked from the overview footer.
-    Error views are partial: an unknown `/ui/*` path now says so, but the
-    reference's separate 401/403/500/503 pages are still not drawn.
+11. ~~**Legal / about and error views**~~ — done 2026-10-20: the three option
+    keys, the three reference paths and three console pages, linked from the
+    overview footer; `/ui/401`, `/ui/403`, `/ui/404`, `/ui/500` and `/ui/503`
+    are each drawn with recovery actions, and an unknown `/ui/*` path lands on
+    the 404 view instead of silently rendering the overview. All five status
+    views were driven in the browser on 2026-10-20.
 12. **OAuth + password reset** — the only auth surfaces still missing.
 
 ## 5. What "superset" will mean here

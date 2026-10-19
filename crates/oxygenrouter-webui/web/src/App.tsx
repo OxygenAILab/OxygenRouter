@@ -65,6 +65,7 @@ import PerfMetricsPage from "./pages/PerfMetricsPage";
 import SystemTasksPage from "./pages/SystemTasksPage";
 import StaticPage from "./pages/StaticPage";
 import NotFoundPage from "./pages/NotFoundPage";
+import ErrorPage from "./pages/ErrorPage";
 import RatioSyncPage from "./pages/RatioSyncPage";
 
 const BASE = "/ui";
@@ -221,6 +222,11 @@ function TopBar() {
     "perf-metrics": t.nav.perf,
     "system-tasks": t.nav.systemTasks,
     "ratio-sync": t.nav.ratioSync,
+    "401": t.errors.unauthorizedTitle,
+    "403": t.errors.forbiddenTitle,
+    "404": t.notFound.title,
+    "500": t.errors.serverTitle,
+    "503": t.errors.maintenanceTitle,
     "system-settings": t.nav.systemSettings,
     // The instance's own copy, reachable from the overview footer.
     about: t.static.about,
@@ -240,7 +246,7 @@ function TopBar() {
   const current =
     path.startsWith("admin/billing")
       ? t.nav.billing
-      : labelMap[label] || t.nav.overview;
+      : labelMap[label] || (label ? t.notFound.title : t.nav.overview);
   const { user, logout, loading } = useAuth();
   return (
     <header className="app-topbar">
@@ -384,6 +390,11 @@ function Shell() {
             <Route path="/ui/about" element={<StaticPage kind="about" />} />
             <Route path="/ui/terms" element={<StaticPage kind="terms" />} />
             <Route path="/ui/privacy" element={<StaticPage kind="privacy" />} />
+            <Route path="/ui/401" element={<ErrorPage status={401} />} />
+            <Route path="/ui/403" element={<ErrorPage status={403} />} />
+            <Route path="/ui/404" element={<ErrorPage status={404} />} />
+            <Route path="/ui/500" element={<ErrorPage status={500} />} />
+            <Route path="/ui/503" element={<ErrorPage status={503} />} />
             {/* An unknown console path is shown as unknown rather than silently            rendered as the overview: a stale link should look wrong, not slow. */}
             <Route path="/ui/*" element={<NotFoundPage />} />
             <Route path="*" element={<Navigate to="/ui/overview" replace />} />

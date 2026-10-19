@@ -501,6 +501,18 @@ export const STRINGS = {
       body: "That console path does not exist on this instance.",
       back: "Back to the overview",
     },
+    errors: {
+      unauthorizedTitle: "Unauthorized access",
+      unauthorizedBody: "Sign in with an account that can open this resource.",
+      forbiddenTitle: "Access forbidden",
+      forbiddenBody: "Your account does not have permission to view this resource.",
+      serverTitle: "Something went wrong",
+      serverBody: "The request could not be completed. Try again in a moment.",
+      maintenanceTitle: "Service under maintenance",
+      maintenanceBody: "The instance is temporarily unavailable. Check back shortly.",
+      goBack: "Go back",
+      backHome: "Back to the overview",
+    },
     plugins: {
       title: "Task plugins",
       description: "JavaScript the gateway runs for task and media protocols",
@@ -1375,6 +1387,18 @@ export const STRINGS = {
       body: "本实例没有这个控制台路径。",
       back: "返回概览",
     },
+    errors: {
+      unauthorizedTitle: "需要登录",
+      unauthorizedBody: "请使用有权限访问此资源的账户登录。",
+      forbiddenTitle: "无权访问",
+      forbiddenBody: "当前账户没有查看此资源的权限。",
+      serverTitle: "服务出错了",
+      serverBody: "请求未能完成，请稍后重试。",
+      maintenanceTitle: "服务维护中",
+      maintenanceBody: "实例暂时不可用，请稍后再访问。",
+      goBack: "返回上一页",
+      backHome: "返回概览",
+    },
     plugins: {
       title: "任务插件",
       description: "网关为任务与媒体协议执行的 JavaScript",
@@ -2178,6 +2202,18 @@ export type Strings = {
     title: string;
     body: string;
     back: string;
+  };
+  errors: {
+    unauthorizedTitle: string;
+    unauthorizedBody: string;
+    forbiddenTitle: string;
+    forbiddenBody: string;
+    serverTitle: string;
+    serverBody: string;
+    maintenanceTitle: string;
+    maintenanceBody: string;
+    goBack: string;
+    backHome: string;
   };
   ratioSync: {
     title: string;
