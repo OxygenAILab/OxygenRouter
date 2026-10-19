@@ -6,6 +6,7 @@ import { PageHeader } from "../App";
 import { useI18n } from "../lib/i18nContext";
 import { useToast } from "../lib/toast";
 import Button from "../components/ui/Button";
+import ChatPresetsEditor from "../components/ChatPresetsEditor";
 import Switch from "../components/ui/Switch";
 import SegmentedControl from "../components/ui/SegmentedControl";
 
@@ -181,12 +182,21 @@ export default function SystemSettingsPage() {
           </div>
           <div className="card">
             {active.map((option) => (
-              <OptionRow
-                key={option.key}
-                option={option}
-                pending={mut.isPending}
-                onSave={(key, value) => mut.mutate({ key, value })}
-              />
+              option.key === "Chats" ? (
+                <ChatPresetsEditor
+                  key={option.key}
+                  value={option.value}
+                  pending={mut.isPending}
+                  onSave={(value) => mut.mutate({ key: option.key, value })}
+                />
+              ) : (
+                <OptionRow
+                  key={option.key}
+                  option={option}
+                  pending={mut.isPending}
+                  onSave={(key, value) => mut.mutate({ key, value })}
+                />
+              )
             ))}
           </div>
         </section>

@@ -285,7 +285,12 @@ export interface SiteValues {
   faq: FaqEntry[];
   /** The instance's own addresses, already parsed and switch-gated. */
   api_info: ApiInfo[];
+  /** Chat client presets, parsed for the chat-link page. */
+  chats: ChatPresetEntry[];
 }
+
+/** One client-name to URL-template pair shown on `/ui/chat2link`. */
+export type ChatPresetEntry = Record<string, string>;
 
 /** One address the operator advertises, in the reference's shape. */
 export interface ApiInfo {

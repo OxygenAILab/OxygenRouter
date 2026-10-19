@@ -48,6 +48,8 @@ export const STRINGS = {
       system: "System Info",
       systemSettings: "System Settings",
       playground: "Playground",
+      chat: "Chat",
+      chat2link: "Chat links",
       models: "Models",
       modelsMeta: "Model Registry",
       modelPricing: "Model Pricing",
@@ -795,6 +797,25 @@ export const STRINGS = {
       deleteOneConfirm: "Delete stale instance \"{name}\"? If it has reported again, it will not be deleted.",
       nodeAutoWarning: "Using an automatic hostname. Set NODE_NAME to a stable unique value for multi-instance management.",
     },
+    chatLinks: {
+      title: "Chat links",
+      description: "Open this gateway in a configured chat client",
+      chatDescription: "Chat with an enabled channel from this gateway",
+      presets: "Client presets",
+      editorHint: "Each row maps a client name to a URL template. {address} and {key} are resolved only when the user opens or copies the link.",
+      addPreset: "Add client",
+      noPresets: "No chat clients configured.",
+      presetName: "Client name",
+      presetUrl: "URL template",
+      invalidPreset: "Every client needs a name and a non-empty URL.",
+      needKey: "Create an enabled API key before opening a preset that needs one.",
+      goKeys: "Open API keys",
+      empty: "No chat clients have been configured yet.",
+      openSettings: "Configure presets",
+      open: "Open",
+      web: "Web",
+      app: "Application",
+    },
     playground: {
       title: "Playground",
       description: "Test chat, embeddings, and image generation in-browser",
@@ -957,6 +978,8 @@ export const STRINGS = {
       system: "系统信息",
       systemSettings: "系统设置",
       playground: "演练场",
+      chat: "聊天",
+      chat2link: "聊天链接",
       models: "模型",
       modelsMeta: "模型注册表",
       modelPricing: "模型定价",
@@ -1705,6 +1728,25 @@ export const STRINGS = {
       deleteOneConfirm: "确定删除陈旧实例“{name}”吗？若它已重新上报，则不会被删除。",
       nodeAutoWarning: "当前使用自动主机名。多实例管理请设置稳定的唯一 NODE_NAME。",
     },
+    chatLinks: {
+      title: "聊天链接",
+      description: "用已配置的聊天客户端打开本网关",
+      chatDescription: "直接通过本网关的已启用渠道聊天",
+      presets: "客户端预设",
+      editorHint: "每行将客户端名称映射到 URL 模板；仅在用户打开或复制链接时替换 {address} 与 {key}。",
+      addPreset: "添加客户端",
+      noPresets: "尚未配置聊天客户端。",
+      presetName: "客户端名称",
+      presetUrl: "URL 模板",
+      invalidPreset: "每个客户端都需要名称和非空 URL。",
+      needKey: "打开需要密钥的预设前，请先创建一个已启用的 API 密钥。",
+      goKeys: "打开 API 密钥",
+      empty: "尚未配置任何聊天客户端。",
+      openSettings: "配置预设",
+      open: "打开",
+      web: "网页",
+      app: "应用",
+    },
     playground: {
       title: "演练场",
       description: "在浏览器中测试聊天、嵌入与图像生成",
@@ -1868,6 +1910,8 @@ export type Strings = {
     settings: string;
     system: string;
     playground: string;
+    chat: string;
+    chat2link: string;
     models: string;
     modelsMeta: string;
     modelPricing: string;
@@ -2616,6 +2660,25 @@ export type Strings = {
     deleteAllConfirm: string;
     deleteOneConfirm: string;
     nodeAutoWarning: string;
+  };
+  chatLinks: {
+    title: string;
+    description: string;
+    chatDescription: string;
+    presets: string;
+    editorHint: string;
+    addPreset: string;
+    noPresets: string;
+    presetName: string;
+    presetUrl: string;
+    invalidPreset: string;
+    needKey: string;
+    goKeys: string;
+    empty: string;
+    openSettings: string;
+    open: string;
+    web: string;
+    app: string;
   };
   playground: {
     title: string;

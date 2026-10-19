@@ -37,5 +37,6 @@ pub use oxygenrouter_plugin::{
 };
 
 pub use options::{
-    find_schema, validate as validate_option, OptionKind, OptionSchema, OptionSection, OPTION_SCHEMA,
+    find_schema, validate as validate_option, validate_for_key as validate_option_for_key,
+    OptionKind, OptionSchema, OptionSection, OPTION_SCHEMA,
 };

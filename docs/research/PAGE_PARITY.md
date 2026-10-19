@@ -12,7 +12,7 @@ reference page and the evidence for this instance's state.
 |---|---|
 | Reference client routes | `web/src/routes/**` of `QuantumNous/new-api` @ `c2b7a9a` (TanStack Router file routes; 64 route files, 5 of them error pages) |
 | Reference settings sections | `web/src/features/system-settings/*/section-registry.tsx` — **40 sections** in 8 groups |
-| Our console routes | `crates/oxygenrouter-webui/web/src/App.tsx` `path="/ui/..."` — **37 routes** |
+| Our console routes | `crates/oxygenrouter-webui/web/src/App.tsx` `path="/ui/..."` — **39 routes** |
 | Our API surface | `crates/oxygenrouter-webui/src/api.rs` route table + `Access` classification |
 
 Status vocabulary:
@@ -33,7 +33,7 @@ Status vocabulary:
 | `/about` | about copy | `/ui/about` over `GET /api/about`, same option shape as the reference | live |
 | `/privacy-policy`, `/user-agreement` | legal copy | `/ui/privacy`, `/ui/terms` over `/api/privacy-policy`, `/api/user-agreement` | live |
 | `/setup` | first-run setup wizard | bootstrap admin is created on first start (`ensure_bootstrap_admin`) | different by design |
-| `(auth)/sign-in`, `/sign-up` | sign in / register | `/ui/sign-in`, `/ui/sign-up` | route |
+| `(auth)/sign-in`, `/sign-up` | sign in / register | `/ui/sign-in`, `/ui/sign-up` | live | both routes and their validation states were driven in the browser on 2026-10-20 |
 | `(auth)/forgot-password`, `/reset`, `/user/reset` | password reset by email | — | **missing** |
 | `(auth)/otp` | one-time-code step | sign-in accepts a 2FA code in the same form | different by design |
 | `(auth)/oauth`, `/oauth/:provider` | six OAuth providers | — | **missing** |
@@ -57,7 +57,7 @@ Status vocabulary:
 | `/users` | `/ui/admin/users` | route | |
 | `/task-plugins` | `/ui/task-plugins` over `/api/plugin/task*` | live | driven in the browser on 2026-10-19: a build uploaded, enabled and activated, and a driver hook dry-run from the console (which is what found the `call_hook` dispatch defect) |
 | `/system-info` | `/ui/system` | live | the instance list, live CPU/memory/disk metrics, heartbeat timestamps and stale-instance deletion were driven in the browser and with `check_system_info.ps1` on 2026-10-20 |
-| `/chat`, `/chat2link` | — | **missing** | reference's own chat UI, not a gateway feature |
+| `/chat`, `/chat2link` | `/ui/chat`, `/ui/chat2link` | live | `/ui/chat` reuses the real playground in chat-only mode; `/ui/chat2link` lists the configured `Chats` presets and resolves `{address}` / `{key}` only when the user opens or copies a link |
 
 ## 3. Settings workspace
 
@@ -75,7 +75,7 @@ workspace is not a superset section-by-section:
 | operations | 7 | partly (log retention, data export, check-in) |
 | security | 3 | partly (fetch/SSRF policy, audit log, login attempts) |
 | request-policies | 3 | **missing** (the reference's request-policy editor) |
-| content | 7 | partly: Uptime Kuma, announcements and the FAQ all have options and a public read (`/api/site`); the API-address block and chat/drawing presets are still missing |
+| content | 7 | partly: Uptime Kuma, announcements, the FAQ and API addresses have options and a public read (`/api/site`); chat presets are editable and consumed by `/ui/chat2link`; drawing/Midjourney settings remain missing |
 
 ## 4. Work list, in the order that unblocks the most
 
@@ -93,9 +93,11 @@ workspace is not a superset section-by-section:
    here was the root gate, now fixed.
 6. ~~**Audit log view**~~ — done 2026-10-19: `/ui/audit`, plus recording a denied
    privileged write with the caller's identity, which the middleware dropped.
-7. **Content sections** — announcements and the FAQ are done (2026-10-19,
-   `/api/site`, with the overview rendering both); API info addresses and the
-   chat/drawing presets are still open.
+7. **Content sections** — announcements, the FAQ and API addresses are done
+   (2026-10-19/20, `/api/site`, with the overview rendering them); chat presets
+   are done on 2026-10-20 through `Chats`, the settings editor and
+   `/ui/chat2link`. Drawing/Midjourney settings remain open because the
+   corresponding task backend does not exist yet.
 8. ~~**Perf metrics**~~ — done 2026-10-19: `perf_metrics` storage, recording on
    the relay path, `/api/perf-metrics[/summary]` and `/ui/perf-metrics`. Time to
    first token stays unmeasured (streaming is buffered), so that field is

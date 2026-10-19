@@ -1078,6 +1078,24 @@ seconds. The browser panel displayed live CPU/memory/storage and completed a
 stale-row deletion through its confirmation dialog. Core suite 57/0, webui suite
 133/0, frontend production build passed.
 
+### Chat presets and chat links (2026-10-20)
+
+`Chats` is a site option containing a JSON array of one-key client-to-template
+objects. The option writer now validates that shape, and `/api/site` publishes
+the parsed list. `/ui/system-settings` renders it as a row-based editor rather
+than a raw JSON box. `/ui/chat2link` displays each configured client and
+resolves `{address}`, `{key}`, and the client-specific config placeholders only
+when the user presses Open or Copy; the API key is revealed through the existing
+explicit `/api/keys/:id/secret` route and never appears in the list payload.
+`/ui/chat` reuses the playground with only the chat mode visible.
+
+Verified live (`.devlogs/live_task/check_chat_links.ps1`): malformed JSON was
+rejected at write time, valid presets round-tripped through `/api/options` and
+`/api/site`, and cleanup restored `[]`. The browser showed both preset cards,
+the static preset navigated to `/docs`, and Copy produced a URL with the
+selected key and encoded address. Workspace suite 659/0; frontend production
+build passed.
+
 ## Open questions
 - _None recorded_
 

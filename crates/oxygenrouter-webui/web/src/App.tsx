@@ -12,6 +12,7 @@ import {
   Gauge,
   Info,
   Key,
+  Link2,
   MessageSquare,
   Menu,
   PanelLeftClose,
@@ -67,6 +68,7 @@ import StaticPage from "./pages/StaticPage";
 import NotFoundPage from "./pages/NotFoundPage";
 import ErrorPage from "./pages/ErrorPage";
 import RatioSyncPage from "./pages/RatioSyncPage";
+import Chat2LinkPage from "./pages/Chat2LinkPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -116,6 +118,10 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
   // entry a non-root user cannot use would invite a dead end.
   // Account-scoped, so it appears only for a signed-in caller.
   if (user) navItems.push({ path: `${BASE}/security`, label: t.nav.security, icon: ShieldCheck, key: "security", count: null });
+  if (user) navItems.push(
+    { path: `${BASE}/chat`, label: t.nav.chat, icon: MessageSquare, key: "chat", count: null },
+    { path: `${BASE}/chat2link`, label: t.nav.chat2link, icon: Link2, key: "chat2link", count: null },
+  );
   if (user?.role === "root") navItems.push(
     { path: `${BASE}/model-pricing`, label: t.nav.modelPricing, icon: Calculator, key: "model-pricing", count: null },
     // Uploading code the gateway will execute is the owner's action, matching
@@ -235,6 +241,8 @@ function TopBar() {
     terms: t.static.terms,
     privacy: t.static.privacy,
     playground: t.nav.playground,
+    chat: t.nav.chat,
+    chat2link: t.nav.chat2link,
     system: t.nav.system,
     settings: t.nav.settings,
     wallet: t.nav.wallet,
@@ -381,6 +389,8 @@ function Shell() {
             <Route path="/ui/system" element={<SystemInfoPage />} />
             <Route path="/ui/system-settings" element={<SystemSettingsPage />} />
             <Route path="/ui/playground" element={<PlaygroundPage />} />
+            <Route path="/ui/chat" element={<PlaygroundPage chatOnly />} />
+            <Route path="/ui/chat2link" element={<Chat2LinkPage />} />
             <Route path="/ui/settings" element={<SettingsPage />} />
             <Route path="/ui/sign-in" element={<AuthPage mode="sign-in" />} />
             <Route path="/ui/sign-up" element={<AuthPage mode="sign-up" />} />

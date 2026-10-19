@@ -97,6 +97,16 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
         "[]",
         "API addresses (JSON array of {url, route, description, color})"
     ),
+    // Chat client presets. Each entry is a one-key object mapping a client name
+    // to its URL template; `{address}` and `{key}` are resolved only when the
+    // signed-in user explicitly asks to open a preset.
+    schema!(
+        "Chats",
+        Site,
+        String,
+        "[]",
+        "Chat client presets (JSON array of {client name: url template})"
+    ),
     // Legal and about copy, served publicly like the reference's `/api/about`,
     // `/api/user-agreement` and `/api/privacy-policy`.
     schema!("About", Site, String, "", "About this instance (plain text)"),
@@ -238,5 +248,87 @@ pub fn validate(kind: OptionKind, value: &str) -> Result<(), String> {
             "true" | "false" | "1" | "0" => Ok(()),
             other => Err(format!("expected a boolean, got {other:?}")),
         },
+    }
+}
+
+/// Validate the raw shape of the JSON-list options the console edits as text.
+///
+/// Kind validation alone would accept `"not json"` for a string option and then
+/// silently render an empty public list, which makes a typo look like a cleared
+/// setting. These checks reject the write while the operator still has the
+/// editor open.
+fn validate_json_array(key: &str, value: &str) -> Result<(), String> {
+    serde_json::from_str::<Vec<serde_json::Value>>(value)
+        .map(|_| ())
+        .map_err(|error| format!("{key} must be a JSON array: {error}"))
+}
+
+fn validate_chat_presets(value: &str) -> Result<(), String> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(value)
+        .map_err(|error| format!("Chats must be a JSON array: {error}"))?;
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(object) = entry.as_object() else {
+            return Err(format!("Chats entry {} must be an object", index + 1));
+        };
+        if object.len() != 1 {
+            return Err(format!(
+                "Chats entry {} must contain exactly one client name",
+                index + 1
+            ));
+        }
+        let Some((name, target)) = object.iter().next() else {
+            return Err(format!("Chats entry {} is empty", index + 1));
+        };
+        if name.trim().is_empty() {
+            return Err(format!("Chats entry {} has an empty client name", index + 1));
+        }
+        let Some(target) = target.as_str() else {
+            return Err(format!(
+                "Chats entry {} ({name}) must map to a URL string",
+                index + 1
+            ));
+        };
+        if target.trim().is_empty() {
+            return Err(format!("Chats entry {} ({name}) has an empty URL", index + 1));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a value against both its kind and the shape implied by its key.
+pub fn validate_for_key(key: &str, kind: OptionKind, value: &str) -> Result<(), String> {
+    validate(kind, value)?;
+    match key {
+        "Chats" => validate_chat_presets(value),
+        "ApiInfo" | "Announcements" | "Faq" | "UptimeKumaGroups" => {
+            validate_json_array(key, value)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_presets_require_one_named_url_per_entry() {
+        assert!(validate_for_key(
+            "Chats",
+            OptionKind::String,
+            r#"[{"Cherry Studio":"cherrystudio://providers"}]"#
+        )
+        .is_ok());
+        assert!(validate_for_key("Chats", OptionKind::String, r#"[{"name":"url","extra":1}]"#)
+            .is_err());
+        assert!(validate_for_key("Chats", OptionKind::String, r#"[{"name":1}]"#).is_err());
+        assert!(validate_for_key("Chats", OptionKind::String, "{}").is_err());
+    }
+
+    #[test]
+    fn list_options_refuse_malformed_json_but_leave_plain_strings_alone() {
+        assert!(validate_for_key("ApiInfo", OptionKind::String, "[]").is_ok());
+        assert!(validate_for_key("ApiInfo", OptionKind::String, "not json").is_err());
+        assert!(validate_for_key("SiteName", OptionKind::String, "not json").is_ok());
     }
 }

@@ -39,7 +39,7 @@ const SYSTEM_PROMPTS: Record<string, string> = {
   custom: "",
 };
 
-export default function PlaygroundPage() {
+export default function PlaygroundPage({ chatOnly = false }: { chatOnly?: boolean }) {
   const { t } = useI18n();
   const toast = useToast();
   const { data: channels } = useQuery({ queryKey: ["channels"], queryFn: api.channels.list });
@@ -314,10 +314,10 @@ export default function PlaygroundPage() {
   return (
     <div className="page-fade-enter">
       <PageHeader
-        title={t.playground.title}
-        description={t.playground.description}
+        title={chatOnly ? t.nav.chat : t.playground.title}
+        description={chatOnly ? t.chatLinks.chatDescription : t.playground.description}
         action={
-          <div className="flex items-center gap-2">
+          !chatOnly && <div className="flex items-center gap-2">
             <div className="mode-tabs">
               {[
                 { id: "chat", label: t.playground.tabChat, icon: MessageSquare },

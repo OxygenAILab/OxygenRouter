@@ -4309,6 +4309,8 @@ struct SiteValues {
     faq: Vec<serde_json::Value>,
     /// The instance's own addresses, already parsed and gated by its switch.
     api_info: Vec<serde_json::Value>,
+    /// The operator's chat-client presets, parsed for `/ui/chat2link`.
+    chats: Vec<serde_json::Value>,
 }
 
 /// Read the four display values, each falling back to the schema's default.
@@ -4343,6 +4345,7 @@ fn site_values(s: &AppState) -> SiteValues {
     } else {
         Vec::new()
     };
+    let chats = json_list("Chats");
     SiteValues {
         site_name: s.db.typed_setting("SiteName", "OxygenRouter".to_string()),
         notice: s.db.typed_setting("Notice", String::new()),
@@ -4354,6 +4357,7 @@ fn site_values(s: &AppState) -> SiteValues {
         announcements,
         faq,
         api_info,
+        chats,
     }
 }
 
@@ -4648,7 +4652,9 @@ async fn update_option(
     let Some(schema) = oxygenrouter_core::find_schema(&input.key) else {
         return Json(ApiResponse::err(format!("unknown option: {}", input.key)));
     };
-    if let Err(error) = oxygenrouter_core::validate_option(schema.kind, &input.value) {
+    if let Err(error) =
+        oxygenrouter_core::validate_option_for_key(schema.key, schema.kind, &input.value)
+    {
         return Json(ApiResponse::err(error));
     }
     // A secret that reads as a mask is not a new value. Without this, a client

@@ -528,6 +528,10 @@ with all three client dialects.
 - ✅ **Prefill groups**, **group management** (all/usable/groups+ratios).
 - ✅ **Uptime-Kuma**: `/api/uptime/status` plus the overview panel, verified live
   against a mock status page (see `docs/FACT.md`).
+- ✅ **Chat presets and links**: `Chats` is shape-validated in the option store,
+  exposed publicly through `/api/site`, editable as a row-based client list, and
+  consumed by `/ui/chat2link`, which reveals an API key only for the explicit
+  open/copy action. `/ui/chat` is the playground in chat-only mode.
 - ✅ **System info**: the scheduled-task surface is `/api/system-task/*` with a
   `log_cleanup` runner and console page; the instance surface is
   `/api/system-info/*` plus the `/ui/system` panel, with 30-second heartbeats,
