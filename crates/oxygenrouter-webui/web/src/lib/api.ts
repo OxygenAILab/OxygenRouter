@@ -280,6 +280,24 @@ export interface SiteValues {
   notice: string;
   footer: string;
   server_address: string;
+  /** Already parsed by the server; empty when the block is switched off. */
+  announcements: Announcement[];
+  faq: FaqEntry[];
+}
+
+/** One operator announcement, in the reference's shape. */
+export interface Announcement {
+  id?: number;
+  content: string;
+  publishDate?: string;
+  /** `default` | `ongoing` | `success` | `warning` | `error`. */
+  type?: string;
+  extra?: string;
+}
+
+export interface FaqEntry {
+  question: string;
+  answer: string;
 }
 
 /** One recorded administrative action (`GET /api/audit-logs`). */

@@ -75,7 +75,7 @@ workspace is not a superset section-by-section:
 | operations | 7 | partly (log retention, data export, check-in) |
 | security | 3 | partly (fetch/SSRF policy, audit log, login attempts) |
 | request-policies | 3 | **missing** (the reference's request-policy editor) |
-| content | 7 | partly (uptime groups landed; announcements/FAQ/API info missing) |
+| content | 7 | partly: Uptime Kuma, announcements and the FAQ all have options and a public read (`/api/site`); the API-address block and chat/drawing presets are still missing |
 
 ## 4. Work list, in the order that unblocks the most
 
@@ -93,7 +93,9 @@ workspace is not a superset section-by-section:
    here was the root gate, now fixed.
 6. ~~**Audit log view**~~ — done 2026-10-19: `/ui/audit`, plus recording a denied
    privileged write with the caller's identity, which the middleware dropped.
-7. **Content sections** — announcements, FAQ, API info addresses, chat presets.
+7. **Content sections** — announcements and the FAQ are done (2026-10-19,
+   `/api/site`, with the overview rendering both); API info addresses and the
+   chat/drawing presets are still open.
 8. **Perf metrics** (`/api/perf-metrics[/summary]`) — the reference's
    latency/throughput page; needs recording on the relay path first.
 9. **Ratio sync** (`/api/ratio_sync`) — upstream price-table sync.

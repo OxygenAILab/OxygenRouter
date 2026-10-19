@@ -74,6 +74,18 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("ServerAddress", Site, String, "http://127.0.0.1:3001", "Public base address used in examples"),
     schema!("Notice", Site, String, "", "Announcement shown on the overview page"),
     schema!("Footer", Site, String, "GitHub@OxygenAILab | OxygenAILab@StarsailsClover", "Footer watermark text"),
+    // Display content, mirroring the reference's `console_setting` group: a
+    // switch per block so an operator can hide it without deleting the copy.
+    schema!("AnnouncementsEnabled", Site, Bool, "true", "Show announcements on the overview"),
+    schema!(
+        "Announcements",
+        Site,
+        String,
+        "[]",
+        "Announcements (JSON array of {content, publishDate, type, extra})"
+    ),
+    schema!("FaqEnabled", Site, Bool, "true", "Show the FAQ on the overview"),
+    schema!("Faq", Site, String, "[]", "FAQ entries (JSON array of {question, answer})"),
     // Auth
     schema!("RegistrationEnabled", Auth, Bool, "true", "Allow new users to register"),
     schema!("PasswordLoginEnabled", Auth, Bool, "true", "Allow password based sign-in"),

@@ -1580,6 +1580,27 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* Operator copy on the overview: announcements and the FAQ. */
+.announcement-list { display: grid; margin: 0; padding: 4px 0; list-style: none; }
+.announcement-item {
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--hairline);
+  border-left: 2px solid transparent;
+}
+.announcement-item:last-child { border-bottom: 0; }
+.announcement-content { font-size: 12px; line-height: 1.6; }
+.announcement-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; color: var(--md-on-surface-variant); font-size: 10px; }
+.announcement-item.is-ongoing { border-left-color: var(--md-info); }
+.announcement-item.is-success { border-left-color: var(--md-success); }
+.announcement-item.is-warning { border-left-color: var(--md-warning); }
+.announcement-item.is-error { border-left-color: var(--md-error); }
+.faq-list { padding: 4px 18px 14px; }
+.faq-item { padding: 10px 0; border-bottom: 1px solid var(--hairline); }
+.faq-item:last-child { border-bottom: 0; }
+.faq-item summary { cursor: pointer; font-size: 12px; font-weight: 500; }
+.faq-item summary::marker { color: var(--md-on-surface-variant); }
+.faq-item p { margin: 8px 0 0; color: var(--md-on-surface-variant); font-size: 12px; line-height: 1.7; }
+
 /* Audit trail: who did what, with the body on demand. */
 .audit-actor { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .audit-actor small { color: var(--md-on-surface-variant); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }

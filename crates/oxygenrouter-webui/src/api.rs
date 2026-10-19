@@ -4229,6 +4229,12 @@ struct SiteValues {
     notice: String,
     footer: String,
     server_address: String,
+    /// Live announcements, already parsed so the page renders them without
+    /// knowing the stored shape. An entry whose blob is malformed yields an
+    /// empty list rather than a broken overview: this is display copy, and a
+    /// typo in it must not take the page down.
+    announcements: Vec<serde_json::Value>,
+    faq: Vec<serde_json::Value>,
 }
 
 /// Read the four display values, each falling back to the schema's default.
@@ -4238,6 +4244,26 @@ struct SiteValues {
 /// out per caller — two spellings of "what is this instance called" would drift
 /// the moment one of them changed.
 fn site_values(s: &AppState) -> SiteValues {
+    let json_list = |key: &str| -> Vec<serde_json::Value> {
+        let raw = s.db.typed_setting(key, "[]".to_string());
+        match serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+            Ok(list) => list,
+            Err(error) => {
+                eprintln!("[OxygenRouter] {key} is not a JSON array of entries: {error}");
+                Vec::new()
+            }
+        }
+    };
+    let announcements = if s.db.typed_setting("AnnouncementsEnabled", true) {
+        json_list("Announcements")
+    } else {
+        Vec::new()
+    };
+    let faq = if s.db.typed_setting("FaqEnabled", true) {
+        json_list("Faq")
+    } else {
+        Vec::new()
+    };
     SiteValues {
         site_name: s.db.typed_setting("SiteName", "OxygenRouter".to_string()),
         notice: s.db.typed_setting("Notice", String::new()),
@@ -4246,6 +4272,8 @@ fn site_values(s: &AppState) -> SiteValues {
             "GitHub@OxygenAILab | OxygenAILab@StarsailsClover".to_string(),
         ),
         server_address: s.db.typed_setting("ServerAddress", String::new()),
+        announcements,
+        faq,
     }
 }
 

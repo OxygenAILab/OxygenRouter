@@ -170,6 +170,8 @@ export default function OverviewPage() {
   // origin when it has not been set.
   const { data: site } = useQuery({ queryKey: ["site"], queryFn: api.site.get, staleTime: 60_000 });
   const notice = site?.notice?.trim() ?? "";
+  const announcements = site?.announcements ?? [];
+  const faq = site?.faq ?? [];
   const baseUrl =
     site?.server_address?.trim() ||
     (status?.listen_host && status.listen_port
@@ -430,14 +432,47 @@ export default function OverviewPage() {
           <div className="info-panel">
             <div className="section-heading">
               <h2>{t.dashboard.announcements}</h2>
+              {announcements.length > 0 && <span className="section-meta">{announcements.length}</span>}
             </div>
-            <div className="announcements-empty">
-              <Sparkles size={24} className="announcements-icon" />
-              <span>{t.dashboard.noAnnouncements}</span>
-            </div>
+            {announcements.length === 0 ? (
+              <div className="announcements-empty">
+                <Sparkles size={24} className="announcements-icon" />
+                <span>{t.dashboard.noAnnouncements}</span>
+              </div>
+            ) : (
+              <ul className="announcement-list">
+                {announcements.map((announcement, index) => (
+                  <li className={`announcement-item is-${announcement.type ?? "default"}`} key={`${announcement.id ?? index}`}>
+                    <div className="announcement-content">{announcement.content}</div>
+                    <div className="announcement-meta">
+                      {announcement.publishDate && <span>{announcement.publishDate}</span>}
+                      {announcement.extra && <span>{announcement.extra}</span>}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         </section>
       </div>
+
+      {/* The operator's own answers, shown once they have written any. */}
+      {faq.length > 0 && (
+        <section className="dashboard-section">
+          <div className="section-heading">
+            <h2>{t.dashboard.faq}</h2>
+            <span className="section-meta">{faq.length}</span>
+          </div>
+          <div className="faq-list">
+            {faq.map((entry, index) => (
+              <details className="faq-item" key={`${entry.question}-${index}`}>
+                <summary>{entry.question}</summary>
+                <p>{entry.answer}</p>
+              </details>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Watermark footer */}
       <div className="watermark-footer">

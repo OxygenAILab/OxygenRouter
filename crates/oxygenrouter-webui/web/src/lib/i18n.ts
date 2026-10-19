@@ -112,6 +112,7 @@ export const STRINGS = {
       noMappings: "No mappings configured",
       announcements: "Announcements",
       noAnnouncements: "No announcements yet",
+      faq: "Frequently asked",
       uptime: {
         title: "Service Uptime",
         subtitle: "Availability reported by Uptime Kuma",
@@ -895,6 +896,7 @@ export const STRINGS = {
       noMappings: "未配置映射",
       announcements: "公告",
       noAnnouncements: "目前暂无公告",
+      faq: "常见问题",
       uptime: {
         title: "服务可用性",
         subtitle: "由 Uptime Kuma 上报的监控状态",
@@ -1681,6 +1683,7 @@ export type Strings = {
     noMappings: string;
     announcements: string;
     noAnnouncements: string;
+    faq: string;
     uptime: {
       title: string;
       subtitle: string;
