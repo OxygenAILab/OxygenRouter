@@ -1580,6 +1580,78 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* Rankings page: leaderboard, vendor share and history. */
+.rankings-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.rankings-vendors { display: grid; gap: 2px; padding: 12px 18px 16px; }
+.rankings-vendor-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px 52px 62px;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  font-size: 12px;
+}
+.rankings-vendor-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rankings-vendor-name small {
+  color: var(--md-on-surface-variant);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rankings-vendor-tokens { color: var(--md-on-surface-variant); font-size: 11px; text-align: right; }
+.rankings-movers { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 12px 18px 16px; }
+.rankings-movers-label { font-size: 11px; font-weight: 500; margin-bottom: 6px; }
+.rankings-movers-label.is-up { color: var(--md-success); }
+.rankings-movers-label.is-down { color: var(--md-error); }
+.rankings-mover-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 30px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--hairline);
+}
+.rankings-mover-row:last-child { border-bottom: 0; }
+.rankings-mover-row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rankings-chart { padding: 16px 18px 4px; min-height: 120px; }
+
+.ranking-rank { display: inline-flex; align-items: baseline; gap: 6px; }
+.ranking-rank b { font-family: var(--font-mono); font-size: 13px; }
+.ranking-rank small { font-size: 10px; }
+.ranking-rank small.is-up, .ranking-growth.is-up { color: var(--md-success); }
+.ranking-rank small.is-down, .ranking-growth.is-down { color: var(--md-error); }
+.ranking-share { display: flex; align-items: center; gap: 8px; }
+.ranking-share-track {
+  display: block;
+  flex: 1;
+  min-width: 40px;
+  height: 5px;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--md-surface-container-highest);
+}
+.ranking-share-track span { display: block; height: 100%; border-radius: inherit; background: var(--md-on-surface); }
+.ranking-growth { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; }
+.ranking-growth.is-flat { color: var(--md-on-surface-variant); }
+
+@media (max-width: 900px) {
+  .rankings-split { grid-template-columns: 1fr; }
+  .rankings-movers { grid-template-columns: 1fr; }
+}
+
 /* Model pricing page: a dense table with an inline editor. */
 .pricing-toolbar {
   display: flex;

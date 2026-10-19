@@ -51,6 +51,7 @@ export const STRINGS = {
       models: "Models",
       modelsMeta: "Model Registry",
       modelPricing: "Model Pricing",
+      rankings: "Rankings",
       wallet: "Wallet",
       plans: "Plans",
       subscriptions: "Subscriptions",
@@ -387,6 +388,34 @@ export const STRINGS = {
       updated: "Model metadata updated",
       deleted: "Model metadata deleted",
     },
+    rankings: {
+      title: "Model Rankings",
+      description: "Which models and vendors this instance actually serves",
+      period: "Period",
+      today: "Today",
+      week: "This week",
+      month: "This month",
+      totalTokens: "Tokens served",
+      modelsTracked: "Models ranked",
+      vendorsTracked: "Vendors ranked",
+      leader: "Top model",
+      leaderboard: "Leaderboard",
+      leaderboardMeta: "Top models by tokens served in the period",
+      rank: "Rank",
+      model: "Model",
+      vendor: "Vendor",
+      tokens: "Tokens",
+      share: "Share",
+      growth: "Growth",
+      empty: "No usage recorded in this period.",
+      vendorShare: "Vendor share",
+      movers: "Rank movers",
+      rising: "Rising",
+      falling: "Falling",
+      modelHistory: "Tokens by model",
+      modelHistoryMeta: "Top models over the period",
+      vendorHistory: "Vendor share over time",
+    },
     modelPricing: {
       title: "Model Pricing",
       description: "What each model costs, and the tables the billing engine reads",
@@ -683,6 +712,7 @@ export const STRINGS = {
       models: "模型",
       modelsMeta: "模型注册表",
       modelPricing: "模型定价",
+      rankings: "排行榜",
       wallet: "钱包",
       plans: "套餐",
       subscriptions: "订阅",
@@ -1020,6 +1050,34 @@ export const STRINGS = {
       updated: "模型元数据已更新",
       deleted: "模型元数据已删除",
     },
+    rankings: {
+      title: "模型排行榜",
+      description: "本实例实际服务的模型与供应商",
+      period: "时间范围",
+      today: "今日",
+      week: "本周",
+      month: "本月",
+      totalTokens: "服务 token 数",
+      modelsTracked: "上榜模型",
+      vendorsTracked: "上榜供应商",
+      leader: "领先模型",
+      leaderboard: "排行榜",
+      leaderboardMeta: "按本周期 token 数排序",
+      rank: "排名",
+      model: "模型",
+      vendor: "供应商",
+      tokens: "Token",
+      share: "占比",
+      growth: "增长",
+      empty: "该周期暂无使用记录。",
+      vendorShare: "供应商占比",
+      movers: "名次变动",
+      rising: "上升",
+      falling: "下降",
+      modelHistory: "各模型 token 趋势",
+      modelHistoryMeta: "本周期内领先模型",
+      vendorHistory: "供应商占比变化",
+    },
     modelPricing: {
       title: "模型定价",
       description: "每个模型的计价方式，以及计费引擎读取的价目表",
@@ -1317,6 +1375,7 @@ export type Strings = {
     models: string;
     modelsMeta: string;
     modelPricing: string;
+    rankings: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -1654,6 +1713,34 @@ export type Strings = {
     created: string;
     updated: string;
     deleted: string;
+  };
+  rankings: {
+    title: string;
+    description: string;
+    period: string;
+    today: string;
+    week: string;
+    month: string;
+    totalTokens: string;
+    modelsTracked: string;
+    vendorsTracked: string;
+    leader: string;
+    leaderboard: string;
+    leaderboardMeta: string;
+    rank: string;
+    model: string;
+    vendor: string;
+    tokens: string;
+    share: string;
+    growth: string;
+    empty: string;
+    vendorShare: string;
+    movers: string;
+    rising: string;
+    falling: string;
+    modelHistory: string;
+    modelHistoryMeta: string;
+    vendorHistory: string;
   };
   modelPricing: {
     title: string;

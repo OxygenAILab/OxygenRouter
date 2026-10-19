@@ -19,6 +19,7 @@ import {
   Settings,
   SlidersHorizontal,
   Sparkles,
+  Trophy,
   CreditCard,
   ShieldCheck,
   UserRound,
@@ -49,6 +50,7 @@ import SubscriptionsPage from "./pages/SubscriptionsPage";
 import AdminUsersPage from "./pages/AdminUsersPage";
 import AdminBillingPage from "./pages/AdminBillingPage";
 import ModelPricingPage from "./pages/ModelPricingPage";
+import RankingsPage from "./pages/RankingsPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -73,6 +75,9 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
   const navItems = [
     { path: `${BASE}/overview`, label: t.nav.overview, icon: Activity, key: "overview", count: null as number | null },
     { path: `${BASE}/analytics`, label: t.nav.analytics, icon: BarChart3, key: "analytics", count: null },
+    // Public, like the reference's rankings module: the API answers a signed-out
+    // visitor, so the page is not hidden behind a role.
+    { path: `${BASE}/rankings`, label: t.nav.rankings, icon: Trophy, key: "rankings", count: null },
     { path: `${BASE}/channels`, label: t.nav.channels, icon: Server, key: "channels", count: enabledChannels > 0 ? enabledChannels : null, total: totalChannels },
     { path: `${BASE}/keys`, label: t.nav.keys, icon: Key, key: "keys", count: totalKeys > 0 ? totalKeys : null },
     { path: `${BASE}/routes`, label: t.nav.routes, icon: RouteIcon, key: "routes", count: totalMaps > 0 ? totalMaps : null },
@@ -176,6 +181,7 @@ function TopBar() {
     // overview, which is the one label that is never right for them.
     "model-registry": t.nav.modelsMeta,
     "model-pricing": t.nav.modelPricing,
+    rankings: t.nav.rankings,
     "system-settings": t.nav.systemSettings,
     playground: t.nav.playground,
     system: t.nav.system,
@@ -302,6 +308,7 @@ function Shell() {
             <Route path="/ui/routes" element={<RoutesPage />} />
             <Route path="/ui/logs" element={<LogsPage />} />
             <Route path="/ui/models" element={<ModelsPage />} />
+            <Route path="/ui/rankings" element={<RankingsPage />} />
             <Route path="/ui/model-registry" element={<ModelMetadataPage />} />
             <Route path="/ui/model-pricing" element={<ModelPricingPage />} />
             <Route path="/ui/system" element={<SystemInfoPage />} />

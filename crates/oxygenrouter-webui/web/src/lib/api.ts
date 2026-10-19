@@ -282,6 +282,60 @@ export interface SiteValues {
   server_address: string;
 }
 
+/** One row of the public model leaderboard (`GET /api/rankings`). */
+export interface RankedModel {
+  rank: number;
+  previous_rank?: number;
+  model_name: string;
+  vendor: string;
+  vendor_icon?: string;
+  category: string;
+  total_tokens: number;
+  share: number;
+  growth_pct: number;
+}
+
+export interface RankedVendor {
+  rank: number;
+  vendor: string;
+  vendor_icon?: string;
+  total_tokens: number;
+  share: number;
+  growth_pct: number;
+  models_count: number;
+  top_model: string;
+}
+
+export interface RankingMover {
+  model_name: string;
+  vendor: string;
+  vendor_icon?: string;
+  rank_delta: number;
+  current_rank: number;
+  growth_pct: number;
+}
+
+export interface ModelHistorySeries {
+  points: Array<{ ts: string; label: string; model: string; vendor: string; tokens: number }>;
+  models: Array<{ name: string; vendor: string; total: number }>;
+  buckets: number;
+}
+
+export interface VendorShareSeries {
+  points: Array<{ ts: string; label: string; vendor: string; share: number; tokens: number }>;
+  vendors: Array<{ name: string; total: number; share: number }>;
+  buckets: number;
+}
+
+export interface RankingsResponse {
+  models: RankedModel[];
+  vendors: RankedVendor[];
+  top_movers: RankingMover[];
+  top_droppers: RankingMover[];
+  models_history: ModelHistorySeries;
+  vendor_share_history: VendorShareSeries;
+}
+
 /** One model's price, as `/api/option/model_pricing` reports it. */
 export interface ModelPricingEntry {
   model_name: string;
@@ -609,6 +663,10 @@ export const api = {
   },
   uptime: {
     get: () => apiFetch<UptimeGroupResult[]>('/uptime/status'),
+  },
+  rankings: {
+    get: (period: "today" | "week" | "month" = "week") =>
+      apiFetch<RankingsResponse>(`/rankings?period=${period}`),
   },
   modelPricing: {
     snapshot: (models: string[] = []) => {
