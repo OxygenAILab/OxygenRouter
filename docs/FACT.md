@@ -1053,6 +1053,31 @@ code, title and two actions, and the 503 screenshot is retained as
 `.devlogs/live_task/error-503.png` (the other four are alongside it). The
 frontend production build passed after the change.
 
+### System instance heartbeats (2026-10-20)
+
+`GET /api/system-info/instances`, `DELETE /api/system-info/instances/:node_name`
+and `DELETE /api/system-info/stale-instances` mirror the reference's RootAuth
+group. Every process reports on startup and every 30 seconds into
+`system_instances`; the row carries the stable `NODE_NAME` (falling back to the
+hostname with a console warning), runtime and host identity, and resource
+metrics. On Windows the reporter reads CPU deltas from `GetSystemTimes`, memory
+from `GlobalMemoryStatusEx`, and disk totals from `GetDiskFreeSpaceExW`; other
+platforms leave those optional fields absent rather than inventing zeros.
+
+An instance is `online` until its heartbeat is more than 90 seconds old. The
+individual delete refuses an online node with the reference's
+`instance is not stale or no longer exists`; the bulk delete removes only rows
+past that cutoff. `/ui/system` renders the list, refreshes every 30 seconds, and
+offers both delete actions.
+
+Verified live on 2026-10-20: the running node reported memory and disk usage;
+two injected stale rows appeared as `stale`; the online node could not be
+deleted; one-by-one and bulk deletion removed exactly the stale rows; anonymous
+read answered `401`, plain-user read `403`; and `last_seen_at` advanced after 30
+seconds. The browser panel displayed live CPU/memory/storage and completed a
+stale-row deletion through its confirmation dialog. Core suite 57/0, webui suite
+133/0, frontend production build passed.
+
 ## Open questions
 - _None recorded_
 

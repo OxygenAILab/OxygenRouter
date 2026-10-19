@@ -19,6 +19,7 @@ import {
 import { api, SystemInfo } from "../lib/api";
 import { PageHeader } from "../App";
 import { useI18n } from "../lib/i18nContext";
+import SystemInstancesPanel from "./SystemInstancesPanel";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -131,6 +132,8 @@ export default function SystemInfoPage() {
           </div>
         }
       />
+
+      <SystemInstancesPanel />
 
       <div className="info-tile-grid">
         <InfoTile

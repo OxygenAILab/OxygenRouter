@@ -481,6 +481,23 @@ pub struct SystemTask {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One gateway process that has reported a heartbeat.
+///
+/// Mirrors the reference's `model.SystemInstance`: the row is keyed by the
+/// stable node name, carries the last heartbeat, and keeps the reported
+/// environment as JSON so the console can render it without a schema change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SystemInstance {
+    pub node_name: String,
+    pub info: serde_json::Value,
+    /// Unix seconds when the process started.
+    pub started_at: i64,
+    /// Unix seconds of the most recent heartbeat.
+    pub last_seen_at: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// One hour of relay performance, summed across requests.
 ///
 /// The reference keeps this in its own `perf_metrics` table rather than deriving

@@ -144,6 +144,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/ratio_sync/fetch",
             post(crate::ratio_sync::fetch_upstreams),
         )
+        // System-instance heartbeats, matching the reference's RootAuth group
+        // (`router/api-router.go:331-337`).
+        .route(
+            "/api/system-info/instances",
+            get(crate::system_info::list_instances),
+        )
+        .route(
+            "/api/system-info/stale-instances",
+            delete(crate::system_info::delete_stale_instances),
+        )
+        .route(
+            "/api/system-info/instances/:node_name",
+            delete(crate::system_info::delete_stale_instance),
+        )
         .route("/api/system-task/list", get(crate::system_tasks::list_tasks))
         .route(
             "/api/system-task/history",
@@ -449,6 +463,7 @@ const ROOT_PREFIXES: &[&str] = &[
     "/api/option",
     "/api/settings",
     "/api/system/info",
+    "/api/system-info",
     "/api/backup",
     "/api/plugin",
     // Diagnostics. This entry was dropped once while removing the empty prefixes
@@ -5620,6 +5635,7 @@ mod classification_audit_tests {
             include_str!("perf_metrics.rs"),
             include_str!("system_tasks.rs"),
             include_str!("ratio_sync.rs"),
+            include_str!("system_info.rs"),
         );
         let mut out = Vec::new();
         let mut rest = source;

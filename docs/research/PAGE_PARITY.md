@@ -56,7 +56,7 @@ Status vocabulary:
 | `/security` | `/ui/security` over `/api/user/{2fa,sessions,token}` | live | driven live on 2026-10-19: sessions revoked, token generated/rotated/revoked, two-factor enabled with an independently generated TOTP code and then disabled |
 | `/users` | `/ui/admin/users` | route | |
 | `/task-plugins` | `/ui/task-plugins` over `/api/plugin/task*` | live | driven in the browser on 2026-10-19: a build uploaded, enabled and activated, and a driver hook dry-run from the console (which is what found the `call_hook` dispatch defect) |
-| `/system-info` | `/ui/system` | route | |
+| `/system-info` | `/ui/system` | live | the instance list, live CPU/memory/disk metrics, heartbeat timestamps and stale-instance deletion were driven in the browser and with `check_system_info.ps1` on 2026-10-20 |
 | `/chat`, `/chat2link` | — | **missing** | reference's own chat UI, not a gateway feature |
 
 ## 3. Settings workspace
@@ -118,7 +118,12 @@ workspace is not a superset section-by-section:
     are each drawn with recovery actions, and an unknown `/ui/*` path lands on
     the 404 view instead of silently rendering the overview. All five status
     views were driven in the browser on 2026-10-20.
-12. **OAuth + password reset** — the only auth surfaces still missing.
+12. ~~**System info instances**~~ — done 2026-10-20: `/api/system-info/instances`,
+    `/api/system-info/instances/:node_name` and `/api/system-info/stale-instances`
+    back the `/ui/system` panel; every process reports CPU, memory and disk
+    metrics every 30 seconds, and only heartbeats older than 90 seconds can be
+    removed. Verified live, including the browser delete flow.
+13. **OAuth + password reset** — the only auth surfaces still missing.
 
 ## 5. What "superset" will mean here
 

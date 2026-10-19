@@ -33,5 +33,13 @@ oxygenrouter-proxy = { path = "../oxygenrouter-proxy" }
 oxygenrouter-billing = { path = "../oxygenrouter-billing" }
 oxygenrouter-plugin = { path = "../oxygenrouter-plugin" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3.27.0"

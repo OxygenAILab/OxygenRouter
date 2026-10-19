@@ -528,9 +528,11 @@ with all three client dialects.
 - ✅ **Prefill groups**, **group management** (all/usable/groups+ratios).
 - ✅ **Uptime-Kuma**: `/api/uptime/status` plus the overview panel, verified live
   against a mock status page (see `docs/FACT.md`).
-- 🔶 **System info**: the scheduled-task surface landed as `/api/system-task/*`
-  with a `log_cleanup` runner and a console page; instance listing and
-  stale-instance cleanup are still missing.
+- ✅ **System info**: the scheduled-task surface is `/api/system-task/*` with a
+  `log_cleanup` runner and console page; the instance surface is
+  `/api/system-info/*` plus the `/ui/system` panel, with 30-second heartbeats,
+  live CPU/memory/disk metrics on Windows, 90-second stale detection, and
+  selective or bulk stale-row cleanup. Verified live 2026-10-20.
 
 ---
 

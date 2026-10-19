@@ -1784,6 +1784,7 @@ dependencies = [
  "tower-http 0.5.2",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

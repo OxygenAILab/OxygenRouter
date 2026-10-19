@@ -25,8 +25,8 @@ use super::{
     AnalyticsFilters, AnalyticsFlow, AnalyticsFlowLink, AnalyticsFlowNode, ApiKey, ApiKeyUsage,
     AuthSession, Channel, ChannelInfo, ChannelPerf, DashboardBreakdown, DashboardSnapshot,
     LedgerEntry, ModelMap, ModelMetadata, ModelTimeBucket, PaymentOrder, RedemptionCode, RequestLog,
-    RouteRule, RouteType, Subscription, SubscriptionPlan, SystemStatus, TimeBucket, User, UserRole,
-    Vendor,
+    RouteRule, RouteType, Subscription, SubscriptionPlan, SystemInstance, SystemStatus, TimeBucket,
+    User, UserRole, Vendor,
 };
 
 fn json_string<T: serde::Serialize>(value: &T) -> String {
@@ -402,6 +402,22 @@ impl Database {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_system_tasks_active
                 ON system_tasks(task_type) WHERE status IN ('pending','running');
             CREATE INDEX IF NOT EXISTS idx_system_tasks_created ON system_tasks(created_at DESC);
+
+            -- One row per reporting gateway process. The primary key is the
+            -- stable node identity; a heartbeat is an upsert, and stale rows are
+            -- deleted only after the reference's 90-second grace period.
+            CREATE TABLE IF NOT EXISTS system_instances (
+                node_name    TEXT PRIMARY KEY,
+                info         TEXT NOT NULL DEFAULT '{}',
+                started_at   INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_system_instances_last_seen
+                ON system_instances(last_seen_at DESC);
+            INSERT OR IGNORE INTO migrations(version, applied_at)
+                VALUES ('20261020_system_instances', datetime('now'));
 
             -- Daily check-in claims. The unique index is the once-a-day guard;
             -- a read-then-write check in the handler would let two simultaneous
@@ -2275,6 +2291,87 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
             error: r.get(7)?,
             created_at: parse(r.get(8)?),
             updated_at: parse(r.get(9)?),
+        })
+    }
+
+    // ── System instances (heartbeats) ────────────────────────────────────────
+
+    /// Insert or refresh one gateway process heartbeat.
+    pub fn upsert_system_instance(
+        &self,
+        node_name: &str,
+        info: &serde_json::Value,
+        started_at: i64,
+        last_seen_at: i64,
+    ) -> SqliteResult<()> {
+        let node_name = node_name.trim();
+        if node_name.is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "node name is empty".to_string(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let info = serde_json::to_string(info).unwrap_or_else(|_| "{}".to_string());
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO system_instances \
+             (node_name,info,started_at,last_seen_at,created_at,updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?5) \
+             ON CONFLICT(node_name) DO UPDATE SET \
+                 info=excluded.info, started_at=excluded.started_at, \
+                 last_seen_at=excluded.last_seen_at, updated_at=excluded.updated_at",
+            params![node_name, info, started_at, last_seen_at, now],
+        )?;
+        Ok(())
+    }
+
+    /// Every reported instance, newest heartbeat first.
+    pub fn list_system_instances(&self) -> SqliteResult<Vec<SystemInstance>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT node_name,info,started_at,last_seen_at,created_at,updated_at \
+             FROM system_instances ORDER BY last_seen_at DESC, node_name ASC",
+        )?;
+        let rows = stmt.query_map([], Self::system_instance_from_row)?;
+        rows.collect()
+    }
+
+    /// Delete every heartbeat older than `cutoff`, returning the row count.
+    pub fn delete_stale_system_instances(&self, cutoff: i64) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM system_instances WHERE last_seen_at < ?1",
+            params![cutoff],
+        )?)
+    }
+
+    /// Delete one named heartbeat only when it is older than `cutoff`.
+    pub fn delete_stale_system_instance(
+        &self,
+        node_name: &str,
+        cutoff: i64,
+    ) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM system_instances WHERE node_name=?1 AND last_seen_at < ?2",
+            params![node_name.trim(), cutoff],
+        )?)
+    }
+
+    fn system_instance_from_row(r: &rusqlite::Row<'_>) -> SqliteResult<SystemInstance> {
+        let parse = |s: String| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|v| v.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now())
+        };
+        Ok(SystemInstance {
+            node_name: r.get(0)?,
+            info: serde_json::from_str(&r.get::<_, String>(1)?)
+                .unwrap_or(serde_json::Value::Null),
+            started_at: r.get(2)?,
+            last_seen_at: r.get(3)?,
+            created_at: parse(r.get(4)?),
+            updated_at: parse(r.get(5)?),
         })
     }
 
@@ -5528,5 +5625,52 @@ mod task_store_tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].task_id, "t2", "newest first");
         assert!(db.list_tasks_for_platform("other").expect("list").is_empty());
+    }
+
+    #[test]
+    fn system_instance_heartbeats_upsert_and_stale_deletes_are_selective() {
+        let db = Database::new(":memory:").expect("db");
+        db.upsert_system_instance(
+            "node-a",
+            &serde_json::json!({"runtime": {"version": "one"}}),
+            10,
+            100,
+        )
+        .expect("first heartbeat");
+        db.upsert_system_instance(
+            "node-a",
+            &serde_json::json!({"runtime": {"version": "two"}}),
+            10,
+            200,
+        )
+        .expect("second heartbeat");
+        db.upsert_system_instance("node-b", &serde_json::json!({}), 20, 50)
+            .expect("stale heartbeat");
+
+        let instances = db.list_system_instances().expect("list");
+        assert_eq!(instances.len(), 2, "heartbeats are keyed by node name");
+        assert_eq!(instances[0].node_name, "node-a");
+        assert_eq!(instances[0].last_seen_at, 200);
+        assert_eq!(instances[0].info["runtime"]["version"], "two");
+
+        assert_eq!(
+            db.delete_stale_system_instance("node-a", 100)
+                .expect("active is kept"),
+            0
+        );
+        assert_eq!(
+            db.delete_stale_system_instance("node-b", 100)
+                .expect("stale is removed"),
+            1
+        );
+        assert!(db.list_system_instances().expect("list").len() == 1);
+
+        db.upsert_system_instance("node-c", &serde_json::json!({}), 30, 40)
+            .expect("another stale heartbeat");
+        assert_eq!(
+            db.delete_stale_system_instances(100)
+                .expect("bulk stale delete"),
+            1
+        );
     }
 }

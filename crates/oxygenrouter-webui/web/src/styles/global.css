@@ -1670,6 +1670,35 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   .error-page-actions > * { width: 100%; }
 }
 
+.instance-panel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px 12px;
+}
+.instance-panel-state {
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  padding: 32px 16px;
+  color: var(--md-on-surface-variant);
+  font-size: 13px;
+}
+.instance-table { min-width: 1120px; }
+.instance-table th,
+.instance-table td { white-space: nowrap; }
+.instance-table .icon-button { width: 32px; height: 32px; min-height: 32px; }
+.instance-name { display: flex; align-items: center; gap: 10px; min-width: 180px; }
+.instance-name .status-dot { flex: 0 0 auto; }
+.instance-node { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+.instance-node svg { color: var(--md-warning); }
+.instance-host { color: var(--md-on-surface-variant); font: 11px var(--font-mono); margin-top: 2px; }
+
+@media (max-width: 640px) {
+  .instance-panel-toolbar { align-items: flex-start; flex-direction: column; }
+}
+
 @media (max-width: 720px) {
   .api-info-url { display: none; }
 }

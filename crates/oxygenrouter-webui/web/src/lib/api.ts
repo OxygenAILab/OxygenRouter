@@ -1049,6 +1049,14 @@ export const api = {
   },
   system: {
     info: () => apiFetch<SystemInfo>('/system/info'),
+    instances: () => apiFetch<SystemInstance[]>('/system-info/instances'),
+    deleteStaleInstances: () =>
+      apiFetch<SystemInstanceDeleteResult>('/system-info/stale-instances', { method: 'DELETE' }),
+    deleteStaleInstance: (nodeName: string) =>
+      apiFetch<SystemInstanceDeleteResult>(
+        `/system-info/instances/${encodeURIComponent(nodeName)}`,
+        { method: 'DELETE' },
+      ),
   },
   backup: {
     create: async (): Promise<void> => {
@@ -1092,4 +1100,47 @@ export interface SystemInfo {
   rustc_version: string;
   build_profile: string;
   started_at: string;
+}
+
+export interface SystemInstanceResources {
+  cpu?: { usage_percent?: number };
+  memory?: { usage_percent?: number };
+  storage?: {
+    total_bytes?: number;
+    used_bytes?: number;
+    free_bytes?: number;
+    used_percent?: number;
+  };
+}
+
+export interface SystemInstanceInfo {
+  schema_version?: number;
+  node?: {
+    name?: string;
+    source?: string;
+    manually_configured?: boolean;
+    should_configure_manually?: boolean;
+  };
+  role?: { is_master?: boolean };
+  runtime?: {
+    version?: string;
+    goos?: string;
+    goarch?: string;
+    started_at?: number;
+  };
+  host?: { hostname?: string };
+  resources?: SystemInstanceResources;
+}
+
+export interface SystemInstance {
+  node_name: string;
+  status: "online" | "stale";
+  stale_after_seconds: number;
+  started_at: number;
+  last_seen_at: number;
+  info: SystemInstanceInfo;
+}
+
+export interface SystemInstanceDeleteResult {
+  deleted_count: number;
 }

@@ -14,6 +14,7 @@ pub mod proxy;
 pub mod rankings;
 pub mod ratio_sync;
 mod state;
+pub mod system_info;
 pub mod system_tasks;
 pub mod task_transport;
 pub mod uptime;

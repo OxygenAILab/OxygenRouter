@@ -770,6 +770,30 @@ export const STRINGS = {
       backupPending: "Creating…",
       backupConfirm: "Generate a backup of the database now?",
       loadError: "Could not load system info.",
+      instances: "Instances",
+      instancesDesc: "Nodes reporting from this deployment and their latest heartbeat.",
+      instance: "Instance",
+      status: "Status",
+      role: "Role",
+      master: "Master",
+      worker: "Worker",
+      online: "Online",
+      stale: "Stale",
+      cpu: "CPU",
+      memory: "Memory",
+      storage: "Storage",
+      started: "Started",
+      lastSeen: "Last seen",
+      actions: "Actions",
+      loading: "Loading instances…",
+      noInstances: "No instances have reported yet.",
+      autoRefresh: "Auto-refreshing every 30s",
+      deleteAllStale: "Delete all stale",
+      deleteStale: "Delete stale instance",
+      deleteFailed: "Delete failed",
+      deleteAllConfirm: "Delete {n} stale instance records? Online instances will not be deleted.",
+      deleteOneConfirm: "Delete stale instance \"{name}\"? If it has reported again, it will not be deleted.",
+      nodeAutoWarning: "Using an automatic hostname. Set NODE_NAME to a stable unique value for multi-instance management.",
     },
     playground: {
       title: "Playground",
@@ -1656,6 +1680,30 @@ export const STRINGS = {
       backupPending: "正在创建…",
       backupConfirm: "确定要立即生成数据库备份吗？",
       loadError: "无法加载系统信息。",
+      instances: "实例",
+      instancesDesc: "从此部署上报的节点及其最近一次心跳。",
+      instance: "实例",
+      status: "状态",
+      role: "角色",
+      master: "主节点",
+      worker: "工作节点",
+      online: "在线",
+      stale: "陈旧",
+      cpu: "CPU",
+      memory: "内存",
+      storage: "存储",
+      started: "启动于",
+      lastSeen: "最近心跳",
+      actions: "操作",
+      loading: "正在加载实例…",
+      noInstances: "尚无实例上报。",
+      autoRefresh: "每 30 秒自动刷新",
+      deleteAllStale: "删除全部陈旧实例",
+      deleteStale: "删除陈旧实例",
+      deleteFailed: "删除失败",
+      deleteAllConfirm: "确定删除 {n} 条陈旧实例记录吗？在线实例不会被删除。",
+      deleteOneConfirm: "确定删除陈旧实例“{name}”吗？若它已重新上报，则不会被删除。",
+      nodeAutoWarning: "当前使用自动主机名。多实例管理请设置稳定的唯一 NODE_NAME。",
     },
     playground: {
       title: "演练场",
@@ -2544,6 +2592,30 @@ export type Strings = {
     backupPending: string;
     backupConfirm: string;
     loadError: string;
+    instances: string;
+    instancesDesc: string;
+    instance: string;
+    status: string;
+    role: string;
+    master: string;
+    worker: string;
+    online: string;
+    stale: string;
+    cpu: string;
+    memory: string;
+    storage: string;
+    started: string;
+    lastSeen: string;
+    actions: string;
+    loading: string;
+    noInstances: string;
+    autoRefresh: string;
+    deleteAllStale: string;
+    deleteStale: string;
+    deleteFailed: string;
+    deleteAllConfirm: string;
+    deleteOneConfirm: string;
+    nodeAutoWarning: string;
   };
   playground: {
     title: string;

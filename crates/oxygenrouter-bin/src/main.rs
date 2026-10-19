@@ -177,6 +177,10 @@ async fn main() {
     state.reload_scheduler_maps().await;
     // Apply this instance's own pricing overrides on top of the shipped pack.
     state.reload_pricing();
+    // The reference reports every process into a shared instance table. Start
+    // the heartbeat here, after the state is fully initialized, so the first
+    // console read already has this node.
+    oxygenrouter_webui::system_info::start_reporter(state.clone());
 
     // Retention. `LogRetentionDays` shipped documented as "0 keeps logs forever"
     // and nothing ever pruned, so the table grew without bound. Hourly is often
