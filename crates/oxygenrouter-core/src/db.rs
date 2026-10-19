@@ -2794,6 +2794,26 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
         Ok(())
     }
 
+    /// Write several settings as one unit.
+    ///
+    /// The pricing tables are three separate keys that the engine reads
+    /// together, so a write that landed on only some of them would price a model
+    /// somewhere the console cannot show — e.g. an expression stored while its
+    /// mode still says `ratio`. `set_setting` cannot be composed into that
+    /// guarantee, which is why this exists rather than three calls.
+    pub fn set_settings_atomic(&self, rows: &[(String, String)]) -> SqliteResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for (key, value) in rows {
+            tx.execute(
+                "INSERT INTO settings (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The instance's crypto secret, minted once and kept for the life of the
     /// database.
     ///

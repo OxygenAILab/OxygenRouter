@@ -282,6 +282,41 @@ export interface SiteValues {
   server_address: string;
 }
 
+/** One model's price, as `/api/option/model_pricing` reports it. */
+export interface ModelPricingEntry {
+  model_name: string;
+  /** Hash of `configured`; a save must present it back. */
+  version: string;
+  /** Only what the operator stored for this model. */
+  configured: Record<string, unknown>;
+  /** What the engine will actually charge, defaults included. */
+  effective: Record<string, unknown>;
+}
+
+export interface ModelPricingSnapshot {
+  entries: ModelPricingEntry[];
+  options: Record<string, string>;
+  empty_version: string;
+}
+
+export interface ModelPricingDetails {
+  mode: string;
+  input_price_per_million?: number;
+  output_price_per_million?: number;
+  per_call_price?: number;
+}
+
+export interface ModelPricingPreview {
+  effective: Record<string, unknown>;
+  billing_details: ModelPricingDetails;
+}
+
+export interface ModelPricingConversion {
+  expression?: string;
+  unsupported_reason?: string;
+  effective: Record<string, unknown>;
+}
+
 /** One row of the Uptime-Kuma panel, as `/api/uptime/status` reports it. */
 export interface UptimeMonitor {
   name: string;
@@ -574,6 +609,29 @@ export const api = {
   },
   uptime: {
     get: () => apiFetch<UptimeGroupResult[]>('/uptime/status'),
+  },
+  modelPricing: {
+    snapshot: (models: string[] = []) => {
+      const query = models.map((model) => `model=${encodeURIComponent(model)}`).join('&');
+      return apiFetch<ModelPricingSnapshot>(`/option/model_pricing${query ? `?${query}` : ''}`);
+    },
+    preview: (model_name: string, pricing: Record<string, unknown>) =>
+      apiFetch<ModelPricingPreview>('/option/model_pricing/preview', {
+        method: 'POST',
+        body: JSON.stringify({ model_name, pricing }),
+      }),
+    convert: (model_name: string, pricing: Record<string, unknown>) =>
+      apiFetch<ModelPricingConversion>('/option/model_pricing/convert', {
+        method: 'POST',
+        body: JSON.stringify({ model_name, pricing }),
+      }),
+    update: (changes: Array<{ model_name: string; expected_version?: string; pricing?: Record<string, unknown>; reset?: boolean }>) =>
+      apiFetch<string[]>('/option/model_pricing', { method: 'PATCH', body: JSON.stringify({ changes }) }),
+    reset: (models: string[] = []) =>
+      apiFetch<string[]>('/option/reset_model_pricing', {
+        method: 'POST',
+        body: JSON.stringify({ models }),
+      }),
   },
   dashboard: {
     get: (timeRange: string = "24h", filters: Record<string, string | undefined> = {}) => {

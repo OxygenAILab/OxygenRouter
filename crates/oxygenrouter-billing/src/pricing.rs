@@ -320,6 +320,19 @@ impl Pricing {
     pub fn expression_count(&self) -> usize {
         self.defaults.pricing.billing_expr.len().max(self.expr_overrides.len())
     }
+
+    /// Every model that has an expression, operator-set or shipped, sorted.
+    ///
+    /// This is the catalogue the pricing console lists, mirroring the reference's
+    /// `GetBuiltinBillingExprCopy` plus its stored maps: a model priced only by
+    /// the legacy ratio table is deliberately not enumerated, because the shipped
+    /// ratio table holds thousands of rows and the console reaches those by name.
+    pub fn expression_models(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        names.extend(self.expr_overrides.keys().cloned());
+        names.extend(self.defaults.pricing.billing_expr.keys().cloned());
+        names.into_iter().collect()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

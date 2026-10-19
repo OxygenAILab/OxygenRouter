@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   BarChart3,
+  Calculator,
   ChevronRight,
   Cpu,
   FileText,
@@ -47,6 +48,7 @@ import PlansPage from "./pages/PlansPage";
 import SubscriptionsPage from "./pages/SubscriptionsPage";
 import AdminUsersPage from "./pages/AdminUsersPage";
 import AdminBillingPage from "./pages/AdminBillingPage";
+import ModelPricingPage from "./pages/ModelPricingPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -85,6 +87,9 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
     { path: `${BASE}/plans`, label: t.nav.plans, icon: Sparkles, key: "plans", count: null },
     { path: `${BASE}/subscriptions`, label: t.nav.subscriptions, icon: UserRound, key: "subscriptions", count: null },
   ];
+  // The price tables are the owner's: the API gates them on root, and a nav
+  // entry a non-root user cannot use would invite a dead end.
+  if (user?.role === "root") navItems.push({ path: `${BASE}/model-pricing`, label: t.nav.modelPricing, icon: Calculator, key: "model-pricing", count: null });
   if (user?.role === "admin") navItems.push({ path: `${BASE}/admin/users`, label: t.nav.users, icon: UserRound, key: "admin-users", count: null }, { path: `${BASE}/admin/billing`, label: t.nav.billing, icon: ShieldCheck, key: "admin-billing", count: null });
   return (
     <aside className={`app-sidebar ${open ? "is-open" : ""} ${collapsed ? "is-collapsed" : ""}`}>
@@ -166,6 +171,12 @@ function TopBar() {
     routes: t.nav.routes,
     logs: t.nav.logs,
     models: t.nav.models,
+    // The registry, the settings workspace and the price tables each have their
+    // own route; without an entry here the breadcrumb claimed they were the
+    // overview, which is the one label that is never right for them.
+    "model-registry": t.nav.modelsMeta,
+    "model-pricing": t.nav.modelPricing,
+    "system-settings": t.nav.systemSettings,
     playground: t.nav.playground,
     system: t.nav.system,
     settings: t.nav.settings,
@@ -292,6 +303,7 @@ function Shell() {
             <Route path="/ui/logs" element={<LogsPage />} />
             <Route path="/ui/models" element={<ModelsPage />} />
             <Route path="/ui/model-registry" element={<ModelMetadataPage />} />
+            <Route path="/ui/model-pricing" element={<ModelPricingPage />} />
             <Route path="/ui/system" element={<SystemInfoPage />} />
             <Route path="/ui/system-settings" element={<SystemSettingsPage />} />
             <Route path="/ui/playground" element={<PlaygroundPage />} />

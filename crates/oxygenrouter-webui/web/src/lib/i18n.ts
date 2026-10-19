@@ -1,4 +1,4 @@
-﻿export type Locale = "en" | "zh";
+export type Locale = "en" | "zh";
 
 export const STRINGS = {
   en: {
@@ -50,6 +50,7 @@ export const STRINGS = {
       playground: "Playground",
       models: "Models",
       modelsMeta: "Model Registry",
+      modelPricing: "Model Pricing",
       wallet: "Wallet",
       plans: "Plans",
       subscriptions: "Subscriptions",
@@ -386,6 +387,38 @@ export const STRINGS = {
       updated: "Model metadata updated",
       deleted: "Model metadata deleted",
     },
+    modelPricing: {
+      title: "Model Pricing",
+      description: "What each model costs, and the tables the billing engine reads",
+      model: "Model",
+      mode: "Billing mode",
+      modeRatio: "Ratio",
+      modeExpr: "Expression",
+      configured: "Configured",
+      effective: "Effective",
+      inherited: "inherited",
+      empty: "No models to price.",
+      emptyHint: "Press Enter to load that model by name.",
+      lookupFailed: "The model could not be loaded",
+      searchPlaceholder: "Search a model…",
+      resetAll: "Reset all",
+      resetOne: "Reset this model",
+      resetDone: "Reset {n} models",
+      edit: "Edit price",
+      ratio: "ModelRatio",
+      ratioHint: "One ratio unit is $2 per million tokens at the shipped QuotaPerUnit.",
+      expression: "Billing expression",
+      expressionHint: "USD per million tokens, e.g. tier(\"base\", p * 2 + c * 6 + cr * 0.2)",
+      preview: "Preview",
+      convert: "Convert to expression",
+      converted: "Equivalent expression",
+      inputPrice: "Input",
+      outputPrice: "Output",
+      perCall: "Per call",
+      saved: "Price saved",
+      saveFailed: "The price was not saved",
+      previewFailed: "The draft was refused",
+    },
     settings: {
       title: "Settings",
       description: "Configure OxygenRouter behavior",
@@ -649,6 +682,7 @@ export const STRINGS = {
       playground: "演练场",
       models: "模型",
       modelsMeta: "模型注册表",
+      modelPricing: "模型定价",
       wallet: "钱包",
       plans: "套餐",
       subscriptions: "订阅",
@@ -986,6 +1020,38 @@ export const STRINGS = {
       updated: "模型元数据已更新",
       deleted: "模型元数据已删除",
     },
+    modelPricing: {
+      title: "模型定价",
+      description: "每个模型的计价方式，以及计费引擎读取的价目表",
+      model: "模型",
+      mode: "计价方式",
+      modeRatio: "倍率",
+      modeExpr: "表达式",
+      configured: "已配置",
+      effective: "生效值",
+      inherited: "继承默认",
+      empty: "暂无可定价模型。",
+      emptyHint: "按回车按名称加载该模型。",
+      lookupFailed: "无法加载该模型",
+      searchPlaceholder: "搜索模型…",
+      resetAll: "全部重置",
+      resetOne: "重置该模型",
+      resetDone: "已重置 {n} 个模型",
+      edit: "编辑定价",
+      ratio: "模型倍率",
+      ratioHint: "在默认 QuotaPerUnit 下，1 倍率约等于每百万 token 2 美元。",
+      expression: "计费表达式",
+      expressionHint: "单位为每百万 token 美元，例如 tier(\"base\", p * 2 + c * 6 + cr * 0.2)",
+      preview: "预览",
+      convert: "转换为表达式",
+      converted: "等价表达式",
+      inputPrice: "输入",
+      outputPrice: "输出",
+      perCall: "每次调用",
+      saved: "定价已保存",
+      saveFailed: "定价未保存",
+      previewFailed: "草稿被拒绝",
+    },
     settings: {
       title: "设置",
       description: "配置 OxygenRouter 行为",
@@ -1250,6 +1316,7 @@ export type Strings = {
     playground: string;
     models: string;
     modelsMeta: string;
+    modelPricing: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -1587,6 +1654,38 @@ export type Strings = {
     created: string;
     updated: string;
     deleted: string;
+  };
+  modelPricing: {
+    title: string;
+    description: string;
+    model: string;
+    mode: string;
+    modeRatio: string;
+    modeExpr: string;
+    configured: string;
+    effective: string;
+    inherited: string;
+    empty: string;
+    emptyHint: string;
+    lookupFailed: string;
+    searchPlaceholder: string;
+    resetAll: string;
+    resetOne: string;
+    resetDone: string;
+    edit: string;
+    ratio: string;
+    ratioHint: string;
+    expression: string;
+    expressionHint: string;
+    preview: string;
+    convert: string;
+    converted: string;
+    inputPrice: string;
+    outputPrice: string;
+    perCall: string;
+    saved: string;
+    saveFailed: string;
+    previewFailed: string;
   };
   settings: {
     title: string;

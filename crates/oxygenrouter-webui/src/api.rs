@@ -3,7 +3,7 @@
 //! GitHub@OxygenAILab | OxygenAILab@StarsailsClover
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, patch, post, put},
@@ -123,6 +123,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/settings", put(update_settings))
         .route("/api/options", get(get_options))
         .route("/api/options", put(update_option))
+        // Per-model pricing. The reference serves this under its root-only
+        // `/option` group (`router/api-router.go:203-214`), read included, and a
+        // price is what every user is charged, so it stays the owner's here too.
+        .route("/api/option/model_pricing", get(get_model_pricing))
+        .route("/api/option/model_pricing", patch(patch_model_pricing))
+        .route(
+            "/api/option/model_pricing/preview",
+            post(preview_model_pricing),
+        )
+        .route(
+            "/api/option/model_pricing/convert",
+            post(convert_model_pricing),
+        )
+        // The whole-table reset the reference calls `ResetModelRatio`, plus the
+        // narrower per-model form. Both spellings of the reference's own route
+        // are served: its path is misspelled (`rest_model_ratio`), and a client
+        // written against it should not have to know that.
+        .route(
+            "/api/option/reset_model_pricing",
+            post(reset_model_pricing),
+        )
+        .route("/api/option/rest_model_ratio", post(reset_model_pricing))
         .route("/api/system/info", get(system_info))
         .route("/api/backup/create", post(create_backup))
         .route("/api/auth/register", post(register))
@@ -359,6 +381,10 @@ const PUBLIC_ROUTES: &[&str] = &[
 /// reveal or rewrite instance-wide configuration.
 const ROOT_PREFIXES: &[&str] = &[
     "/api/options",
+    // The per-model price tables. The reference gates this whole group on
+    // `RootAuth` (`router/api-router.go:203`), read included: what a model costs
+    // is the operator's commercial decision, not an admin's.
+    "/api/option",
     "/api/settings",
     "/api/system/info",
     "/api/backup",
@@ -4455,6 +4481,117 @@ async fn update_option(
     }
 }
 
+/// The `model` values of a query string, which may repeat.
+///
+/// `serde_urlencoded` cannot express a repeated key, and the reference reads
+/// this one with `QueryArray` (`controller/model_pricing_config.go:12`), so the
+/// raw query is parsed here rather than narrowing the API to one model per call.
+fn requested_models(query: Option<&str>) -> Vec<String> {
+    query
+        .map(|raw| {
+            url::form_urlencoded::parse(raw.as_bytes())
+                .filter(|(key, _)| key == "model")
+                .map(|(_, value)| value.into_owned())
+                .filter(|value| !value.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The console's shape for a pricing request that was refused.
+fn pricing_error<T: Serialize>(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse::<T>::err(message)),
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ModelPricingDraftInput {
+    model_name: String,
+    #[serde(default)]
+    pricing: crate::pricing_config::PricingValues,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelPricingUpdateInput {
+    #[serde(default)]
+    changes: Vec<crate::pricing_config::ModelPricingChange>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ModelPricingResetInput {
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+/// `GET /api/option/model_pricing[?model=a&model=b]`
+async fn get_model_pricing(
+    State(s): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    match crate::pricing_config::snapshot(&s, &requested_models(query.as_deref())) {
+        Ok(snapshot) => Json(ApiResponse::ok(snapshot)).into_response(),
+        Err(error) => pricing_error::<crate::pricing_config::ModelPricingSnapshot>(error),
+    }
+}
+
+/// `PUT`-style batch update of the three price tables, one change per model.
+async fn patch_model_pricing(
+    State(s): State<Arc<AppState>>,
+    Json(input): Json<ModelPricingUpdateInput>,
+) -> Response {
+    match crate::pricing_config::apply(&s, &input.changes) {
+        Ok(updated) => Json(ApiResponse::ok(updated)).into_response(),
+        // A version mismatch is what the reference answers 409 for, and the
+        // status is derived from the error variant rather than its wording.
+        Err(crate::pricing_config::WriteError::Conflict(message)) => (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<Vec<String>>::err(message)),
+        )
+            .into_response(),
+        Err(error) => pricing_error::<Vec<String>>(error.message().to_string()),
+    }
+}
+
+/// `POST /api/option/model_pricing/preview` — resolve a draft, storing nothing.
+async fn preview_model_pricing(
+    State(s): State<Arc<AppState>>,
+    Json(input): Json<ModelPricingDraftInput>,
+) -> Response {
+    match crate::pricing_config::preview(&s, &input.model_name, &input.pricing) {
+        Ok(preview) => Json(ApiResponse::ok(preview)).into_response(),
+        Err(error) => pricing_error::<crate::pricing_config::ModelPricingPreview>(error),
+    }
+}
+
+/// `POST /api/option/model_pricing/convert` — the legacy ratio as an expression.
+async fn convert_model_pricing(
+    State(s): State<Arc<AppState>>,
+    Json(input): Json<ModelPricingDraftInput>,
+) -> Response {
+    match crate::pricing_config::convert(&s, &input.model_name, &input.pricing) {
+        Ok(conversion) => Json(ApiResponse::ok(conversion)).into_response(),
+        Err(error) => pricing_error::<crate::pricing_config::ModelPricingConversion>(error),
+    }
+}
+
+/// `POST /api/option/reset_model_pricing` — forget stored overrides.
+///
+/// An absent body resets every overridden model, which is the reference's
+/// table-wide `ResetModelRatio`; `{"models":["a"]}` narrows it.
+async fn reset_model_pricing(
+    State(s): State<Arc<AppState>>,
+    body: Option<Json<ModelPricingResetInput>>,
+) -> Response {
+    let models = body.map(|Json(input)| input.models).unwrap_or_default();
+    match crate::pricing_config::reset(&s, &models) {
+        Ok(reset) => Json(ApiResponse::ok(reset)).into_response(),
+        Err(error) => pricing_error::<Vec<String>>(error.message().to_string()),
+    }
+}
+
 async fn update_settings(
     State(s): State<Arc<AppState>>,
     Json(input): Json<UpdateSettingsInput>,
@@ -4723,6 +4860,14 @@ mod access_tests {
             "/api/options",
             "/api/settings",
             "/api/system/info",
+            // The price tables. The reference gates its whole `/option` group on
+            // `RootAuth`, so `GET` is the owner's too: what a model costs is a
+            // commercial decision, not a read any admin should have.
+            "/api/option/model_pricing",
+            "/api/option/model_pricing/preview",
+            "/api/option/model_pricing/convert",
+            "/api/option/reset_model_pricing",
+            "/api/option/rest_model_ratio",
             "/api/backup/create",
             "/api/plugin/task",
             // `/api/system-task` used to be listed here. It was never a route --

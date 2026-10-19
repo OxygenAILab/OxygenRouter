@@ -346,7 +346,9 @@ export default function OverviewPage() {
             </div>
             <div className="health-metric-label">{t.dashboard.successRate}</div>
             <div className="health-metric-value font-mono">
-              {dash ? `${(dash.success_rate * 100).toFixed(1)}%` : "—"}
+              {/* `success_rate` already arrives as a percentage (0..100); the
+                  analytics and log pages render it the same way. */}
+              {dash ? `${dash.success_rate.toFixed(1)}%` : "—"}
             </div>
           </div>
           <div className="health-metric">

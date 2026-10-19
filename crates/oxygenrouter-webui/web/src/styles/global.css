@@ -796,6 +796,7 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
 .modal-header h2 { margin: 0; font-size: 16px; font-weight: 600; }
 .modal-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 .field-label { display: block; margin-bottom: 6px; font-size: 11px; font-weight: 500; color: var(--md-on-surface-variant); }
+.field-hint { margin: 6px 0 0; color: var(--md-on-surface-variant); font-size: 11px; line-height: 1.5; }
 .settings-section { display: flex; flex-direction: column; gap: 8px; }
 .settings-section .card { padding: 8px 22px; }
 .settings-section .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 0; border-bottom: 1px solid var(--hairline); }
@@ -1577,6 +1578,67 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   font-size: 22px;
   font-weight: 600;
   letter-spacing: -0.02em;
+}
+
+/* Model pricing page: a dense table with an inline editor. */
+.pricing-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.pricing-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 240px;
+  padding: 0 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-thumb);
+  background: var(--md-surface);
+  color: var(--md-on-surface-variant);
+}
+.pricing-search .input {
+  border: 0;
+  background: transparent;
+  padding-left: 0;
+}
+.pricing-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--radius-pill);
+  background: var(--md-surface-container-low);
+  color: var(--md-on-surface-variant);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.pricing-muted { color: var(--md-on-surface-variant); font-size: 11px; white-space: nowrap; }
+.pricing-preview {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-thumb);
+  background: var(--md-surface-container-low);
+}
+.pricing-preview-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--md-on-surface-variant);
+  font-size: 11px;
+}
+.pricing-preview-code {
+  display: block;
+  overflow-x: auto;
+  color: var(--md-on-surface);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* Uptime-Kuma service panel on the overview. */
