@@ -4222,6 +4222,8 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
             // Defaults here; the handler overlays the configured value so the
             // storage layer does not have to read the option table.
             currency: "USD".to_string(),
+            uptime_kuma_enabled: self
+                .typed_setting("UptimeKumaEnabled", false),
         })
     }
 }

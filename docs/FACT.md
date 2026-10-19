@@ -941,6 +941,42 @@ OpenAI-compatible adaptor is covered as soon as it is registered. Reverting
 `Ollama`'s `request_url` or `convert_request` to the old verbatim behaviour makes
 it fail (mutation-verified).
 
+### Uptime-Kuma status panel (2026-10-19)
+
+The overview can show the health of the services behind the gateway, read from
+one or more Uptime Kuma status pages. `GET /api/uptime/status` mirrors the
+reference's `controller/uptime_kuma.go`: for every configured group the instance
+reads `/api/status-page/<slug>` and `/api/status-page/heartbeat/<slug>` and
+flattens the monitors into `{name, uptime, status, group}` rows, with uptime from
+`uptimeList["<id>_24"]` and state from the first heartbeat.
+
+Configuration is two options, matching `setting/console_setting/config.go`:
+`UptimeKumaEnabled` (off by default) and `UptimeKumaGroups`, a JSON array of
+`{url, slug, categoryName}`. `/api/status` publishes `uptime_kuma_enabled` so the
+overview can hide the panel without a second request.
+
+Three behaviours are deliberate:
+
+| Behaviour | Why |
+|---|---|
+| A group whose status page fails is reported with **no monitors**, not an error | One unreachable page must not blank the panel; the reference does the same |
+| The route is **public** but the fan-out runs only when the panel is on | Public matches the reference (`router/api-router.go:27`) and the panel renders for signed-out visitors; gating the fan-out keeps a cheap anonymous request from becoming twenty outbound ones |
+| The fan-out result is cached for 10s, keyed on the settings blob | The overview polls; the TTL bounds the outbound rate and an edit is still visible at once because the key changes |
+
+Verified live with a mock Uptime Kuma (`.devlogs/live_task/uptime_kuma.py`,
+`check_uptime.ps1`): a two-group configuration returned `gateway` at
+`uptime 0.9875 / status 1` and `database` at `0.25 / 0`, the second group (HTTP
+500) came back with an empty monitor list, a second read inside the TTL made **no**
+new requests (mock hit counter unchanged at 4), and switching the panel off
+answered `data: []`. The panel itself was then rendered in the console:
+`gateway Public 98.75%` green beside `database Public 25.00%` red, under the
+heading `Public Services`.
+
+Deliberately **not** implemented, recorded here rather than implied: the
+reference's own panel is a pure reader too, but our route does not follow
+redirects (a redirect would silently move every poll somewhere else) and refuses
+a group whose slug is not a single path segment.
+
 ## Open questions
 - _None recorded_
 

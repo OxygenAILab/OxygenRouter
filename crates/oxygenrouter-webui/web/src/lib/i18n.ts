@@ -106,6 +106,17 @@ export const STRINGS = {
       noMappings: "No mappings configured",
       announcements: "Announcements",
       noAnnouncements: "No announcements yet",
+      uptime: {
+        title: "Service Uptime",
+        subtitle: "Availability reported by Uptime Kuma",
+        empty: "No monitors configured",
+        unreachable: "Status page unreachable",
+        availability: "24h",
+        up: "Up",
+        down: "Down",
+        pending: "Pending",
+        maintenance: "Maintenance",
+      },
       metrics: {
         total: "Total Requests",
         success: "Success Rate",
@@ -694,6 +705,17 @@ export const STRINGS = {
       noMappings: "未配置映射",
       announcements: "公告",
       noAnnouncements: "目前暂无公告",
+      uptime: {
+        title: "服务可用性",
+        subtitle: "由 Uptime Kuma 上报的监控状态",
+        empty: "未配置监控项",
+        unreachable: "状态页不可达",
+        availability: "24 小时",
+        up: "正常",
+        down: "故障",
+        pending: "等待中",
+        maintenance: "维护中",
+      },
       metrics: {
         total: "总请求数",
         success: "成功率",
@@ -1285,6 +1307,17 @@ export type Strings = {
     noMappings: string;
     announcements: string;
     noAnnouncements: string;
+    uptime: {
+      title: string;
+      subtitle: string;
+      empty: string;
+      unreachable: string;
+      availability: string;
+      up: string;
+      down: string;
+      pending: string;
+      maintenance: string;
+    };
     metrics: {
       total: string;
       success: string;

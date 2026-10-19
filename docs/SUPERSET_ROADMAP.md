@@ -508,15 +508,20 @@ with all three client dialects.
 - ✅ **Vendor metadata** CRUD (list/search/get/create/update/delete on
   `/api/vendors`, with a derived `model_count`). Merge/multi-select operations
   (`/api/vendors/operations`) are not implemented.
-- **Pricing config**: snapshot/preview/convert/batch-update/reset.
-- **Ratio sync**: from official preset / models.dev / channels (OpenRouter + models.dev
+- ❌ **Pricing config**: snapshot/preview/convert/batch-update/reset.
+- ❌ **Ratio sync**: from official preset / models.dev / channels (OpenRouter + models.dev
   conversion).
-- **Perf metrics**: latency/throughput by model/group/hour.
-- **Rankings**: usage snapshot by period.
-- **Check-in**: daily quota award.
-- **Prefill groups**, **group management** (all/usable/groups+ratios).
-- **Uptime-Kuma** integration.
-- **System info**: instances, stale-instance cleanup, system tasks (scheduled).
+- ❌ **Perf metrics page**: latency/throughput by model/group/hour. (The
+  root-only diagnostics at `/api/performance/{stats,reset_stats}` are a
+  different surface; the reference's user-visible `/api/perf-metrics` group is
+  still missing.)
+- ✅ **Rankings**: usage snapshot by period (`/api/rankings`, `rankings.rs`).
+- ✅ **Check-in**: daily quota award (`/api/user/checkin`, `core/checkin.rs`).
+- ✅ **Prefill groups**, **group management** (all/usable/groups+ratios).
+- ✅ **Uptime-Kuma**: `/api/uptime/status` plus the overview panel, verified live
+  against a mock status page (see `docs/FACT.md`).
+- ❌ **System info**: instances, stale-instance cleanup, system tasks (scheduled,
+  `/api/system-task/*`).
 
 ---
 

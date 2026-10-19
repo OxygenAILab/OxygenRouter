@@ -11,6 +11,7 @@ pub mod proxy;
 pub mod rankings;
 mod state;
 pub mod task_transport;
+pub mod uptime;
 
 pub use proxy::fallback_handler;
 pub use state::AppState;

@@ -107,6 +107,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/status", get(get_status))
         .route("/api/site", get(get_site))
+        // The Uptime-Kuma panel on the overview. Public for the same reason the
+        // reference serves it above `UserAuth`: the panel renders for a
+        // signed-out visitor too, and it carries nothing but the monitor names
+        // the operator chose to publish. See `crate::uptime` for the two guards
+        // on the outbound fan-out.
+        .route("/api/uptime/status", get(crate::uptime::get_uptime_status))
         // Public model/vendor rankings, matching the reference's
         // `GET /api/rankings` (`router/api-router.go:43`), which defaults to the
         // week and answers 400 for a period it does not know.
@@ -338,6 +344,11 @@ const PUBLIC_ROUTES: &[&str] = &[
     // rankings module defaults to public (`middleware/header_nav.go:17`), so a
     // visitor can see the leaderboard before signing in.
     "/api/rankings",
+    // The Uptime-Kuma panel, likewise public above `UserAuth` in the reference
+    // (`router/api-router.go:27`). It exposes only the monitor names an operator
+    // chose to publish, and it answers an empty list unless they switched the
+    // panel on -- see `crate::uptime`.
+    "/api/uptime/status",
 ];
 
 /// Prefixes that only the instance owner may reach.
@@ -4734,6 +4745,9 @@ mod access_tests {
             "/api/auth/register",
             "/api/plans",
             "/api/status",
+            // The Uptime-Kuma panel is public above `UserAuth`, matching the
+            // reference's `GET /api/uptime/status` (`router/api-router.go:27`).
+            "/api/uptime/status",
             // The instance's own display copy, which the sign-in page and the
             // sidebar render before any credential exists. Listed here so opening
             // it was a decision rather than a side effect.
@@ -5113,6 +5127,7 @@ mod log_scoping_tests {
             listen_host: None,
             listen_port: None,
             currency: "USD".into(),
+            uptime_kuma_enabled: false,
         };
         let json = serde_json::to_value(&status).expect("system status serialises");
         let keys: Vec<&str> = json

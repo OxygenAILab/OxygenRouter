@@ -20,7 +20,7 @@ import {
   Wallet,
   Zap,
 } from "lucide-react";
-import { api, SystemStatus, DashboardSnapshot } from "../lib/api";
+import { api, SystemStatus, DashboardSnapshot, UptimeGroupResult, UptimeMonitor } from "../lib/api";
 import { PageHeader } from "../App";
 import { useI18n } from "../lib/i18nContext";
 
@@ -73,9 +73,85 @@ function StatCard({ icon: Icon, label, value, sub, color }: { icon: React.Elemen
   );
 }
 
+/**
+ * The Uptime-Kuma panel. Rendered only when an operator has switched it on
+ * (`SystemStatus.uptime_kuma_enabled`); the rows are monitors, grouped the way
+ * the status page groups them.
+ *
+ * A group whose status page could not be read arrives with no monitors, which
+ * is the one case that needs explaining rather than an empty list: the operator
+ * configured those monitors, so "unreachable" is the answer, not "none".
+ */
+function UptimePanel({ groups }: { groups: UptimeGroupResult[] }) {
+  const { t } = useI18n();
+  const monitors = groups.flatMap((group) => group.monitors);
+
+  const state = (monitor: UptimeMonitor) => {
+    switch (monitor.status) {
+      case 1:
+        return { className: "is-up", label: t.dashboard.uptime.up };
+      case 2:
+        return { className: "is-pending", label: t.dashboard.uptime.pending };
+      case 3:
+        return { className: "is-maintenance", label: t.dashboard.uptime.maintenance };
+      default:
+        return { className: "is-down", label: t.dashboard.uptime.down };
+    }
+  };
+
+  return (
+    <section className="health-section">
+      <div className="section-heading">
+        <h2>{t.dashboard.uptime.title}</h2>
+        <span className="section-meta">{t.dashboard.uptime.subtitle}</span>
+      </div>
+      {monitors.length === 0 ? (
+        <div className="uptime-note">
+          {groups.length === 0 ? t.dashboard.uptime.empty : t.dashboard.uptime.unreachable}
+        </div>
+      ) : (
+        <div className="uptime-groups">
+          {groups
+            .filter((group) => group.monitors.length > 0)
+            .map((group, index) => (
+              <div className="uptime-group" key={`${group.categoryName}-${index}`}>
+                {group.categoryName && <div className="uptime-group-name">{group.categoryName}</div>}
+                <div className="uptime-rows">
+                  {group.monitors.map((monitor, row) => {
+                    const { className, label } = state(monitor);
+                    const availability = Math.min(Math.max(monitor.uptime, 0), 1) * 100;
+                    return (
+                      <div className="uptime-row" key={`${monitor.name}-${row}`}>
+                        <span className={`uptime-dot ${className}`} role="img" title={label} aria-label={label} />
+                        <span className="uptime-name">{monitor.name}</span>
+                        {monitor.group && <span className="uptime-tag">{monitor.group}</span>}
+                        <span className="uptime-track" aria-hidden>
+                          <span style={{ width: `${availability}%` }} />
+                        </span>
+                        <span className="uptime-value font-mono">{availability.toFixed(2)}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function OverviewPage() {
   const { t } = useI18n();
   const { data: status, isLoading } = useQuery<SystemStatus>({ queryKey: ["status"], queryFn: api.status.get, refetchInterval: 15_000 });
+  // Only fetched when the panel is switched on, so a deployment that does not
+  // use Uptime Kuma never calls the route at all.
+  const { data: uptime } = useQuery<UptimeGroupResult[]>({
+    queryKey: ["uptime"],
+    queryFn: api.uptime.get,
+    enabled: status?.uptime_kuma_enabled === true,
+    refetchInterval: 30_000,
+  });
   const { data: channels } = useQuery({ queryKey: ["channels"], queryFn: api.channels.list });
   const { data: keys } = useQuery({ queryKey: ["keys"], queryFn: api.keys.list });
   const { data: maps } = useQuery({ queryKey: ["modelMaps"], queryFn: api.modelMaps.list });
@@ -293,6 +369,10 @@ export default function OverviewPage() {
           </div>
         </div>
       </section>
+
+      {status?.uptime_kuma_enabled && (
+        <UptimePanel groups={uptime ?? []} />
+      )}
 
       {/* Quick Actions + Info */}
       <div className="overview-bottom-grid">

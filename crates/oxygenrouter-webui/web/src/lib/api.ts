@@ -282,6 +282,22 @@ export interface SiteValues {
   server_address: string;
 }
 
+/** One row of the Uptime-Kuma panel, as `/api/uptime/status` reports it. */
+export interface UptimeMonitor {
+  name: string;
+  /** 24-hour availability, 0..1, as Uptime Kuma reports it. */
+  uptime: number;
+  /** 0 down, 1 up, 2 pending, 3 maintenance. */
+  status: number;
+  /** The Uptime Kuma "public group" the monitor belongs to, when it has one. */
+  group?: string;
+}
+
+export interface UptimeGroupResult {
+  categoryName: string;
+  monitors: UptimeMonitor[];
+}
+
 export interface SystemStatus {
   version: string;
   uptime_seconds: number;
@@ -298,6 +314,8 @@ export interface SystemStatus {
   listen_port?: number;
   /** The configured display currency; a public display preference. */
   currency: string;
+  /** Whether the console should render the Uptime-Kuma panel. */
+  uptime_kuma_enabled: boolean;
 }
 
 export interface DashboardBreakdown {
@@ -553,6 +571,9 @@ export const api = {
   },
   status: {
     get: () => apiFetch<SystemStatus>('/status'),
+  },
+  uptime: {
+    get: () => apiFetch<UptimeGroupResult[]>('/uptime/status'),
   },
   dashboard: {
     get: (timeRange: string = "24h", filters: Record<string, string | undefined> = {}) => {

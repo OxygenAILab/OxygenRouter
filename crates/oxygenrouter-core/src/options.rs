@@ -182,6 +182,10 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("billing_mode", Models, String, "{}", "Per-model billing mode override (JSON)"),
     schema!("UpstreamModelSyncEnabled", Models, Bool, "false", "Automatically refresh channel model lists"),
     schema!("ModelSyncIntervalMinutes", Models, Int, "60", "Minutes between automatic model syncs"),
+    // Uptime-Kuma status panel. Matches the reference's `console_setting`
+    // (`setting/console_setting/config.go`): a switch plus a JSON array of groups.
+    schema!("UptimeKumaEnabled", Operations, Bool, "false", "Show the Uptime-Kuma status panel in the console"),
+    schema!("UptimeKumaGroups", Operations, String, "[]", "Uptime-Kuma monitor groups (JSON array of {url, slug, categoryName})"),
 ];
 
 pub fn find_schema(key: &str) -> Option<&'static OptionSchema> {

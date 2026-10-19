@@ -650,6 +650,13 @@ pub struct SystemStatus {
     /// Public on purpose: it is a display preference, not a credential, and the
     /// plan catalogue is served before sign-in.
     pub currency: String,
+    /// Whether the console should render the Uptime-Kuma panel.
+    ///
+    /// A display switch rather than a secret, and public for the same reason the
+    /// panel route is: the overview decides before anyone signs in. The panel's
+    /// own data comes from `/api/uptime/status`.
+    #[serde(default)]
+    pub uptime_kuma_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

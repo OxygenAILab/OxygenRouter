@@ -1579,6 +1579,51 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* Uptime-Kuma service panel on the overview. */
+.uptime-groups {
+  padding: 4px 18px 14px;
+  display: grid;
+  gap: 10px;
+}
+.uptime-group-name {
+  color: var(--md-on-surface-variant);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  padding-left: 2px;
+}
+.uptime-rows {
+  display: grid;
+  gap: 1px;
+  background: var(--md-outline-variant);
+}
+.uptime-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--md-surface);
+  border-bottom: 0;
+}
+.uptime-row:last-child { border-bottom: 0; }
+.uptime-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--md-background) 15%, transparent);
+}
+.uptime-dot.is-up { background: var(--md-success); }
+.uptime-dot.is-down { background: var(--md-error); }
+.uptime-dot.is-pending { background: var(--md-warning); }
+.uptime-dot.is-maintenance { background: var(--md-info); }
+.uptime-name { flex: 1; color: var(--md-on-surface); font-size: 12px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uptime-tag { flex: none; color: var(--md-on-surface-variant); font-size: 10px; padding: 0 6px; border: 1px solid var(--md-outline-variant); border-radius: var(--radius-pill); background: var(--md-surface-container-low); margin-right: 8px; }
+.uptime-track { flex: 1; height: 4px; border-radius: var(--radius-pill); background: var(--md-surface-container-highest); overflow: hidden; margin-right: 10px; min-width: 60px; }
+.uptime-track span { display: block; height: 100%; background: var(--md-success); }
+.uptime-value { flex: none; width: 56px; color: var(--md-on-surface-variant); font-size: 11px; font-family: var(--font-mono); text-align: right; font-variant-numeric: tabular-nums; }
+.uptime-note { padding: 14px 18px; color: var(--md-on-surface-variant); font-size: 12px; text-align: center; }
+
 /* Bottom grid (quick actions + info) */
 .overview-bottom-grid {
   display: grid;
