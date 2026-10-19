@@ -300,6 +300,29 @@ export interface FaqEntry {
   answer: string;
 }
 
+/** One maintenance-task run (`/api/system-task*`). */
+export interface SystemTask {
+  id: number;
+  task_id: string;
+  type: string;
+  /** `pending` | `running` | `succeeded` | `failed`. */
+  status: string;
+  /** JSON text: the request. */
+  payload: string;
+  /** JSON text: live progress. */
+  state: string;
+  /** JSON text: the outcome, empty until it finishes. */
+  result: string;
+  error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SystemTaskList {
+  tasks: SystemTask[];
+  total: number;
+}
+
 /** Relay performance, by model and hour (`GET /api/perf-metrics*`). */
 export interface PerfBucketPoint {
   ts: number;
@@ -871,7 +894,17 @@ export const api = {
     list: (limit = 200) => apiFetch<AuditLog[]>(`/audit-logs?limit=${limit}`),
     clear: () => apiFetch<number>("/audit-logs", { method: "DELETE" }),
   },
-  perfMetrics: {
+  systemTasks: {
+    // Root-only, like the tree itself: these endpoints rewrite the instance's
+    // own history.
+    current: (type = "log_cleanup") => apiFetch<SystemTask | null>(`/system-task/current?type=${type}`),
+    list: (type = "log_cleanup", limit = 50) =>
+      apiFetch<SystemTaskList>(`/system-task/list?type=${type}&limit=${limit}`),
+    startLogCleanup: (targetTimestamp: number) =>
+      apiFetch<SystemTask>(`/system-task/log-cleanup?target_timestamp=${targetTimestamp}`, { method: "POST" }),
+    get: (taskId: string) => apiFetch<SystemTask>(`/system-task/${encodeURIComponent(taskId)}`),
+    clearHistory: (type = "log_cleanup") => apiFetch<number>(`/system-task/history?type=${type}`, { method: "DELETE" }),
+  },  perfMetrics: {
     // Public, like the reference's pricing module: these figures sit beside the
     // price list.
     summary: (hours = 24) => apiFetch<PerfSummaryAll>(`/perf-metrics/summary?hours=${hours}`),

@@ -384,6 +384,25 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_perf_metrics_bucket ON perf_metrics(bucket_ts DESC);
 
+            -- Maintenance-task runs. The partial unique index is the "one
+            -- unfinished task per type" rule: a handler that checked first and
+            -- inserted second would let two clicks at the same moment both pass.
+            CREATE TABLE IF NOT EXISTS system_tasks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id     TEXT NOT NULL UNIQUE,
+                task_type   TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                payload     TEXT NOT NULL DEFAULT '',
+                state       TEXT NOT NULL DEFAULT '',
+                result      TEXT NOT NULL DEFAULT '',
+                error       TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_system_tasks_active
+                ON system_tasks(task_type) WHERE status IN ('pending','running');
+            CREATE INDEX IF NOT EXISTS idx_system_tasks_created ON system_tasks(created_at DESC);
+
             -- Daily check-in claims. The unique index is the once-a-day guard;
             -- a read-then-write check in the handler would let two simultaneous
             -- taps both pass before either wrote.
@@ -2072,6 +2091,191 @@ pub(crate) fn claimed_protocol_names(manifest: &serde_json::Value) -> Vec<String
             })
         })?;
         rows.collect()
+    }
+
+    // ── Maintenance tasks (system_tasks) ─────────────────────────────────────
+
+    /// Record a task run and return it.
+    ///
+    /// The caller is expected to have checked `active_system_task` first; if it
+    /// did not, or two callers raced, the partial unique index refuses the
+    /// insert rather than letting a second run start.
+    pub fn create_system_task(
+        &self,
+        task_type: &str,
+        payload: &str,
+    ) -> SqliteResult<crate::SystemTask> {
+        let now = Utc::now();
+        let task = crate::SystemTask {
+            id: 0,
+            task_id: uuid::Uuid::new_v4().to_string(),
+            task_type: task_type.to_string(),
+            status: "pending".to_string(),
+            payload: payload.to_string(),
+            state: "{}".to_string(),
+            result: String::new(),
+            error: String::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO system_tasks (task_id,task_type,status,payload,state,result,error,created_at,updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                task.task_id,
+                task.task_type,
+                task.status,
+                task.payload,
+                task.state,
+                task.result,
+                task.error,
+                task.created_at.to_rfc3339(),
+                task.updated_at.to_rfc3339()
+            ],
+        )?;
+        Ok(crate::SystemTask {
+            id: conn.last_insert_rowid(),
+            ..task
+        })
+    }
+
+    pub fn get_system_task(&self, task_id: &str) -> SqliteResult<Option<crate::SystemTask>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,task_id,task_type,status,payload,state,result,error,created_at,updated_at \
+             FROM system_tasks WHERE task_id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![task_id], Self::system_task_from_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The unfinished task of a type, if one is queued or running.
+    pub fn active_system_task(&self, task_type: &str) -> SqliteResult<Option<crate::SystemTask>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id,task_id,task_type,status,payload,state,result,error,created_at,updated_at \
+             FROM system_tasks WHERE task_type=?1 AND status IN ('pending','running') LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![task_type], Self::system_task_from_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Newest first, optionally narrowed by type, with the total before paging.
+    pub fn list_system_tasks(
+        &self,
+        task_type: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> SqliteResult<(Vec<crate::SystemTask>, i64)> {
+        let conn = self.conn.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM system_tasks WHERE (?1 IS NULL OR task_type=?1)",
+            params![task_type],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id,task_id,task_type,status,payload,state,result,error,created_at,updated_at \
+             FROM system_tasks WHERE (?1 IS NULL OR task_type=?1) \
+             ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(params![task_type, limit, offset], Self::system_task_from_row)?;
+        Ok((rows.collect::<SqliteResult<Vec<_>>>()?, total))
+    }
+
+    /// Rewrite a task's status and progress.
+    pub fn update_system_task_state(
+        &self,
+        task_id: &str,
+        status: &str,
+        state: &str,
+    ) -> SqliteResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE system_tasks SET status=?2, state=?3, updated_at=?4 WHERE task_id=?1",
+            params![task_id, status, state, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Record the terminal state. The row stays as history.
+    pub fn finish_system_task(
+        &self,
+        task_id: &str,
+        status: &str,
+        result: &str,
+        error: &str,
+    ) -> SqliteResult<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE system_tasks SET status=?2, result=?3, error=?4, updated_at=?5 WHERE task_id=?1",
+            params![task_id, status, result, error, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop finished history, optionally for one type. A running task is never
+    /// deleted: its row is the only thing that says the work is in flight.
+    pub fn delete_system_task_history(&self, task_type: Option<&str>) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM system_tasks WHERE status NOT IN ('pending','running') \
+             AND (?1 IS NULL OR task_type=?1)",
+            params![task_type],
+        )?)
+    }
+
+    /// How many request-log rows are older than a cutoff.
+    pub fn count_request_logs_before(&self, cutoff: DateTime<Utc>) -> SqliteResult<i64> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM request_logs WHERE created_at < ?1",
+            params![cutoff.to_rfc3339()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Delete at most `limit` log rows older than a cutoff.
+    ///
+    /// Batched rather than one `DELETE`: a long delete would hold the write lock
+    /// for its whole duration and stall every request the gateway is serving.
+    pub fn delete_request_logs_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+    ) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM request_logs WHERE id IN (\
+                 SELECT id FROM request_logs WHERE created_at < ?1 LIMIT ?2)",
+            params![cutoff.to_rfc3339(), limit],
+        )?)
+    }
+
+    fn system_task_from_row(r: &rusqlite::Row<'_>) -> SqliteResult<crate::SystemTask> {
+        let parse = |s: String| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|v| v.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now())
+        };
+        Ok(crate::SystemTask {
+            id: r.get(0)?,
+            task_id: r.get(1)?,
+            task_type: r.get(2)?,
+            status: r.get(3)?,
+            payload: r.get(4)?,
+            state: r.get(5)?,
+            result: r.get(6)?,
+            error: r.get(7)?,
+            created_at: parse(r.get(8)?),
+            updated_at: parse(r.get(9)?),
+        })
     }
 
     /// Totals across a window, from the summary rather than the raw log.

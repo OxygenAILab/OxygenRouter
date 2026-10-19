@@ -55,6 +55,7 @@ export const STRINGS = {
       plugins: "Task Plugins",
       audit: "Audit trail",
       perf: "Performance",
+      systemTasks: "Maintenance",
       security: "Security",
       pricing: "Pricing",
       wallet: "Wallet",
@@ -434,6 +435,32 @@ export const STRINGS = {
       latencySeries: "Average latency per hour",
       tpsSeries: "Success rate per hour",
       noSeries: "No bucket in this window.",
+    },
+    systemTasks: {
+      title: "Maintenance",
+      description: "Tasks that rewrite this instance's own history",
+      logCleanup: "Request-log cleanup",
+      logCleanupHint: "Deletes log rows older than the cutoff, in batches",
+      retain: "Keep the last (days)",
+      run: "Run cleanup",
+      idle: "Nothing is running.",
+      history: "Runs",
+      clearHistory: "Clear history",
+      noHistory: "No run recorded yet.",
+      when: "Started",
+      type: "Task",
+      status: "Status",
+      result: "Result",
+      updated: "Last update",
+      deleted: "Deleted {n} rows",
+      failed: "Failed",
+      pending: "Queued",
+      running: "Running",
+      succeeded: "Succeeded",
+      started: "Cleanup started",
+      startFailed: "The cleanup was not started",
+      cleared: "Cleared {n} runs",
+      clearFailed: "History was not cleared",
     },
     plugins: {
       title: "Task plugins",
@@ -862,6 +889,7 @@ export const STRINGS = {
       plugins: "任务插件",
       audit: "审计日志",
       perf: "性能指标",
+      systemTasks: "维护任务",
       security: "账户安全",
       pricing: "价格目录",
       wallet: "钱包",
@@ -1242,6 +1270,32 @@ export const STRINGS = {
       latencySeries: "每小时平均延迟",
       tpsSeries: "每小时成功率",
       noSeries: "该时间窗暂无数据桶。",
+    },
+    systemTasks: {
+      title: "维护任务",
+      description: "会改写本实例自身历史记录的任务",
+      logCleanup: "请求日志清理",
+      logCleanupHint: "分批删除早于截止时间的日志行",
+      retain: "保留最近（天）",
+      run: "开始清理",
+      idle: "当前没有任务在运行。",
+      history: "运行记录",
+      clearHistory: "清空记录",
+      noHistory: "暂无运行记录。",
+      when: "开始时间",
+      type: "任务",
+      status: "状态",
+      result: "结果",
+      updated: "最近更新",
+      deleted: "已删除 {n} 行",
+      failed: "失败",
+      pending: "排队中",
+      running: "运行中",
+      succeeded: "已完成",
+      started: "清理已开始",
+      startFailed: "清理未启动",
+      cleared: "已清空 {n} 条记录",
+      clearFailed: "记录未清空",
     },
     plugins: {
       title: "任务插件",
@@ -1673,6 +1727,7 @@ export type Strings = {
     plugins: string;
     audit: string;
     perf: string;
+    systemTasks: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -2052,6 +2107,32 @@ export type Strings = {
     latencySeries: string;
     tpsSeries: string;
     noSeries: string;
+  };
+  systemTasks: {
+    title: string;
+    description: string;
+    logCleanup: string;
+    logCleanupHint: string;
+    retain: string;
+    run: string;
+    idle: string;
+    history: string;
+    clearHistory: string;
+    noHistory: string;
+    when: string;
+    type: string;
+    status: string;
+    result: string;
+    updated: string;
+    deleted: string;
+    failed: string;
+    pending: string;
+    running: string;
+    succeeded: string;
+    started: string;
+    startFailed: string;
+    cleared: string;
+    clearFailed: string;
   };
   plugins: {
     title: string;

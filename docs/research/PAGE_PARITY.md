@@ -101,8 +101,8 @@ workspace is not a superset section-by-section:
    first token stays unmeasured (streaming is buffered), so that field is
    omitted rather than reported as a measured zero.
 9. **Ratio sync** (`/api/ratio_sync`) — upstream price-table sync.
-10. **System tasks** (`/api/system-task/*`) — scheduled log cleanup with
-    progress; the reference's five routes.
+10. ~~**System tasks**~~ — done 2026-10-19: the five `/api/system-task/*` routes
+    over a `log_cleanup` runner with durable progress, plus `/ui/system-tasks`.
 11. **Legal / about / error pages** — static copy and error views.
 12. **OAuth + password reset** — the only auth surfaces still missing.
 

@@ -13,6 +13,7 @@ pub mod pricing_public;
 pub mod proxy;
 pub mod rankings;
 mod state;
+pub mod system_tasks;
 pub mod task_transport;
 pub mod uptime;
 

@@ -1580,6 +1580,28 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* Maintenance page: the run control and its progress. */
+.task-days { width: 84px; }
+.task-status {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--radius-pill);
+  font-size: 10px;
+}
+.task-status.is-done { border-color: var(--md-success); color: var(--md-success); }
+.task-status.is-running { border-color: var(--md-info); color: var(--md-info); }
+.task-status.is-failed { border-color: var(--md-error); color: var(--md-error); }
+.task-progress { display: flex; flex-direction: column; gap: 6px; }
+.task-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.task-progress-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--md-surface-container-highest);
+}
+.task-progress-track span { display: block; height: 100%; background: var(--md-info); transition: width 200ms ease; }
+
 /* Performance page: the hourly series and the per-group breakdown. */
 .perf-charts {
   display: grid;

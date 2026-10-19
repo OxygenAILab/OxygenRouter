@@ -523,8 +523,9 @@ with all three client dialects.
 - ✅ **Prefill groups**, **group management** (all/usable/groups+ratios).
 - ✅ **Uptime-Kuma**: `/api/uptime/status` plus the overview panel, verified live
   against a mock status page (see `docs/FACT.md`).
-- ❌ **System info**: instances, stale-instance cleanup, system tasks (scheduled,
-  `/api/system-task/*`).
+- 🔶 **System info**: the scheduled-task surface landed as `/api/system-task/*`
+  with a `log_cleanup` runner and a console page; instance listing and
+  stale-instance cleanup are still missing.
 
 ---
 

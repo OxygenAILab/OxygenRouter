@@ -24,6 +24,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Trophy,
+  Wrench,
   CreditCard,
   ShieldCheck,
   UserRound,
@@ -60,6 +61,7 @@ import SecurityPage from "./pages/SecurityPage";
 import TaskPluginsPage from "./pages/TaskPluginsPage";
 import AuditPage from "./pages/AuditPage";
 import PerfMetricsPage from "./pages/PerfMetricsPage";
+import SystemTasksPage from "./pages/SystemTasksPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -117,6 +119,8 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
     // The trail names who holds power and what they changed, so it is the
     // owner's for the same reason the price tables are.
     { path: `${BASE}/audit`, label: t.nav.audit, icon: ScrollText, key: "audit", count: null },
+    // Rewriting the instance's own history is the owner's, like the audit trail.
+    { path: `${BASE}/system-tasks`, label: t.nav.systemTasks, icon: Wrench, key: "system-tasks", count: null },
   );
   if (isAdmin(user)) navItems.push({ path: `${BASE}/admin/users`, label: t.nav.users, icon: UserRound, key: "admin-users", count: null }, { path: `${BASE}/admin/billing`, label: t.nav.billing, icon: ShieldCheck, key: "admin-billing", count: null });
   return (
@@ -210,6 +214,7 @@ function TopBar() {
     "task-plugins": t.nav.plugins,
     audit: t.nav.audit,
     "perf-metrics": t.nav.perf,
+    "system-tasks": t.nav.systemTasks,
     "system-settings": t.nav.systemSettings,
     playground: t.nav.playground,
     system: t.nav.system,
@@ -348,6 +353,7 @@ function Shell() {
             <Route path="/ui/task-plugins" element={<TaskPluginsPage />} />
             <Route path="/ui/audit" element={<AuditPage />} />
             <Route path="/ui/perf-metrics" element={<PerfMetricsPage />} />
+            <Route path="/ui/system-tasks" element={<SystemTasksPage />} />
             {/* The reference publishes the catalogue at `/pricing`; an existing
                 link keeps working rather than landing on the SPA fallback. */}
             <Route path="/pricing" element={<Navigate to="/ui/pricing" replace />} />

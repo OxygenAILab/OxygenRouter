@@ -453,6 +453,34 @@ pub struct AuditLog {
     pub created_at: DateTime<Utc>,
 }
 
+/// One run of a maintenance task, as the console lists it.
+///
+/// Mirrors the reference's `model.SystemTask`: a durable row per run, with the
+/// request in `payload`, the live progress in `state` and the outcome in
+/// `result`, so a page can be reloaded while the task is running without losing
+/// it. The reference's lock bookkeeping (`locked_by`, leases) is deliberately
+/// absent: that exists so several runner instances can share one queue, and this
+/// instance runs its own tasks in-process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemTask {
+    pub id: i64,
+    #[serde(rename = "task_id")]
+    pub task_id: String,
+    #[serde(rename = "type")]
+    pub task_type: String,
+    /// `pending` | `running` | `succeeded` | `failed`.
+    pub status: String,
+    /// The request, as JSON text.
+    pub payload: String,
+    /// Live progress, as JSON text. Rewritten as the task advances.
+    pub state: String,
+    /// The outcome, as JSON text. Empty until the task finishes.
+    pub result: String,
+    pub error: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// One hour of relay performance, summed across requests.
 ///
 /// The reference keeps this in its own `perf_metrics` table rather than deriving

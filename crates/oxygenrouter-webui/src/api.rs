@@ -117,6 +117,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         // already advertises through `/api/pricing`.
         .route("/api/perf-metrics", get(get_perf_metrics))
         .route("/api/perf-metrics/summary", get(get_perf_metrics_summary))
+        // Maintenance tasks, matching the reference's `/system-task` group
+        // (`router/api-router.go:322-329`). Root-only: scheduling work that
+        // rewrites the instance's own history is the owner's.
+        .route(
+            "/api/system-task/log-cleanup",
+            post(crate::system_tasks::create_log_cleanup),
+        )
+        .route(
+            "/api/system-task/current",
+            get(crate::system_tasks::current_task),
+        )
+        .route("/api/system-task/list", get(crate::system_tasks::list_tasks))
+        .route(
+            "/api/system-task/history",
+            axum::routing::delete(crate::system_tasks::delete_history),
+        )
+        .route(
+            "/api/system-task/:task_id",
+            get(crate::system_tasks::get_task),
+        )
         // The Uptime-Kuma panel on the overview. Public for the same reason the
         // reference serves it above `UserAuth`: the panel renders for a
         // signed-out visitor too, and it carries nothing but the monitor names
@@ -417,15 +437,18 @@ const ROOT_PREFIXES: &[&str] = &[
     // was running. Caught by a live probe, not by any source-level check, which is
     // why there is now a test asserting this path is root.
     "/api/performance",
-    // The three this list used to carry -- `/api/ratio_sync`, `/api/system-task`
-    // and `/api/custom-oauth-provider` -- were removed rather than given empty
+    // The maintenance-task tree, which the reference gates on `RootAuth`
+    // (`router/api-router.go:322`). This entry was removed once because nothing
+    // served it; it is back because `/api/system-task/*` now does.
+    "/api/system-task",
+    // Two of the three this list used to carry -- `/api/ratio_sync` and
+    // `/api/custom-oauth-provider` -- were removed rather than given empty
     // endpoints. Each promised a subsystem the reference has and this instance
-    // does not: syncing upstream price tables, a scheduled-task runner, and
-    // operator-registered OAuth providers. Listing them here claimed those trees
-    // existed and were root-protected when there was nothing behind them at all,
-    // which is the exact shape of defect this project keeps finding: a promise in
-    // one place and nothing in the other. They belong here again when the
-    // subsystem does.
+    // does not: syncing upstream price tables, and operator-registered OAuth
+    // providers. Listing them here claimed those trees existed and were
+    // root-protected when there was nothing behind them at all, which is the
+    // exact shape of defect this project keeps finding: a promise in one place
+    // and nothing in the other. They belong here again when the subsystem does.
     // Who changed what. Sensitive precisely because it is complete, and it names
     // the accounts that hold power.
     "/api/audit-logs",
@@ -5004,11 +5027,14 @@ mod access_tests {
             "/api/option/rest_model_ratio",
             "/api/backup/create",
             "/api/plugin/task",
-            // `/api/system-task` used to be listed here. It was never a route --
-            // the reference has a scheduled-task runner and this instance does
-            // not -- so the assertion was pinning the classification of a path
-            // that would fall back to the default level if anyone ever asked for
-            // it. Diagnostics take its place, because they exist.
+            // The maintenance-task tree. It was removed from this list once
+            // because nothing served it; the routes exist again, so the
+            // assertion does too.
+            "/api/system-task/log-cleanup",
+            "/api/system-task/current",
+            "/api/system-task/list",
+            "/api/system-task/history",
+            "/api/system-task/abc",
             "/api/performance/stats",
             "/api/performance/reset_stats",
         ] {
@@ -5528,7 +5554,19 @@ mod classification_audit_tests {
     /// Every route in the router, paired with its handler name, scraped from the
     /// `router()` source.
     fn routes_from_source() -> Vec<(String, String)> {
-        let source = include_str!("api.rs");
+        // Handlers live in this module and, increasingly, in the feature modules
+        // beside it (`uptime`, `pricing_*`, `perf_metrics`, `system_tasks`).
+        // Scanning only this file silently dropped every route those modules
+        // serve, which is how a declared prefix could look unserved while the
+        // tree behind it existed and worked.
+        let source = concat!(
+            include_str!("api.rs"),
+            include_str!("uptime.rs"),
+            include_str!("pricing_config.rs"),
+            include_str!("pricing_public.rs"),
+            include_str!("perf_metrics.rs"),
+            include_str!("system_tasks.rs"),
+        );
         let mut out = Vec::new();
         let mut rest = source;
         while let Some(at) = rest.find(".route(") {
