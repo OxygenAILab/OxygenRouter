@@ -9902,15 +9902,6 @@
    "whisper": 0.006,
    "whisper-1": 0.006
   },
-  "group_ratio": {
-   "xb5pr9": 1,
-   "c26q7d": 1,
-   "kub88g": 1,
-   "eeqlxi": 1,
-   "zy7l0w": 1,
-   "auto": 1,
-   "China": 1,
-   "GPT": 1
-  }
+  "group_ratio": {}
  }
 }

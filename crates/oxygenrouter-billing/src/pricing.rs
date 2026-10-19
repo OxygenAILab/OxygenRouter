@@ -494,13 +494,18 @@ mod tests {
         assert!(pricing.has_group("vip"));
     }
 
-    /// The console's group list is the pack's names plus overrides, sorted, so a
-    /// configured group is always offered and a shipped one is never lost.
+    /// The console's group list is the pack's names plus overrides, sorted.
+    ///
+    /// The shipped pack deliberately carries **no** group ratios: the pack was
+    /// captured from a live instance, and that instance's group names
+    /// (`xb5pr9`, `China`, …) are operator configuration, not public vendor
+    /// prices. Shipping them made every fresh instance advertise eight groups
+    /// nobody had configured.
     #[test]
     fn group_names_are_the_pack_plus_overrides() {
         let mut pricing = embedded();
         let before = pricing.group_names();
-        assert!(!before.is_empty(), "the pack ships at least one group");
+        assert!(before.is_empty(), "the pack ships no groups: {before:?}");
         assert!(before.windows(2).all(|pair| pair[0] <= pair[1]), "sorted");
         assert!(!before.contains(&"brand-new".to_string()));
 

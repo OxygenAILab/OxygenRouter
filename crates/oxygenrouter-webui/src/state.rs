@@ -574,31 +574,43 @@ impl AppState {
                 pricing.set_quota_per_unit(value);
             }
         }
-        if let Ok(Some(raw)) = self.db.get_setting("GroupRatio") {
-            match serde_json::from_str::<HashMap<String, f64>>(&raw) {
-                Ok(map) => {
-                    for (group, ratio) in map {
-                        pricing.set_group_ratio(&group, ratio);
+        // The two ratio tables replace the engine's override layer **wholesale**.
+        //
+        // Merging entry by entry was a real defect: removing an override -- the
+        // pricing editor's reset, or deleting a key from the JSON blob -- left
+        // the deleted ratio charging until the process restarted, because the
+        // engine kept the value the store no longer held. Replacing loses
+        // nothing, because the shipped pack is a *separate* layer inside the
+        // engine (`Pricing::defaults`), which is what an entry falls back to.
+        //
+        // A value that cannot be parsed leaves the layer untouched rather than
+        // clearing it: a typo must not silently reprice every model to the pack
+        // default while the console still shows the operator's table.
+        let read_ratios = |key: &str| -> Option<HashMap<String, f64>> {
+            match self.db.get_setting(key) {
+                Ok(Some(raw)) => match serde_json::from_str::<HashMap<String, f64>>(&raw) {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        eprintln!("[OxygenRouter] {key} override ignored: {e}");
+                        None
                     }
-                }
-                Err(e) => eprintln!("[OxygenRouter] GroupRatio override ignored: {e}"),
+                },
+                // An unset key is an empty table, not a missing one: the console
+                // may have just deleted its last entry.
+                _ => Some(HashMap::new()),
             }
-        }
-        // Per-model price ratios. This is the field the console labels "Per-model
-        // price ratios (JSON)" and it previously read nothing: the engine's
-        // support for the table existed and the console exposed a control for it,
-        // but nothing joined the two. Values layer over the shipped pack entry by
-        // entry, so an operator can correct one model's price without losing the
-        // rest of the catalogue.
-        if let Ok(Some(raw)) = self.db.get_setting("ModelRatio") {
-            match serde_json::from_str::<HashMap<String, f64>>(&raw) {
-                Ok(map) => {
-                    for (model, ratio) in map {
-                        pricing.set_model_ratio(&model, ratio);
-                    }
-                }
-                Err(e) => eprintln!("[OxygenRouter] ModelRatio override ignored: {e}"),
+        };
+        match (read_ratios("ModelRatio"), read_ratios("GroupRatio")) {
+            (Some(model_ratio), Some(group_ratio)) => {
+                pricing.set_ratio_tables(oxygenrouter_billing::PricingTables {
+                    model_ratio,
+                    group_ratio,
+                    ..Default::default()
+                });
             }
+            _ => eprintln!(
+                "[OxygenRouter] ratio tables left as they were: one of them could not be read"
+            ),
         }
     }
 }

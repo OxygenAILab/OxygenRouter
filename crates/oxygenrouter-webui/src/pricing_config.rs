@@ -195,6 +195,25 @@ pub fn version_of(values: &PricingValues) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// A hash of the whole price table set, for clients that cache the catalogue.
+///
+/// The three tables are hashed in a fixed order and concatenated, so a change to
+/// any of them changes the version while an unrelated option does not.
+pub fn pricing_version(maps: &PricingMaps) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for table in [&maps.ratio, &maps.expr, &maps.mode] {
+        let encoded = serde_json::to_string(table).unwrap_or_default();
+        hasher.update(encoded.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Reject a draft the engine could not honour.
 ///
 /// Checked before anything is stored, so a bad edit is refused by name instead
@@ -936,6 +955,42 @@ mod tests {
         assert!(stored.ratio.is_empty());
         // Resetting an instance with nothing overridden is a no-op success.
         assert!(reset(&state, &[]).expect("second reset").is_empty());
+    }
+
+    /// A reset must reach the engine that prices requests, not only the store.
+    ///
+    /// This is the regression guard for a defect the live probe found: the
+    /// reload merged the stored table into the engine entry by entry, so a
+    /// deleted ratio kept charging until the process restarted. The store and
+    /// the console both looked correct while every request was billed at the
+    /// removed price.
+    #[test]
+    fn a_reset_reaches_the_running_engine() {
+        let state = state();
+        apply(
+            &state,
+            &[ModelPricingChange {
+                model_name: "probe-engine".to_string(),
+                expected_version: None,
+                pricing: Some(draft(json!({ "ModelRatio": 5.0, "billing_mode": "ratio" }))),
+                reset: false,
+            }],
+        )
+        .expect("saved");
+        {
+            let pricing = state.billing.pricing();
+            let guard = pricing.read();
+            assert_eq!(guard.price_data("probe-engine", "default").model_ratio, 5.0);
+        }
+
+        reset(&state, &["probe-engine".to_string()]).expect("reset");
+        let pricing = state.billing.pricing();
+        let guard = pricing.read();
+        assert_eq!(
+            guard.price_data("probe-engine", "default").model_ratio,
+            1.0,
+            "the engine must forget the deleted ratio"
+        );
     }
 
     /// The conversion preview turns a ratio into the equivalent expression,
