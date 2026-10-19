@@ -28,8 +28,8 @@ Status vocabulary:
 | Reference route | Reference page | Ours | Status |
 |---|---|---|---|
 | `/` | landing / home content | `/ui/overview` (same page signed in or out) | live |
-| `/pricing`, `/pricing/:modelId` | public price catalogue and per-model detail | — | **missing** |
-| `/rankings` | public model rankings | API `GET /api/rankings` exists (`rankings.rs`), no page | **missing page** |
+| `/pricing`, `/pricing/:modelId` | public price catalogue and per-model detail | `/ui/pricing` over `GET /api/pricing` (`pricing_public.rs`), and `/pricing` redirects to it. Per-model detail is a dialog rather than its own route | live |
+| `/rankings` | public model rankings | `/ui/rankings` over `GET /api/rankings` (`rankings.rs`) | live |
 | `/about` | about copy | — | **missing** |
 | `/privacy-policy`, `/user-agreement` | legal copy | — | **missing** |
 | `/setup` | first-run setup wizard | bootstrap admin is created on first start (`ensure_bootstrap_admin`) | different by design |
@@ -79,11 +79,9 @@ workspace is not a superset section-by-section:
 
 ## 4. Work list, in the order that unblocks the most
 
-1. **Rankings page** — the public leaderboard; the API is already live
-   (`rankings.rs`), so this is one page.
-2. **Public pricing page** (`/ui/pricing`, per-model detail) — reuses
-   `/api/option/model_pricing` for the operator view; the public view needs a
-   read-only projection without the tables' raw blobs.
+1. ~~**Rankings page**~~ — done 2026-10-19 (`f4ecc8d`).
+2. ~~**Public pricing page**~~ — done 2026-10-19 (`bc49edb`): `GET /api/pricing`
+   and `/ui/pricing`.
 3. **Security page** (`/ui/security`) — 2FA, sessions and access token all have
    endpoints and no UI.
 4. **Task plugins page** — `/api/plugin/task*` exists (upload, activate,
