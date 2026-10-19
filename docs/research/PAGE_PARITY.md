@@ -48,7 +48,7 @@ Status vocabulary:
 | `/keys` | `/ui/keys` | route | create / edit / reveal |
 | `/models`, `/models/$section` | `/ui/models`, `/ui/model-registry`, `/ui/model-pricing` | live | pricing page driven live; registry route exists |
 | `/playground` | `/ui/playground` | route | |
-| `/usage-logs`, `/usage-logs/audit` | `/ui/logs`, `GET /api/audit-logs` | route | audit has an API, the console has no audit view |
+| `/usage-logs`, `/usage-logs/audit` | `/ui/logs`, `/ui/audit` | live | the audit view was driven in the browser on 2026-10-19, including the stored body of a channel create (credentials redacted) |
 | `/wallet` | `/ui/wallet` | route | |
 | `/subscriptions` | `/ui/subscriptions`, `/ui/plans` | route | |
 | `/redemption-codes` | admin CRUD inside `/ui/admin/billing`, and the redeem form on `/ui/wallet` | live | a code created in the browser on 2026-10-19; the admin gate was checking `role === "admin"` and so refused the instance's own root account — see `isAdmin` |
@@ -91,7 +91,8 @@ workspace is not a superset section-by-section:
    `/api/admin/redemption-codes`. **Covered**: the admin CRUD lives in
    `/ui/admin/billing` and the redeem form on `/ui/wallet`; the remaining work
    here was the root gate, now fixed.
-6. **Audit log view** — `/api/audit-logs` exists.
+6. ~~**Audit log view**~~ — done 2026-10-19: `/ui/audit`, plus recording a denied
+   privileged write with the caller's identity, which the middleware dropped.
 7. **Content sections** — announcements, FAQ, API info addresses, chat presets.
 8. **Perf metrics** (`/api/perf-metrics[/summary]`) — the reference's
    latency/throughput page; needs recording on the relay path first.
