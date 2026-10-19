@@ -53,7 +53,7 @@ Status vocabulary:
 | `/subscriptions` | `/ui/subscriptions`, `/ui/plans` | route | |
 | `/redemption-codes` | — (API `POST /api/redemption/redeem`) | **missing page** | |
 | `/profile` | — (fields on `/ui/settings`) | partial | |
-| `/security` | — (API: `/api/user/2fa/*`, `/api/user/sessions`, `/api/user/token`) | **missing page** | |
+| `/security` | `/ui/security` over `/api/user/{2fa,sessions,token}` | live | driven live on 2026-10-19: sessions revoked, token generated/rotated/revoked, two-factor enabled with an independently generated TOTP code and then disabled |
 | `/users` | `/ui/admin/users` | route | |
 | `/task-plugins` | — (API: `/api/plugin/task*`) | **missing page** | |
 | `/system-info` | `/ui/system` | route | |
@@ -82,8 +82,8 @@ workspace is not a superset section-by-section:
 1. ~~**Rankings page**~~ — done 2026-10-19 (`f4ecc8d`).
 2. ~~**Public pricing page**~~ — done 2026-10-19 (`bc49edb`): `GET /api/pricing`
    and `/ui/pricing`.
-3. **Security page** (`/ui/security`) — 2FA, sessions and access token all have
-   endpoints and no UI.
+3. ~~**Security page**~~ — done 2026-10-19: `/ui/security` over the existing
+   2FA, session and access-token endpoints.
 4. **Task plugins page** — `/api/plugin/task*` exists (upload, activate,
    dry-run).
 5. **Redemption codes page** — redeem endpoint exists; admin CRUD exists at

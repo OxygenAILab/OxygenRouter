@@ -282,6 +282,32 @@ export interface SiteValues {
   server_address: string;
 }
 
+/** One signed-in browser session (`GET /api/user/sessions`). */
+export interface SessionView {
+  id: string;
+  created_at: string;
+  expires_at: string;
+  /** True for the session making the request. */
+  current: boolean;
+}
+
+export interface TwoFactorStatus {
+  enabled: boolean;
+  backup_codes_remaining: number;
+}
+
+export interface TwoFactorSetup {
+  secret: string;
+  otpauth_uri: string;
+  issuer: string;
+  account: string;
+}
+
+export interface AccessTokenStatus {
+  enabled: boolean;
+  created_at: string | null;
+}
+
 /** One model in the public price catalogue (`GET /api/pricing`). */
 export interface PublicPricing {
   model_name: string;
@@ -719,6 +745,35 @@ export const api = {
       const res = await fetch(`${API_BASE}/pricing`, { headers });
       if (!res.ok) throw new Error(`Request failed (${res.status})`);
       return (await res.json()) as PricingCatalogue;
+    },
+  },
+  account: {
+    sessions: {
+      list: () => apiFetch<SessionView[]>("/user/sessions"),
+      revoke: (id: string) => apiFetch<string>(`/user/sessions/${id}`, { method: "DELETE" }),
+      revokeOthers: () => apiFetch<number>("/user/sessions/revoke-others", { method: "POST" }),
+    },
+    twoFactor: {
+      status: () => apiFetch<TwoFactorStatus>("/user/2fa/status"),
+      setup: () => apiFetch<TwoFactorSetup>("/user/2fa/setup", { method: "POST" }),
+      enable: (code: string) =>
+        apiFetch<{ enabled: boolean; backup_codes: string[] }>("/user/2fa/enable", {
+          method: "POST",
+          body: JSON.stringify({ code }),
+        }),
+      disable: (code: string) =>
+        apiFetch<string>("/user/2fa/disable", { method: "POST", body: JSON.stringify({ code }) }),
+      backupCodes: (code: string) =>
+        apiFetch<{ backup_codes: string[] }>("/user/2fa/backup_codes", {
+          method: "POST",
+          body: JSON.stringify({ code }),
+        }),
+    },
+    accessToken: {
+      status: () => apiFetch<AccessTokenStatus>("/user/token/status"),
+      // The value is returned exactly once, here.
+      generate: () => apiFetch<string>("/user/token", { method: "POST" }),
+      revoke: () => apiFetch<string>("/user/token", { method: "DELETE" }),
     },
   },
   modelPricing: {

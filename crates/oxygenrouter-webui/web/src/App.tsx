@@ -53,6 +53,7 @@ import AdminBillingPage from "./pages/AdminBillingPage";
 import ModelPricingPage from "./pages/ModelPricingPage";
 import RankingsPage from "./pages/RankingsPage";
 import PricingPage from "./pages/PricingPage";
+import SecurityPage from "./pages/SecurityPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -98,6 +99,8 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
   ];
   // The price tables are the owner's: the API gates them on root, and a nav
   // entry a non-root user cannot use would invite a dead end.
+  // Account-scoped, so it appears only for a signed-in caller.
+  if (user) navItems.push({ path: `${BASE}/security`, label: t.nav.security, icon: ShieldCheck, key: "security", count: null });
   if (user?.role === "root") navItems.push({ path: `${BASE}/model-pricing`, label: t.nav.modelPricing, icon: Calculator, key: "model-pricing", count: null });
   if (user?.role === "admin") navItems.push({ path: `${BASE}/admin/users`, label: t.nav.users, icon: UserRound, key: "admin-users", count: null }, { path: `${BASE}/admin/billing`, label: t.nav.billing, icon: ShieldCheck, key: "admin-billing", count: null });
   return (
@@ -187,6 +190,7 @@ function TopBar() {
     "model-pricing": t.nav.modelPricing,
     rankings: t.nav.rankings,
     pricing: t.nav.pricing,
+    security: t.nav.security,
     "system-settings": t.nav.systemSettings,
     playground: t.nav.playground,
     system: t.nav.system,
@@ -315,6 +319,7 @@ function Shell() {
             <Route path="/ui/models" element={<ModelsPage />} />
             <Route path="/ui/rankings" element={<RankingsPage />} />
             <Route path="/ui/pricing" element={<PricingPage />} />
+            <Route path="/ui/security" element={<SecurityPage />} />
             {/* The reference publishes the catalogue at `/pricing`; an existing
                 link keeps working rather than landing on the SPA fallback. */}
             <Route path="/pricing" element={<Navigate to="/ui/pricing" replace />} />

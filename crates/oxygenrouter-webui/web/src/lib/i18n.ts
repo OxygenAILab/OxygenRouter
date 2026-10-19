@@ -52,6 +52,7 @@ export const STRINGS = {
       modelsMeta: "Model Registry",
       modelPricing: "Model Pricing",
       rankings: "Rankings",
+      security: "Security",
       pricing: "Pricing",
       wallet: "Wallet",
       plans: "Plans",
@@ -388,6 +389,48 @@ export const STRINGS = {
       created: "Model metadata created",
       updated: "Model metadata updated",
       deleted: "Model metadata deleted",
+    },
+    security: {
+      title: "Security",
+      description: "Two-factor, sessions and the API token for this account",
+      twoFactor: "Two-factor authentication",
+      signInFirst: "Sign in to manage two-factor, sessions and API tokens for this account.",
+      enabled: "Enabled",
+      disabled: "Disabled",
+      codesLeft: "recovery codes left",
+      twoFactorHint: "A second factor is required at sign-in once it is enabled.",
+      startSetup: "Start setup",
+      scanHint: "Add this secret to your authenticator app, then confirm with a code.",
+      codePlaceholder: "6-digit code",
+      enable: "Enable",
+      enabledHint: "Enter a code to reissue recovery codes or disable two-factor.",
+      reissueCodes: "Reissue recovery codes",
+      disable: "Disable",
+      disableHint: "Disabling needs a current code: a stolen session must not be able to switch the second factor off.",
+      recoveryCodes: "Recovery codes",
+      recoveryOnce: "Shown once. Each code works a single time.",
+      accessToken: "Access token",
+      tokenHint: "A long-lived credential for scripts. The value is shown once; rotating replaces the previous one.",
+      createToken: "Create token",
+      rotateToken: "Rotate token",
+      revokeToken: "Revoke",
+      sessions: "Signed-in sessions",
+      active: "active",
+      thisDevice: "this device",
+      currentSession: "current session",
+      created: "Created",
+      expires: "Expires",
+      revoke: "Revoke",
+      revokeOthers: "Revoke every other session",
+      noSessions: "No sessions recorded.",
+      sessionRevoked: "Session revoked",
+      sessionsRevoked: "Revoked {n} sessions",
+      tokenRevoked: "Access token revoked",
+      twoFactorEnabled: "Two-factor enabled",
+      twoFactorDisabled: "Two-factor disabled",
+      codesReissued: "New recovery codes issued",
+      badCode: "That code was refused",
+      actionFailed: "The action did not complete",
     },
     pricing: {
       title: "Pricing",
@@ -741,6 +784,7 @@ export const STRINGS = {
       modelsMeta: "模型注册表",
       modelPricing: "模型定价",
       rankings: "排行榜",
+      security: "账户安全",
       pricing: "价格目录",
       wallet: "钱包",
       plans: "套餐",
@@ -1078,6 +1122,48 @@ export const STRINGS = {
       created: "模型元数据已创建",
       updated: "模型元数据已更新",
       deleted: "模型元数据已删除",
+    },
+    security: {
+      title: "账户安全",
+      description: "双因素认证、登录会话与访问令牌",
+      twoFactor: "双因素认证",
+      signInFirst: "登录后可管理本账户的双因素认证、登录会话与访问令牌。",
+      enabled: "已启用",
+      disabled: "未启用",
+      codesLeft: "个恢复码剩余",
+      twoFactorHint: "启用后，登录需要第二个验证因素。",
+      startSetup: "开始设置",
+      scanHint: "把以下密钥添加到验证器应用，然后用验证码确认。",
+      codePlaceholder: "6 位验证码",
+      enable: "启用",
+      enabledHint: "输入验证码可重新生成恢复码，或停用双因素认证。",
+      reissueCodes: "重发恢复码",
+      disable: "停用",
+      disableHint: "停用需要当前验证码：仅凭被盗的会话不应能关闭第二因素。",
+      recoveryCodes: "恢复码",
+      recoveryOnce: "仅显示一次，每个恢复码只能使用一次。",
+      accessToken: "访问令牌",
+      tokenHint: "供脚本使用的长期凭据。令牌值只显示一次；轮换会替换旧值。",
+      createToken: "创建令牌",
+      rotateToken: "轮换令牌",
+      revokeToken: "撤销",
+      sessions: "已登录会话",
+      active: "个有效",
+      thisDevice: "本设备",
+      currentSession: "当前会话",
+      created: "创建时间",
+      expires: "过期时间",
+      revoke: "撤销",
+      revokeOthers: "撤销其他所有会话",
+      noSessions: "暂无会话记录。",
+      sessionRevoked: "会话已撤销",
+      sessionsRevoked: "已撤销 {n} 个会话",
+      tokenRevoked: "访问令牌已撤销",
+      twoFactorEnabled: "双因素认证已启用",
+      twoFactorDisabled: "双因素认证已停用",
+      codesReissued: "已生成新的恢复码",
+      badCode: "验证码被拒绝",
+      actionFailed: "操作未完成",
     },
     pricing: {
       title: "价格目录",
@@ -1433,6 +1519,7 @@ export type Strings = {
     modelPricing: string;
     rankings: string;
     pricing: string;
+    security: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -1770,6 +1857,48 @@ export type Strings = {
     created: string;
     updated: string;
     deleted: string;
+  };
+  security: {
+    title: string;
+    description: string;
+    twoFactor: string;
+    signInFirst: string;
+    enabled: string;
+    disabled: string;
+    codesLeft: string;
+    twoFactorHint: string;
+    startSetup: string;
+    scanHint: string;
+    codePlaceholder: string;
+    enable: string;
+    enabledHint: string;
+    reissueCodes: string;
+    disable: string;
+    disableHint: string;
+    recoveryCodes: string;
+    recoveryOnce: string;
+    accessToken: string;
+    tokenHint: string;
+    createToken: string;
+    rotateToken: string;
+    revokeToken: string;
+    sessions: string;
+    active: string;
+    thisDevice: string;
+    currentSession: string;
+    created: string;
+    expires: string;
+    revoke: string;
+    revokeOthers: string;
+    noSessions: string;
+    sessionRevoked: string;
+    sessionsRevoked: string;
+    tokenRevoked: string;
+    twoFactorEnabled: string;
+    twoFactorDisabled: string;
+    codesReissued: string;
+    badCode: string;
+    actionFailed: string;
   };
   pricing: {
     title: string;
