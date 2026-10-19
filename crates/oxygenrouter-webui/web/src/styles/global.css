@@ -1580,6 +1580,11 @@ select option { background: var(--md-surface-container-high); color: var(--md-on
   letter-spacing: -0.02em;
 }
 
+/* Audit trail: who did what, with the body on demand. */
+.audit-actor { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.audit-actor small { color: var(--md-on-surface-variant); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.audit-status-error { color: var(--md-error); }
+
 /* Task plugins page: builds, activation and the dry-run console. */
 .plugin-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .plugin-cell small { color: var(--md-on-surface-variant); font-size: 10px; overflow: hidden; text-overflow: ellipsis; }

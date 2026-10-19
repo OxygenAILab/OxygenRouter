@@ -282,6 +282,22 @@ export interface SiteValues {
   server_address: string;
 }
 
+/** One recorded administrative action (`GET /api/audit-logs`). */
+export interface AuditLog {
+  id: string;
+  actor_id: string | null;
+  /** Denormalised, so the row stays readable after the account is gone. */
+  actor_name: string;
+  actor_role: string;
+  method: string;
+  path: string;
+  status_code: number | null;
+  /** The request body with credential-bearing fields replaced. */
+  detail: string | null;
+  client_ip: string | null;
+  created_at: string;
+}
+
 /** A task plugin as the console lists it (`GET /api/plugin/task`). */
 export interface TaskPlugin {
   key: string;
@@ -788,6 +804,12 @@ export const api = {
         `/plugin/task/${encodeURIComponent(key)}/versions/${encodeURIComponent(version)}`,
         { method: "DELETE" },
       ),
+  },
+  audit: {
+    // The trail's own reader takes a limit only; filtering and paging happen in
+    // the page, which is honest about what the endpoint does.
+    list: (limit = 200) => apiFetch<AuditLog[]>(`/audit-logs?limit=${limit}`),
+    clear: () => apiFetch<number>("/audit-logs", { method: "DELETE" }),
   },
   account: {
     sessions: {

@@ -530,8 +530,33 @@ async fn access_guard(
                 next.run(request).await
             }
         }
-        // `auth_user` already produced the right response shape and status.
-        Err(response) => response,
+        // The refusal itself is worth a row: "who tried to reach this privileged
+        // surface without the role" is the question an investigator asks first,
+        // and the check that refused them deliberately did not resolve their
+        // identity — so it is resolved here, best-effort, from the same headers.
+        //
+        // Only the privileged classes are recorded; auditing every expired token
+        // would bury the trail in noise. The body is not stored for a denial: it
+        // was never buffered, and reading it here would mean consuming a request
+        // that is about to be answered.
+        Err(response) => {
+            if matches!(required, Access::Admin | Access::Root)
+                && request.method() != axum::http::Method::GET
+                && state.audit_log_enabled()
+            {
+                let actor = auth_user(&state, &headers).ok();
+                record_audit(
+                    &state,
+                    actor.as_ref(),
+                    request.method().as_str(),
+                    &path,
+                    Some(response.status().as_u16()),
+                    None,
+                    &headers,
+                );
+            }
+            response
+        }
     }
 }
 

@@ -17,6 +17,7 @@ import {
   PanelLeftOpen,
   Receipt,
   Route as RouteIcon,
+  ScrollText,
   Server,
   Settings,
   SlidersHorizontal,
@@ -56,6 +57,7 @@ import RankingsPage from "./pages/RankingsPage";
 import PricingPage from "./pages/PricingPage";
 import SecurityPage from "./pages/SecurityPage";
 import TaskPluginsPage from "./pages/TaskPluginsPage";
+import AuditPage from "./pages/AuditPage";
 
 const BASE = "/ui";
 const COLLAPSE_KEY = "oxygenrouter:sidebar-collapsed";
@@ -108,6 +110,9 @@ function Sidebar({ open, onClose, collapsed, onToggle }: { open: boolean; onClos
     // Uploading code the gateway will execute is the owner's action, matching
     // the root-only `/api/plugin` tree.
     { path: `${BASE}/task-plugins`, label: t.nav.plugins, icon: Boxes, key: "task-plugins", count: null },
+    // The trail names who holds power and what they changed, so it is the
+    // owner's for the same reason the price tables are.
+    { path: `${BASE}/audit`, label: t.nav.audit, icon: ScrollText, key: "audit", count: null },
   );
   if (isAdmin(user)) navItems.push({ path: `${BASE}/admin/users`, label: t.nav.users, icon: UserRound, key: "admin-users", count: null }, { path: `${BASE}/admin/billing`, label: t.nav.billing, icon: ShieldCheck, key: "admin-billing", count: null });
   return (
@@ -199,6 +204,7 @@ function TopBar() {
     pricing: t.nav.pricing,
     security: t.nav.security,
     "task-plugins": t.nav.plugins,
+    audit: t.nav.audit,
     "system-settings": t.nav.systemSettings,
     playground: t.nav.playground,
     system: t.nav.system,
@@ -335,6 +341,7 @@ function Shell() {
             <Route path="/ui/pricing" element={<PricingPage />} />
             <Route path="/ui/security" element={<SecurityPage />} />
             <Route path="/ui/task-plugins" element={<TaskPluginsPage />} />
+            <Route path="/ui/audit" element={<AuditPage />} />
             {/* The reference publishes the catalogue at `/pricing`; an existing
                 link keeps working rather than landing on the SPA fallback. */}
             <Route path="/pricing" element={<Navigate to="/ui/pricing" replace />} />

@@ -53,6 +53,7 @@ export const STRINGS = {
       modelPricing: "Model Pricing",
       rankings: "Rankings",
       plugins: "Task Plugins",
+      audit: "Audit trail",
       security: "Security",
       pricing: "Pricing",
       wallet: "Wallet",
@@ -390,6 +391,25 @@ export const STRINGS = {
       created: "Model metadata created",
       updated: "Model metadata updated",
       deleted: "Model metadata deleted",
+    },
+    audit: {
+      title: "Audit trail",
+      description: "Every administrative write, and who made it",
+      when: "When",
+      actor: "Who",
+      method: "Method",
+      path: "Path",
+      status: "Status",
+      detail: "Body",
+      trail: "Recorded actions",
+      entries: "entries",
+      empty: "Nothing recorded yet.",
+      searchPlaceholder: "Search who, path or body…",
+      clear: "Clear the trail",
+      clearHint: "This erases the record of who changed what.",
+      clearBody: "The trail is the only record of administrative actions. Clearing it cannot be undone.",
+      cleared: "Cleared {n} entries",
+      clearFailed: "The trail was not cleared",
     },
     plugins: {
       title: "Task plugins",
@@ -816,6 +836,7 @@ export const STRINGS = {
       modelPricing: "模型定价",
       rankings: "排行榜",
       plugins: "任务插件",
+      audit: "审计日志",
       security: "账户安全",
       pricing: "价格目录",
       wallet: "钱包",
@@ -1154,6 +1175,25 @@ export const STRINGS = {
       created: "模型元数据已创建",
       updated: "模型元数据已更新",
       deleted: "模型元数据已删除",
+    },
+    audit: {
+      title: "审计日志",
+      description: "每一次管理写入，以及是谁做的",
+      when: "时间",
+      actor: "操作人",
+      method: "方法",
+      path: "路径",
+      status: "状态",
+      detail: "请求体",
+      trail: "已记录操作",
+      entries: "条记录",
+      empty: "暂无记录。",
+      searchPlaceholder: "搜索操作人、路径或请求体…",
+      clear: "清空日志",
+      clearHint: "这会抹掉「谁改了什么」的记录。",
+      clearBody: "审计日志是管理操作的唯一记录，清空后无法恢复。",
+      cleared: "已清空 {n} 条记录",
+      clearFailed: "日志未清空",
     },
     plugins: {
       title: "任务插件",
@@ -1583,6 +1623,7 @@ export type Strings = {
     pricing: string;
     security: string;
     plugins: string;
+    audit: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -1920,6 +1961,25 @@ export type Strings = {
     created: string;
     updated: string;
     deleted: string;
+  };
+  audit: {
+    title: string;
+    description: string;
+    when: string;
+    actor: string;
+    method: string;
+    path: string;
+    status: string;
+    detail: string;
+    trail: string;
+    entries: string;
+    empty: string;
+    searchPlaceholder: string;
+    clear: string;
+    clearHint: string;
+    clearBody: string;
+    cleared: string;
+    clearFailed: string;
   };
   plugins: {
     title: string;
