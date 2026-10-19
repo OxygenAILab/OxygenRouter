@@ -1025,18 +1025,22 @@ returned separately as new models, and one unreachable source leaves the
 remaining reports intact.
 
 `/ui/ratio-sync` is root-only and links to the versioned pricing editor for the
-actual save. Applying the reference's full field/source matrix remains open:
-official preset, models.dev and OpenRouter conversion, `model_price` and audio
-fields, and the reference's richer `differences` / `prices` response.
+actual save. The source list now includes the reference's official and
+models.dev presets, and the fetch path converts OpenRouter `/v1/models` and
+models.dev `/api.json` into local ratios. The comparison covers all reference
+price fields: model/completion/cache/create-cache/image/audio ratios,
+audio-completion, `model_price`, billing mode and billing expression.
 
 Verified live (`.devlogs/live_task/check_ratio_sync.ps1` against the
 `ratio_upstream.py` mock on 18093): an explicit upstream produced the
 `gpt-4o` `model_ratio` / `completion_ratio` / `cache_ratio` differences and the
-`brand-new-model` source-only row; the pricing snapshot still had no configured
+`DeepSeek-V4-Flash-Vision-Exp` ratio/audio differences and the
+`brand-new-model` source-only row; OpenRouter and models.dev fixtures both
+resolved to source-only models; the pricing snapshot still had no configured
 ratio afterward; a dead source was isolated; a channel could be named as the
 source; the empty request answered `400`; anonymous read `401`; plain-user read
-`403`. The page was driven in the browser and showed six field differences plus
-one source-only model. Workspace suite: 654/0; frontend production build passed.
+`403`. The page was driven in the browser and showed the three sources plus the
+field differences. Workspace suite: 661/0; frontend production build passed.
 
 ### Error pages (2026-10-20)
 

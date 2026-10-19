@@ -102,16 +102,16 @@ workspace is not a superset section-by-section:
    the relay path, `/api/perf-metrics[/summary]` and `/ui/perf-metrics`. Time to
    first token stays unmeasured (streaming is buffered), so that field is
    omitted rather than reported as a measured zero.
-9. **Ratio sync** (`/api/ratio_sync`) — **partial**. The root-only
-   `/ui/ratio-sync` page and `/api/ratio_sync/{channels,fetch}` endpoints were
-   driven live on 2026-10-19: operator-supplied HTTP sources and enabled
-   channels are compared across `model_ratio`, `completion_ratio`, `cache_ratio`,
-   `create_cache_ratio` and `image_ratio`; only real differences are reported,
-   source-only models are separated, a dead source does not discard a live one,
-   and the preview writes nothing (saving remains in the versioned pricing
-   editor). The reference's official preset, models.dev and OpenRouter adapters,
-   its remaining price fields (`model_price`, audio and billing-expression
-   fields), and its richer response/selection shape are still open.
+9. ~~**Ratio sync** (`/api/ratio_sync`)~~ — done 2026-10-20. The root-only
+   `/ui/ratio-sync` page and `/api/ratio_sync/{channels,fetch}` endpoints list
+   enabled channels plus the official and models.dev presets, compare every
+   reference price field (model/completion/cache/create-cache/image/audio/
+   audio-completion/model_price and billing mode/expression), convert the
+   OpenRouter and models.dev payloads, separate source-only models, and leave a
+   dead source from hiding a live one. The preview writes nothing; saving stays
+   in the versioned pricing editor. Verified live with
+   `.devlogs/live_task/check_ratio_sync.ps1`; the two remote presets' conversion
+   paths are exercised against local fixtures.
 10. ~~**System tasks**~~ — done 2026-10-19: the five `/api/system-task/*` routes
     over a `log_cleanup` runner with durable progress, plus `/ui/system-tasks`.
 11. ~~**Legal / about and error views**~~ — done 2026-10-20: the three option

@@ -13,8 +13,8 @@ type DifferenceRow = {
   upstream: string;
   model_name: string;
   field: string;
-  local?: number;
-  upstream_value?: number;
+  local?: number | string;
+  upstream_value?: number | string;
 };
 
 /**

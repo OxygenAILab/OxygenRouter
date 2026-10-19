@@ -333,6 +333,97 @@ impl Pricing {
         names.extend(self.defaults.pricing.billing_expr.keys().cloned());
         names.into_iter().collect()
     }
+
+    /// Every model named by any price table, operator override or shipped
+    /// default. The price comparison uses this rather than the expression
+    /// catalogue, because a model priced only by a legacy ratio is still a
+    /// real local price.
+    pub fn sync_models(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut add = |map: &HashMap<String, f64>| names.extend(map.keys().cloned());
+        for table in [
+            &self.defaults.pricing.model_ratio,
+            &self.defaults.pricing.completion_ratio,
+            &self.defaults.pricing.cache_ratio,
+            &self.defaults.pricing.cache_creation_ratio,
+            &self.defaults.pricing.image_ratio,
+            &self.defaults.pricing.audio_ratio,
+            &self.defaults.pricing.audio_completion_ratio,
+            &self.defaults.pricing.model_price,
+        ] {
+            add(table);
+        }
+        for table in [
+            &self.ratio_overrides.model_ratio,
+            &self.ratio_overrides.completion_ratio,
+            &self.ratio_overrides.cache_ratio,
+            &self.ratio_overrides.cache_creation_ratio,
+            &self.ratio_overrides.image_ratio,
+            &self.ratio_overrides.audio_ratio,
+            &self.ratio_overrides.audio_completion_ratio,
+            &self.ratio_overrides.model_price,
+        ] {
+            add(table);
+        }
+        names.extend(self.expr_overrides.keys().cloned());
+        names.extend(self.defaults.pricing.billing_expr.keys().cloned());
+        names.extend(self.mode_overrides.keys().cloned());
+        names.extend(self.defaults.pricing.billing_mode.keys().cloned());
+        names.into_iter().collect()
+    }
+
+    /// One numeric sync field, or `None` when the model does not declare it.
+    ///
+    /// The `None` matters: a source that publishes no audio price is not the
+    /// same as a source that publishes zero, and the comparison must not turn
+    /// the first into the second.
+    pub fn sync_numeric(&self, field: &str, model: &str) -> Option<f64> {
+        let lookup = |overrides: &HashMap<String, f64>,
+                      defaults: &HashMap<String, f64>|
+         -> Option<f64> {
+            overrides
+                .get(model)
+                .or_else(|| defaults.get(model))
+                .copied()
+                .filter(|value| value.is_finite())
+        };
+        match field {
+            "model_ratio" => lookup(&self.ratio_overrides.model_ratio, &self.defaults.pricing.model_ratio),
+            "completion_ratio" => lookup(
+                &self.ratio_overrides.completion_ratio,
+                &self.defaults.pricing.completion_ratio,
+            ),
+            "cache_ratio" => lookup(&self.ratio_overrides.cache_ratio, &self.defaults.pricing.cache_ratio),
+            "create_cache_ratio" => lookup(
+                &self.ratio_overrides.cache_creation_ratio,
+                &self.defaults.pricing.cache_creation_ratio,
+            ),
+            "image_ratio" => lookup(&self.ratio_overrides.image_ratio, &self.defaults.pricing.image_ratio),
+            "audio_ratio" => lookup(&self.ratio_overrides.audio_ratio, &self.defaults.pricing.audio_ratio),
+            "audio_completion_ratio" => lookup(
+                &self.ratio_overrides.audio_completion_ratio,
+                &self.defaults.pricing.audio_completion_ratio,
+            ),
+            "model_price" => lookup(&self.ratio_overrides.model_price, &self.defaults.pricing.model_price),
+            _ => None,
+        }
+    }
+
+    /// The billing mode only when the model explicitly declares one.
+    pub fn sync_billing_mode(&self, model: &str) -> Option<String> {
+        let explicit = self.mode_overrides.contains_key(model)
+            || self.defaults.pricing.billing_mode.contains_key(model);
+        if !explicit {
+            return None;
+        }
+        Some(
+            match self.mode(model) {
+                BillingMode::TieredExpr => "tiered_expr",
+                BillingMode::Ratio => "ratio",
+            }
+            .to_string(),
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

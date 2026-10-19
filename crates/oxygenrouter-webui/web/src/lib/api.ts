@@ -323,12 +323,13 @@ export interface SyncableChannel {
   name: string;
   base_url: string;
   endpoint: string;
+  kind: "channel" | "official" | "models_dev";
 }
 
 export interface FieldDifference {
   field: string;
-  local?: number;
-  upstream?: number;
+  local?: number | string;
+  upstream?: number | string;
 }
 
 export interface ModelDifference {
