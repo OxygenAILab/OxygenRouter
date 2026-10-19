@@ -55,7 +55,7 @@ Status vocabulary:
 | `/profile` | — (fields on `/ui/settings`) | partial | |
 | `/security` | `/ui/security` over `/api/user/{2fa,sessions,token}` | live | driven live on 2026-10-19: sessions revoked, token generated/rotated/revoked, two-factor enabled with an independently generated TOTP code and then disabled |
 | `/users` | `/ui/admin/users` | route | |
-| `/task-plugins` | — (API: `/api/plugin/task*`) | **missing page** | |
+| `/task-plugins` | `/ui/task-plugins` over `/api/plugin/task*` | live | driven in the browser on 2026-10-19: a build uploaded, enabled and activated, and a driver hook dry-run from the console (which is what found the `call_hook` dispatch defect) |
 | `/system-info` | `/ui/system` | route | |
 | `/chat`, `/chat2link` | — | **missing** | reference's own chat UI, not a gateway feature |
 
@@ -84,8 +84,9 @@ workspace is not a superset section-by-section:
    and `/ui/pricing`.
 3. ~~**Security page**~~ — done 2026-10-19: `/ui/security` over the existing
    2FA, session and access-token endpoints.
-4. **Task plugins page** — `/api/plugin/task*` exists (upload, activate,
-   dry-run).
+4. ~~**Task plugins page**~~ — done 2026-10-19: `/ui/task-plugins` over the
+   existing plugin endpoints, plus the `call_hook` dispatch fix that made a
+   dry run able to call a driver hook at all.
 5. **Redemption codes page** — redeem endpoint exists; admin CRUD exists at
    `/api/admin/redemption-codes`. **Covered**: the admin CRUD lives in
    `/ui/admin/billing` and the redeem form on `/ui/wallet`; the remaining work

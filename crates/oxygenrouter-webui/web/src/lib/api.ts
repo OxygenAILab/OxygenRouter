@@ -282,6 +282,21 @@ export interface SiteValues {
   server_address: string;
 }
 
+/** A task plugin as the console lists it (`GET /api/plugin/task`). */
+export interface TaskPlugin {
+  key: string;
+  name: string;
+  version: string | null;
+  description: string;
+  enabled: boolean;
+  active_version: string | null;
+  /** Every build on file, newest first. */
+  versions: string[];
+  /** Endpoint protocols the active build claims. */
+  protocols: string[];
+  updated_at: string;
+}
+
 /** One signed-in browser session (`GET /api/user/sessions`). */
 export interface SessionView {
   id: string;
@@ -746,6 +761,33 @@ export const api = {
       if (!res.ok) throw new Error(`Request failed (${res.status})`);
       return (await res.json()) as PricingCatalogue;
     },
+  },
+  plugins: {
+    list: () => apiFetch<TaskPlugin[]>("/plugin/task"),
+    upload: (input: { key: string; version: string; source: string }) =>
+      apiFetch<TaskPlugin>("/plugin/task", { method: "POST", body: JSON.stringify(input) }),
+    // These three answer a short status string or a count, not the plugin: the
+    // console re-reads the list rather than trusting a returned snapshot.
+    activate: (key: string, version: string) =>
+      apiFetch<string>(`/plugin/task/${encodeURIComponent(key)}/activate`, {
+        method: "POST",
+        body: JSON.stringify({ version }),
+      }),
+    setEnabled: (key: string, enabled: boolean) =>
+      apiFetch<string>(`/plugin/task/${encodeURIComponent(key)}/status`, {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      }),
+    dryRun: (key: string, hook: string, input: unknown) =>
+      apiFetch<unknown>(`/plugin/task/${encodeURIComponent(key)}/dryrun`, {
+        method: "POST",
+        body: JSON.stringify({ hook, input }),
+      }),
+    removeVersion: (key: string, version: string) =>
+      apiFetch<number>(
+        `/plugin/task/${encodeURIComponent(key)}/versions/${encodeURIComponent(version)}`,
+        { method: "DELETE" },
+      ),
   },
   account: {
     sessions: {

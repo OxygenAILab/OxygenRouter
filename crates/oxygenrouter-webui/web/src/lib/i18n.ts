@@ -52,6 +52,7 @@ export const STRINGS = {
       modelsMeta: "Model Registry",
       modelPricing: "Model Pricing",
       rankings: "Rankings",
+      plugins: "Task Plugins",
       security: "Security",
       pricing: "Pricing",
       wallet: "Wallet",
@@ -389,6 +390,36 @@ export const STRINGS = {
       created: "Model metadata created",
       updated: "Model metadata updated",
       deleted: "Model metadata deleted",
+    },
+    plugins: {
+      title: "Task plugins",
+      description: "JavaScript the gateway runs for task and media protocols",
+      upload: "Upload build",
+      uploaded: "Build stored",
+      uploadFailed: "The build was refused",
+      key: "Plugin key",
+      version: "Version",
+      source: "Source",
+      sourceHint: "The build is run once before it is stored, so a broken build is refused here.",
+      plugin: "Plugin",
+      enabled: "Enabled",
+      active: "Active",
+      versions: "Builds",
+      protocols: "Protocols",
+      installed: "installed",
+      empty: "No plugin is installed yet.",
+      lastUpdated: "Last updated",
+      activated: "Build activated",
+      updated: "Plugin updated",
+      versionRemoved: "Build removed",
+      removeVersion: "Remove this build",
+      dryRun: "Dry run",
+      dryRunFailed: "The hook refused the call",
+      run: "Run",
+      hook: "Hook",
+      input: "Input (JSON)",
+      result: "Result",
+      actionFailed: "The action did not complete",
     },
     security: {
       title: "Security",
@@ -784,6 +815,7 @@ export const STRINGS = {
       modelsMeta: "模型注册表",
       modelPricing: "模型定价",
       rankings: "排行榜",
+      plugins: "任务插件",
       security: "账户安全",
       pricing: "价格目录",
       wallet: "钱包",
@@ -1122,6 +1154,36 @@ export const STRINGS = {
       created: "模型元数据已创建",
       updated: "模型元数据已更新",
       deleted: "模型元数据已删除",
+    },
+    plugins: {
+      title: "任务插件",
+      description: "网关为任务与媒体协议执行的 JavaScript",
+      upload: "上传构建",
+      uploaded: "构建已保存",
+      uploadFailed: "构建被拒绝",
+      key: "插件标识",
+      version: "版本",
+      source: "源码",
+      sourceHint: "保存前会先试运行一次，因此损坏的构建会在此被拒绝。",
+      plugin: "插件",
+      enabled: "启用",
+      active: "当前版本",
+      versions: "版本",
+      protocols: "协议",
+      installed: "个已安装",
+      empty: "暂无插件。",
+      lastUpdated: "最近更新",
+      activated: "已切换版本",
+      updated: "插件已更新",
+      versionRemoved: "版本已删除",
+      removeVersion: "删除该版本",
+      dryRun: "试运行",
+      dryRunFailed: "钩子拒绝了调用",
+      run: "运行",
+      hook: "钩子",
+      input: "输入 (JSON)",
+      result: "结果",
+      actionFailed: "操作未完成",
     },
     security: {
       title: "账户安全",
@@ -1520,6 +1582,7 @@ export type Strings = {
     rankings: string;
     pricing: string;
     security: string;
+    plugins: string;
     systemSettings: string;
     wallet: string;
     plans: string;
@@ -1857,6 +1920,36 @@ export type Strings = {
     created: string;
     updated: string;
     deleted: string;
+  };
+  plugins: {
+    title: string;
+    description: string;
+    upload: string;
+    uploaded: string;
+    uploadFailed: string;
+    key: string;
+    version: string;
+    source: string;
+    sourceHint: string;
+    plugin: string;
+    enabled: string;
+    active: string;
+    versions: string;
+    protocols: string;
+    installed: string;
+    empty: string;
+    lastUpdated: string;
+    activated: string;
+    updated: string;
+    versionRemoved: string;
+    removeVersion: string;
+    dryRun: string;
+    dryRunFailed: string;
+    run: string;
+    hook: string;
+    input: string;
+    result: string;
+    actionFailed: string;
   };
   security: {
     title: string;
