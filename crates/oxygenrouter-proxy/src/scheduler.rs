@@ -7,24 +7,21 @@ use std::time::Duration;
 
 use crate::affinity::{AffinityStore, SessionMode};
 use crate::dispatch::{relay_format_for_path, RelayClient};
+use crate::policy::RequestPolicy;
 use crate::selection::{
     apply_model_map, select_tiered_excluding, tiers_exhausted_excluding, Selection,
 };
 use crate::upstream::{ProxyError, ProxyRequest, ProxyResult};
 use oxygenrouter_core::{Channel, ChannelSelector, ModelMap};
-use oxygenrouter_relay::retry::backoff_ms;
 
 pub struct ChannelScheduler {
     selector: ChannelSelector,
     relay: RelayClient,
     model_maps: Vec<ModelMap>,
-    max_retries: u32,
-    backoff_base_ms: u64,
-    backoff_cap_ms: u64,
-    /// Consecutive failures per channel, for auto-disable.
+    /// The live request policy, replaced whole whenever an option changes.
+    policy: RequestPolicy,
+    /// Consecutive failures per channel, for the streak exclusion extension.
     failures: parking_lot::Mutex<std::collections::HashMap<String, u32>>,
-    /// Consecutive failures before a channel is disabled. `0` disables the rule.
-    disable_threshold: u32,
     /// Session stickiness, shared with the console so one edit reaches every
     /// in-flight dispatch.
     affinity: std::sync::Arc<AffinityStore>,
@@ -36,11 +33,8 @@ impl ChannelScheduler {
             selector,
             relay,
             model_maps: Vec::new(),
-            max_retries: 3,
-            backoff_base_ms: 300,
-            backoff_cap_ms: 30_000,
+            policy: RequestPolicy::default(),
             failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            disable_threshold: 5,
             affinity: std::sync::Arc::new(AffinityStore::new()),
         }
     }
@@ -50,24 +44,17 @@ impl ChannelScheduler {
         std::sync::Arc::clone(&self.affinity)
     }
 
-    /// Configure auto-disable. `threshold == 0` turns the rule off; NewAPI's
-    /// default behaviour is to never auto-disable unless configured.
-    pub fn with_disable_threshold(mut self, threshold: u32) -> Self {
-        self.disable_threshold = threshold;
-        self
+    /// Install a new policy snapshot.
+    ///
+    /// The console writes options and then pushes the rebuilt snapshot here, so
+    /// an edit reaches the very next dispatch without a restart — the reference
+    /// does the same through its `RequestPolicySnapshot`.
+    pub fn set_policy(&mut self, policy: RequestPolicy) {
+        self.policy = policy;
     }
 
-    pub fn with_max_retries(mut self, n: u32) -> Self {
-        self.max_retries = n;
-        self
-    }
-
-    /// Configure retry backoff. `base_ms == 0` disables sleeping (immediate
-    /// retry, matching NewAPI's behaviour).
-    pub fn with_backoff(mut self, base_ms: u64, cap_ms: u64) -> Self {
-        self.backoff_base_ms = base_ms;
-        self.backoff_cap_ms = cap_ms.max(base_ms);
-        self
+    pub fn policy(&self) -> &RequestPolicy {
+        &self.policy
     }
 
     pub fn set_model_maps(&mut self, maps: Vec<ModelMap>) {
@@ -101,13 +88,13 @@ impl ChannelScheduler {
     /// count, and an improvement in that the threshold is enforced in-process
     /// so a dead channel stops being selected immediately.
     fn note_failure(&self, channel_id: &str) -> bool {
-        if self.disable_threshold == 0 {
+        if self.policy.failure_streak_threshold == 0 {
             return false;
         }
         let mut failures = self.failures.lock();
         let count = failures.entry(channel_id.to_string()).or_insert(0);
         *count += 1;
-        *count >= self.disable_threshold
+        *count >= self.policy.failure_streak_threshold
     }
 
     /// Number of consecutive failures recorded for a channel.
@@ -135,8 +122,60 @@ impl ChannelScheduler {
     /// A caller that selects channels itself has to apply the same exclusion
     /// `candidates` applies for the relay path.
     pub fn is_temporarily_disabled(&self, channel_id: &str) -> bool {
-        self.disable_threshold > 0
-            && self.failure_count(channel_id) >= self.disable_threshold
+        self.policy.failure_streak_threshold > 0
+            && self.failure_count(channel_id) >= self.policy.failure_streak_threshold
+    }
+
+    /// Persist an automatic disable when the policy says this failure deserves
+    /// one, and drop the streak that stood in for it.
+    ///
+    /// The two mechanisms answer different questions: the streak keeps traffic
+    /// away from a flapping channel in-process, while the persisted disable is
+    /// the operator-visible state a health test can lift. Once the persisted
+    /// disable exists, keeping the streak would leave the channel excluded even
+    /// after the console shows it enabled again.
+    fn maybe_auto_disable(&self, channel: &Channel, error: &ProxyError) {
+        if !channel.auto_ban || !self.policy.auto_disable_enabled {
+            return;
+        }
+        if !self.policy.should_disable(error) {
+            return;
+        }
+        let reason = self.policy.disable_reason(error);
+        match self
+            .selector
+            .database()
+            .set_channel_auto_disabled(&channel.id, &reason)
+        {
+            Ok(true) => {
+                self.failures.lock().remove(&channel.id);
+                eprintln!(
+                    "[OxygenRouter] channel {} ({}) auto-disabled: {}",
+                    channel.name, channel.id, reason
+                );
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "[OxygenRouter] failed to auto-disable channel {}: {error}",
+                channel.id
+            ),
+        }
+    }
+
+    /// Record a failed attempt the caller performed itself, and apply the
+    /// auto-disable rule to it.
+    ///
+    /// The task bridge shapes its own requests through a plugin, so it cannot
+    /// go through `dispatch`; without this the policy that protects the relay
+    /// path would not see task failures at all.
+    pub fn record_task_failure(&self, channel: &Channel, status: u16, message: &str) -> bool {
+        let crossed = self.note_failure(&channel.id);
+        let error = ProxyError::Upstream {
+            status,
+            body: message.to_string(),
+        };
+        self.maybe_auto_disable(channel, &error);
+        crossed
     }
 
     pub async fn dispatch(
@@ -157,7 +196,9 @@ impl ChannelScheduler {
         let mut tried: Vec<String> = Vec::new();
         let mut last_err: Option<ProxyError> = None;
         let mut current_model = model.to_string();
-        let limit = self.max_retries.max(1);
+        // `RetryTimes` counts the attempts *after* the first, matching the
+        // reference's `for retry <= RetryTimes` loop: 0 means try once.
+        let limit = self.policy.max_retries;
 
         // Resolved once, before any attempt: the identity a rule derives must not
         // change because a retry rewrote the model, or a failover would pin the
@@ -216,12 +257,14 @@ impl ChannelScheduler {
                         // channel. A caller that asked for a stable upstream
                         // would rather see the error than be moved silently.
                         self.note_failure(&channel.id);
+                        self.maybe_auto_disable(&channel, &error);
                         return Err(error);
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // Prefer mode: fall through to ordinary selection, which
                         // will also remember the channel it ultimately chooses.
                         self.note_failure(&channel.id);
+                        self.maybe_auto_disable(&channel, &error);
                         tried.push(channel.id.clone());
                     }
                 }
@@ -268,21 +311,26 @@ impl ChannelScheduler {
                             continue;
                         }
                     }
-                    let retryable = e.is_retryable();
+                    let retryable = self.policy.should_retry(&e, limit - attempt);
                     if retryable {
                         let crossed = self.note_failure(&channel.id);
                         if crossed {
                             eprintln!(
                                 "[OxygenRouter] channel {} hit {} consecutive failures; excluding it from selection",
-                                channel.id, self.disable_threshold
+                                channel.id, self.policy.failure_streak_threshold
                             );
                         }
                     }
+                    // The persisted disable is decided from the policy's own
+                    // rules and applies even to failures that are not retried:
+                    // a keyword like "exceeded your current quota" arrives with
+                    // a status the retry ranges leave alone, yet it is exactly
+                    // the state that should take the channel out of service.
+                    self.maybe_auto_disable(&channel, &e);
                     if retryable && attempt < limit {
                         last_err = Some(e);
-                        if self.backoff_base_ms > 0 {
-                            let delay =
-                                backoff_ms(attempt, self.backoff_base_ms, self.backoff_cap_ms);
+                        let delay = self.policy.retry_delay_ms(attempt);
+                        if delay > 0 {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
                         continue;
@@ -310,7 +358,7 @@ impl ChannelScheduler {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        let threshold = self.disable_threshold;
+        let threshold = self.policy.failure_streak_threshold;
         let failures = self.failures.lock();
         let mut candidates: Vec<Channel> = channels
             .into_iter()
@@ -416,5 +464,24 @@ mod tests {
         assert!(scheduler
             .candidates(&[], "missing-model", None, true)
             .is_empty());
+    }
+
+    #[test]
+    fn the_failure_streak_exclusion_reads_the_policy() {
+        let candidate = channel("only", 1, &["wanted"]);
+        let id = candidate.id.clone();
+        let mut scheduler = scheduler_with(vec![candidate]);
+        let mut policy = RequestPolicy::default();
+        policy.failure_streak_threshold = 2;
+        scheduler.set_policy(policy);
+
+        assert!(!scheduler.note_attempt_failure(&id));
+        assert!(!scheduler.is_temporarily_disabled(&id));
+        assert!(scheduler.note_attempt_failure(&id));
+        assert!(scheduler.is_temporarily_disabled(&id));
+        assert!(scheduler.candidates(&[], "wanted", None, true).is_empty());
+
+        scheduler.note_attempt_success(&id);
+        assert_eq!(scheduler.candidates(&[], "wanted", None, true).len(), 1);
     }
 }

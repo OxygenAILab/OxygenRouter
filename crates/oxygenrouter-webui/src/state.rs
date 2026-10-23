@@ -577,6 +577,19 @@ impl AppState {
         }
     }
 
+    /// Rebuild the request policy from the option store and hand it to the
+    /// scheduler.
+    ///
+    /// The retry ranges, the disable rules and the health-test knobs are all
+    /// read on the relay path, so they are pushed rather than derived per
+    /// request. One snapshot means a write either lands whole or not at all: an
+    /// operator can never observe the new retry ranges with the old disable
+    /// codes.
+    pub async fn reload_request_policy(&self) {
+        let policy = oxygenrouter_proxy::RequestPolicy::from_db(&self.db);
+        self.scheduler.write().await.set_policy(policy);
+    }
+
     /// Apply the three billing thresholds the console offers.
     ///
     /// `TrustQuota`, `PreConsumedQuota` and `FreeModelPreConsumeEnabled` were

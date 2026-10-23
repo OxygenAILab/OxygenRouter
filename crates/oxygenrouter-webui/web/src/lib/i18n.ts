@@ -370,6 +370,7 @@ export const STRINGS = {
         operations: "Operations",
         security: "Security",
         models: "Models",
+        request_policies: "Request Policies",
         bootstrap: "Startup (restart required)",
       },
     },
@@ -1300,6 +1301,7 @@ export const STRINGS = {
         operations: "运维",
         security: "安全",
         models: "模型",
+        request_policies: "请求策略",
         bootstrap: "启动项（需重启）",
       },
     },
@@ -2233,6 +2235,7 @@ export type Strings = {
       operations: string;
       security: string;
       models: string;
+      request_policies: string;
       bootstrap: string;
     };
   };

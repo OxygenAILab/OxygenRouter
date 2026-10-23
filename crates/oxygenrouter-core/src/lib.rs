@@ -23,6 +23,7 @@ mod db;
 mod models;
 pub mod net;
 pub mod options;
+pub mod status_ranges;
 pub mod totp;
 
 pub use config::{APP_CONFIG, load_config, save_config};
@@ -39,4 +40,8 @@ pub use oxygenrouter_plugin::{
 pub use options::{
     find_schema, validate as validate_option, validate_for_key as validate_option_for_key,
     OptionKind, OptionSchema, OptionSection, OPTION_SCHEMA,
+};
+pub use status_ranges::{
+    format_status_ranges, matches_status_ranges, parse_http_status_ranges,
+    ALWAYS_SKIP_RETRY_STATUS, DEFAULT_DISABLE_STATUS_RANGES, DEFAULT_RETRY_STATUS_RANGES,
 };

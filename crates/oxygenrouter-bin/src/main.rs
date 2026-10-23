@@ -118,11 +118,27 @@ async fn main() {
     }
 
     let selector = ChannelSelector::new(db.clone());
+    // `ChannelDisableThreshold` used to mean "consecutive failures" here while
+    // the reference means "seconds a health test may take". The streak now has
+    // its own key, so an instance that wrote the old meaning is carried over
+    // once, and the old key returns to the reference's shipped default.
+    if db
+        .get_setting("ChannelFailureStreakThreshold")
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        if let Some(old) = db.get_setting("ChannelDisableThreshold").ok().flatten() {
+            if let Ok(value) = old.trim().parse::<i64>() {
+                let _ = db.set_setting("ChannelFailureStreakThreshold", &value.max(0).to_string());
+                let _ = db.set_setting("ChannelDisableThreshold", "5");
+            }
+        }
+    }
     // Read from the settings table, which is now the single authority. Each key
     // falls back to its schema default, so an unset table behaves like a fresh
     // install rather than an empty configuration.
-    let (max_retries, user_agent, timeout_ms, backoff_base_ms, immediate_retry) = {
-        let max_retries = db.typed_setting("RetryTimes", 3_i64).max(0) as u32;
+    let (user_agent, timeout_ms) = {
         let configured_agent: String = db.typed_setting("UserAgent", String::new());
         let user_agent = if configured_agent.trim().is_empty() {
             format!("OxygenRouter/{}", env!("CARGO_PKG_VERSION"))
@@ -130,31 +146,13 @@ async fn main() {
             configured_agent
         };
         let timeout_ms = db.typed_setting("UpstreamTimeoutMs", 120_000_u64);
-        let backoff_base_ms = db.typed_setting("RetryIntervalMs", 500_i64).max(0) as u64;
-        // "none" reproduces NewAPI's immediate retry; anything else backs off.
-        let immediate_retry = db
-            .typed_setting("RetryBackoff", "exponential".to_string())
-            .eq_ignore_ascii_case("none");
-        (
-            max_retries,
-            user_agent,
-            timeout_ms,
-            backoff_base_ms,
-            immediate_retry,
-        )
+        (user_agent, timeout_ms)
     };
     let relay = RelayClient::new(user_agent, timeout_ms);
-    let scheduler = ChannelScheduler::new(selector, relay)
-        .with_max_retries(max_retries)
-        .with_backoff(
-            if immediate_retry { 0 } else { backoff_base_ms },
-            backoff_base_ms.saturating_mul(60).max(30_000),
-        )
-        // `ChannelDisableThreshold` was advertised and read by nothing: the
-        // scheduler carried a builder for it and always ran on the hard-coded
-        // default, so an operator could not make a flaky channel stand down
-        // sooner or later than the shipped five.
-        .with_disable_threshold(db.typed_setting("ChannelDisableThreshold", 5_i64).max(0) as u32);
+    // Every retry/disable decision comes from this one snapshot; the console
+    // replaces it through `AppState::reload_request_policy`.
+    let mut scheduler = ChannelScheduler::new(selector, relay);
+    scheduler.set_policy(oxygenrouter_proxy::RequestPolicy::from_db(&db));
 
     // The local token is now read from the table; the seeded value above is what
     // carries an existing instance's token across.
@@ -395,6 +393,68 @@ async fn main() {
         });
     }
 
+    // The scheduled channel health test. It is the recovery half of the
+    // auto-disable rule: without a pass that probes stood-down channels, a
+    // transient outage would remove a channel until an operator noticed. The
+    // wait is sliced and the interval re-read on every tick, for the same reason
+    // as the retention and model-sync loops above: reading the interval before a
+    // single long sleep would make a shortened setting take effect only after the
+    // old one had elapsed.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut last_pass: Option<std::time::Instant> = None;
+            loop {
+                ticker.tick().await;
+                let policy = state.scheduler.read().await.policy().clone();
+                if !policy.health.enabled {
+                    // Cleared while the schedule is off, so turning it back on
+                    // probes promptly instead of waiting out a stale interval.
+                    last_pass = None;
+                    continue;
+                }
+                let minutes = policy.health.interval_minutes.max(1.0);
+                let due = last_pass
+                    .map(|last| {
+                        last.elapsed() >= std::time::Duration::from_secs_f64(minutes * 60.0)
+                    })
+                    .unwrap_or(true);
+                if !due {
+                    continue;
+                }
+                last_pass = Some(std::time::Instant::now());
+                // The pass runs as a recorded task, so a manual trigger and a
+                // scheduled run share one code path and one "already running"
+                // guard.
+                let task =
+                    match oxygenrouter_webui::channel_health::start_channel_test(&state, None) {
+                        Ok(task) => task,
+                        Err(reason) => {
+                            // An active pass is the normal case when the manual
+                            // trigger just fired; it is not worth a log line.
+                            if !reason.contains("already") {
+                                eprintln!("[OxygenRouter] channel test skipped: {reason}");
+                            }
+                            continue;
+                        }
+                    };
+                let summary =
+                    oxygenrouter_webui::channel_health::run_channel_test_task(state.clone(), task)
+                        .await;
+                if summary.tested > 0 {
+                    println!(
+                        "[OxygenRouter] channel test: {} tested, {} ok, {} failed, {} disabled, {} recovered",
+                        summary.tested,
+                        summary.succeeded,
+                        summary.failed,
+                        summary.disabled,
+                        summary.enabled
+                    );
+                }
+            }
+        });
+    }
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/health", get(health_handler))

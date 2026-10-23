@@ -74,7 +74,7 @@ workspace is not a superset section-by-section:
 | models | 5 | partly (pricing tables, model sync interval) |
 | operations | 7 | partly (log retention, data export, check-in) |
 | security | 3 | partly (fetch/SSRF policy, audit log, login attempts) |
-| request-policies | 3 | **missing** (the reference's request-policy editor) |
+| request-policies | 3 | ours: one `request-policies` group in `/ui/system-settings` over the option catalogue -- retry budget and ranges, automatic disable/enable, the keyword list, the monitor knobs and the response-time threshold (2026-10-24) |
 | content | 7 | partly: Uptime Kuma, announcements, the FAQ and API addresses have options and a public read (`/api/site`); chat presets are editable and consumed by `/ui/chat2link`; drawing/Midjourney settings remain missing |
 
 ## 4. Work list, in the order that unblocks the most
@@ -126,6 +126,26 @@ workspace is not a superset section-by-section:
     metrics every 30 seconds, and only heartbeats older than 90 seconds can be
     removed. Verified live, including the browser delete flow.
 13. **OAuth + password reset** — the only auth surfaces still missing.
+14. ~~**Request policies**~~ — done 2026-10-24. The reference's
+    `request-policies` workspace (three sections: request checks, sessions and
+    retries, channel health) now exists as one console group over the option
+    catalogue, and every rule it edits is enforced on the live path:
+    `AutomaticRetryStatusCodes` drives the relay's retry decision through the
+    scheduler; `AutomaticDisableChannelEnabled` + `AutomaticDisableStatusCodes`
+    + `AutomaticDisableKeywords` stand a channel down through
+    `set_channel_auto_disabled`; `AutomaticEnableChannelEnabled` + the scheduled
+    `channel_test` task
+    (`POST /api/system-task/channel-test`, three modes, shared concurrency
+    knobs) brings back only what the engine itself disabled; retry budget,
+    backoff shape and the failure-streak threshold apply without a restart.
+    Verified live with `.devlogs/live_task/check_request_policies.ps1` (six
+    assertions against two mocks: failover on the shipped ranges, a narrowed
+    range surfacing the upstream 500 with the backup untouched, a status
+    disable with its stored reason, recovery through a health pass, a keyword
+    disable, and the 409 on a concurrent manual test). The request-check
+    section's sensitive-word filtering is the one sub-feature still open: the
+    three keys (`CheckSensitiveEnabled`, `CheckSensitiveOnPromptEnabled`,
+    `SensitiveWords`) exist in the reference and are not yet implemented here.
 
 ## 5. What "superset" will mean here
 

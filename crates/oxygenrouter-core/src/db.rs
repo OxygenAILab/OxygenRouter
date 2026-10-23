@@ -249,7 +249,11 @@ impl Database {
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 test_model  TEXT NOT NULL DEFAULT 'gpt-3.5-turbo',
                 created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                updated_at  TEXT NOT NULL,
+                auto_ban    INTEGER NOT NULL DEFAULT 1,
+                auto_disabled INTEGER NOT NULL DEFAULT 0,
+                status_reason TEXT NOT NULL DEFAULT '',
+                status_time TEXT
             );
 
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -568,6 +572,13 @@ impl Database {
             "ALTER TABLE channels ADD COLUMN balance_micros INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE channels ADD COLUMN last_test_at TEXT",
             "ALTER TABLE channels ADD COLUMN info TEXT NOT NULL DEFAULT '{}'",
+            // Automatic-disable bookkeeping, kept apart from `enabled` so the
+            // console can tell an operator's disable from the scheduler's and
+            // only the latter may be lifted by a passing test.
+            "ALTER TABLE channels ADD COLUMN auto_ban INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE channels ADD COLUMN auto_disabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE channels ADD COLUMN status_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE channels ADD COLUMN status_time TEXT",
             // A long-lived dashboard credential, distinct from a login session:
             // the reference stores it on the user row (`users.access_token`) and
             // hands it to the client once, on generation.
@@ -597,14 +608,15 @@ impl Database {
     pub fn upsert_channel(&self, ch: &Channel) -> SqliteResult<()> {
         let conn = self.conn.lock();
         conn.execute(
-            r#"INSERT INTO channels (id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
+            r#"INSERT INTO channels (id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at,auto_ban,auto_disabled,status_reason,status_time)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
                ON CONFLICT(id) DO UPDATE SET
                    name=?2, provider=?3, base_url=?4, api_key=?5, priority=?6, weight=?7,
                    enabled=?8, test_model=?9, group_name=?10, tags=?11, model_list=?12, response_headers=?13, status_code_mapping=?14, override_parameters=?15, balance_micros=?16, last_test_at=?17, info=?18, updated_at=?20"#,
             params![
                 ch.id, ch.name, ch.provider, ch.base_url, ch.api_key, ch.priority, ch.weight,
-                ch.enabled as i32, ch.test_model, ch.group_name, json_string(&ch.tags), json_string(&ch.model_list), json_string(&ch.response_headers), json_string(&ch.status_code_mapping), json_string(&ch.override_parameters), ch.balance_micros, ch.last_test_at.map(|v| v.to_rfc3339()), json_string(&ch.info), ch.created_at.to_rfc3339(), ch.updated_at.to_rfc3339()
+                ch.enabled as i32, ch.test_model, ch.group_name, json_string(&ch.tags), json_string(&ch.model_list), json_string(&ch.response_headers), json_string(&ch.status_code_mapping), json_string(&ch.override_parameters), ch.balance_micros, ch.last_test_at.map(|v| v.to_rfc3339()), json_string(&ch.info), ch.created_at.to_rfc3339(), ch.updated_at.to_rfc3339(),
+                ch.auto_ban as i32, ch.auto_disabled as i32, ch.status_reason, ch.status_time.map(|v| v.to_rfc3339())
             ],
         )?;
         Ok(())
@@ -613,7 +625,7 @@ impl Database {
     pub fn list_channels(&self) -> SqliteResult<Vec<Channel>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
-            "SELECT id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at
+            "SELECT id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at,auto_ban,auto_disabled,status_reason,status_time
              FROM channels ORDER BY priority DESC, weight DESC",
         )?;
         let rows = s.query_map([], |r| {
@@ -642,6 +654,10 @@ impl Database {
                 updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(19)?)
                     .unwrap()
                     .with_timezone(&Utc),
+                auto_ban: r.get::<_, i32>(20)? != 0,
+                auto_disabled: r.get::<_, i32>(21)? != 0,
+                status_reason: r.get(22)?,
+                status_time: optional_datetime(r.get(23)?),
             })
         })?;
         rows.collect()
@@ -650,7 +666,7 @@ impl Database {
     pub fn get_channel(&self, id: &str) -> SqliteResult<Option<Channel>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
-            "SELECT id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at
+            "SELECT id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at,auto_ban,auto_disabled,status_reason,status_time
              FROM channels WHERE id=?1",
         )?;
         let mut rows = s.query(params![id])?;
@@ -680,6 +696,10 @@ impl Database {
                 updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(19)?)
                     .unwrap()
                     .with_timezone(&Utc),
+                auto_ban: r.get::<_, i32>(20)? != 0,
+                auto_disabled: r.get::<_, i32>(21)? != 0,
+                status_reason: r.get(22)?,
+                status_time: optional_datetime(r.get(23)?),
             }))
         } else {
             Ok(None)
@@ -690,6 +710,50 @@ impl Database {
         self.conn
             .lock()
             .execute("DELETE FROM channels WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Stand a channel down after a failure the request policy matched.
+    ///
+    /// Only an enabled, not-already-auto-disabled channel changes: a manual
+    /// disable is an operator decision this flow must not overwrite, and a
+    /// repeated failure on a channel that is already down has nothing to do.
+    /// The `WHERE` clause makes "did we actually disable it" a fact about the
+    /// update rather than a read-then-write race.
+    pub fn set_channel_auto_disabled(&self, id: &str, reason: &str) -> SqliteResult<bool> {
+        let at = Utc::now().to_rfc3339();
+        let changed = self.conn.lock().execute(
+            "UPDATE channels SET enabled=0, auto_disabled=1, status_reason=?2, status_time=?3, updated_at=?3 \
+             WHERE id=?1 AND enabled=1 AND auto_disabled=0",
+            params![id, reason, at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Lift an automatic disable after a passing test.
+    ///
+    /// Deliberately narrower than "enable this channel": rows an operator
+    /// disabled carry `auto_disabled=0` and are left alone, so a health test
+    /// cannot revive something a human took down.
+    pub fn enable_channel_from_auto(&self, id: &str) -> SqliteResult<bool> {
+        let changed = self.conn.lock().execute(
+            "UPDATE channels SET enabled=1, auto_disabled=0, status_reason='', status_time=NULL, updated_at=?2 \
+             WHERE id=?1 AND auto_disabled=1",
+            params![id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Stamp the moment a test last probed this channel.
+    ///
+    /// A targeted update rather than an `upsert_channel` round-trip: the probe
+    /// holds a snapshot of the channel from before the request, and writing that
+    /// whole row back would undo an edit an operator made while the test ran.
+    pub fn record_channel_test(&self, id: &str) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "UPDATE channels SET last_test_at=?2 WHERE id=?1",
+            params![id, Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -758,7 +822,7 @@ impl Database {
     pub fn get_enabled_channels(&self) -> SqliteResult<Vec<Channel>> {
         let conn = self.conn.lock();
         let mut s = conn.prepare(
-            "SELECT id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at
+            "SELECT id,name,provider,base_url,api_key,priority,weight,enabled,test_model,group_name,tags,model_list,response_headers,status_code_mapping,override_parameters,balance_micros,last_test_at,info,created_at,updated_at,auto_ban,auto_disabled,status_reason,status_time
              FROM channels WHERE enabled=1 ORDER BY priority DESC, weight DESC",
         )?;
         let rows = s.query_map([], |r| {
@@ -787,6 +851,10 @@ impl Database {
                 updated_at: DateTime::parse_from_rfc3339(&r.get::<_, String>(19)?)
                     .unwrap()
                     .with_timezone(&Utc),
+                auto_ban: r.get::<_, i32>(20)? != 0,
+                auto_disabled: r.get::<_, i32>(21)? != 0,
+                status_reason: r.get(22)?,
+                status_time: optional_datetime(r.get(23)?),
             })
         })?;
         rows.collect()
@@ -4678,6 +4746,61 @@ mod tests {
         Database::new(":memory:").expect("in-memory database")
     }
 
+    /// The automatic disable flow moves `enabled` but owns only the state it
+    /// set: it never touches a row it did not disable, and a recovery may only
+    /// lift a disable that the engine itself applied.
+    #[test]
+    fn auto_disable_round_trip_keeps_manual_state_apart() {
+        let db = database();
+        let mut channel = Channel::new(
+            "flaky".to_string(),
+            "http://127.0.0.1:9".to_string(),
+            "k".to_string(),
+            1,
+            1,
+            "m".to_string(),
+        );
+        channel.model_list = vec!["m".to_string()];
+        db.upsert_channel(&channel).unwrap();
+
+        assert!(db
+            .set_channel_auto_disabled(&channel.id, "upstream HTTP 401")
+            .unwrap());
+        let stored = db.get_channel(&channel.id).unwrap().unwrap();
+        assert!(!stored.enabled);
+        assert!(stored.auto_disabled);
+        assert_eq!(stored.status_reason, "upstream HTTP 401");
+        assert!(stored.status_time.is_some());
+        assert!(db.get_enabled_channels().unwrap().is_empty());
+
+        // A second failure on an already-disabled row changes nothing.
+        assert!(!db
+            .set_channel_auto_disabled(&channel.id, "again")
+            .unwrap());
+        assert_eq!(
+            db.get_channel(&channel.id).unwrap().unwrap().status_reason,
+            "upstream HTTP 401"
+        );
+
+        assert!(db.enable_channel_from_auto(&channel.id).unwrap());
+        let recovered = db.get_channel(&channel.id).unwrap().unwrap();
+        assert!(recovered.enabled);
+        assert!(!recovered.auto_disabled);
+        assert!(recovered.status_reason.is_empty());
+        assert!(recovered.status_time.is_none());
+        // A row an operator disabled is not the engine's to re-enable.
+        assert!(!db.enable_channel_from_auto(&channel.id).unwrap());
+
+        let mut manual = channel.clone();
+        manual.id = "manual".to_string();
+        manual.enabled = false;
+        manual.auto_disabled = false;
+        db.upsert_channel(&manual).unwrap();
+        assert!(!db.set_channel_auto_disabled(&manual.id, "nope").unwrap());
+        assert!(!db.enable_channel_from_auto(&manual.id).unwrap());
+        assert!(!db.get_channel(&manual.id).unwrap().unwrap().enabled);
+    }
+
     #[test]
     fn password_authentication_and_session_lookup() {
         let db = database();
@@ -5338,6 +5461,16 @@ mod tests {
 impl ChannelSelector {
     pub fn new(db: std::sync::Arc<Database>) -> Self {
         Self { db }
+    }
+
+    /// The database behind this selector.
+    ///
+    /// The scheduler owns the auto-disable flow (it is the component that sees
+    /// the upstream failure), so it needs the same store the selection reads;
+    /// a second `Arc<Database>` passed around would be a second way to reach the
+    /// same file.
+    pub fn database(&self) -> &std::sync::Arc<Database> {
+        &self.db
     }
 
     pub fn list_enabled(&self) -> SqliteResult<Vec<Channel>> {

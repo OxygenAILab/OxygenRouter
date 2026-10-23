@@ -2428,7 +2428,7 @@ async fn plugin_bridge(
                         .scheduler
                         .read()
                         .await
-                        .note_attempt_failure(&channel.id);
+                        .record_task_failure(&channel, error.status, &error.message);
                     if crossed {
                         eprintln!(
                             "[OxygenRouter] channel {} hit the auto-disable threshold on a task submission; excluding it from selection",
@@ -5455,10 +5455,12 @@ mod tests {
             .expect("second");
         assert_eq!(second.id, backup.id, "a retry moves to the other channel");
 
-        // The scheduler's default threshold is five consecutive failures.
+        // The request policy's shipped streak threshold is three consecutive
+        // failures (an OxygenRouter extension; the reference disables on the
+        // first matched failure instead of counting).
         rt.block_on(async {
             let scheduler = state.scheduler.read().await;
-            for _ in 0..5 {
+            for _ in 0..3 {
                 scheduler.note_attempt_failure(&primary.id);
             }
         });

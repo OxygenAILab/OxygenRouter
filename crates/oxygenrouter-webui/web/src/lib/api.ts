@@ -218,6 +218,8 @@ export interface OptionEntry {
     | "operations"
     | "security"
     | "models"
+    /** Request retry, channel disable and health-test policy. */
+    | "request_policies"
     /** Read once at startup, so a change needs a restart. */
     | "bootstrap";
   kind: "string" | "int" | "bool" | "float";

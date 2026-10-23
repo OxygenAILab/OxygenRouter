@@ -130,6 +130,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/system-task/log-cleanup",
             post(crate::system_tasks::create_log_cleanup),
         )
+        // The manual channel health test, matching the reference's
+        // `GET /api/channel/test` (`router/channel-router.go:47`). It shares the
+        // system-task tree, so its run is durable and root-only like the other
+        // maintenance work.
+        .route(
+            "/api/system-task/channel-test",
+            post(crate::channel_health::create_channel_test),
+        )
         .route(
             "/api/system-task/current",
             get(crate::system_tasks::current_task),
@@ -2355,6 +2363,13 @@ async fn create_channel(
         weight: ch.weight,
         enabled: ch.enabled,
         test_model: ch.test_model,
+        // A fresh channel opts in to auto-ban like the reference's DB default
+        // (`model/channel.go:46`), but only the engine ever sets the
+        // auto-disabled state, so a client cannot create a channel pre-banned.
+        auto_ban: ch.auto_ban,
+        auto_disabled: false,
+        status_reason: String::new(),
+        status_time: None,
         group_name: ch.group_name,
         tags: ch.tags,
         model_list: ch.model_list,
@@ -2416,6 +2431,20 @@ async fn update_channel(
     // even if the client sends a different value.
     ch.created_at = existing.created_at;
     ch.updated_at = chrono::Utc::now();
+    // A change to the enable switch is a human decision that supersedes the
+    // automatic flow: clearing the marker is what stops a later health test
+    // from treating the channel as auto-recoverable (enable) or from resurrecting
+    // one the operator took down (disable). When the switch did not change, the
+    // engine-owned fields are preserved rather than trusted from the client.
+    if ch.enabled != existing.enabled {
+        ch.auto_disabled = false;
+        ch.status_reason.clear();
+        ch.status_time = None;
+    } else {
+        ch.auto_disabled = existing.auto_disabled;
+        ch.status_reason = existing.status_reason.clone();
+        ch.status_time = existing.status_time;
+    }
     Json(match s.db.upsert_channel(&ch) {
         // Mask the response, so an update cannot leak what the read routes walk
         // out of their way to withhold.
@@ -2444,6 +2473,7 @@ async fn test_channel(
         Err(e) => return Json(ApiResponse::err(e.to_string())),
     };
     let result = oxygenrouter_proxy::test_channel(&ch).await;
+    let _ = s.db.record_channel_test(&ch.id);
     Json(ApiResponse::ok(result))
 }
 
@@ -4703,6 +4733,25 @@ async fn update_option(
             if schema.key == "ChannelAffinity" {
                 s.reload_affinity().await;
             }
+            // The request policy is one snapshot shared by retry, disable and
+            // the health test, so every key that feeds it rebuilds the whole
+            // snapshot instead of one field being patched in place.
+            if matches!(
+                schema.key,
+                "RetryTimes"
+                    | "RetryIntervalMs"
+                    | "RetryBackoff"
+                    | "ChannelFailureStreakThreshold"
+                    | "ChannelDisableThreshold"
+                    | "AutomaticRetryStatusCodes"
+                    | "AutomaticDisableStatusCodes"
+                    | "AutomaticDisableKeywords"
+                    | "AutomaticDisableChannelEnabled"
+                    | "AutomaticEnableChannelEnabled"
+            ) || schema.key.starts_with("monitor_setting.")
+            {
+                s.reload_request_policy().await;
+            }
             Json(ApiResponse::ok("updated"))
         }
         Err(error) => Json(ApiResponse::err(error.to_string())),
@@ -5208,6 +5257,10 @@ mod credential_tests {
             weight: 1,
             enabled: true,
             test_model: String::new(),
+            auto_ban: true,
+            auto_disabled: false,
+            status_reason: String::new(),
+            status_time: None,
             group_name: "default".into(),
             tags: Vec::new(),
             model_list: Vec::new(),

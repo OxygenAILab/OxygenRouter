@@ -24,6 +24,27 @@ pub struct Channel {
     pub enabled: bool,
     #[serde(default = "default_test_model")]
     pub test_model: String,
+    /// Whether a failing call may stand this channel down.
+    ///
+    /// Mirrors the reference's per-channel `auto_ban` switch
+    /// (`model/channel.go:46`, DB default 1): a fresh channel opts in, and an
+    /// operator can pin a channel in place by clearing it.
+    #[serde(default = "default_true")]
+    pub auto_ban: bool,
+    /// Set by the automatic disable flow, never by the operator.
+    ///
+    /// Kept apart from `enabled` because the recovery side needs to know *why*
+    /// a channel is down: an operator's manual disable must not be undone by a
+    /// passing test, while an automatic one may be. The reference models the
+    /// same distinction with its status enum (1 enabled / 2 manual / 3 auto).
+    #[serde(default)]
+    pub auto_disabled: bool,
+    /// Why the channel was auto-disabled, shown in the console.
+    #[serde(default)]
+    pub status_reason: String,
+    /// When the channel was auto-disabled.
+    #[serde(default)]
+    pub status_time: Option<DateTime<Utc>>,
     #[serde(default = "default_group_name")]
     pub group_name: String,
     #[serde(default)]
@@ -160,6 +181,10 @@ impl Channel {
             weight,
             enabled: true,
             test_model,
+            auto_ban: true,
+            auto_disabled: false,
+            status_reason: String::new(),
+            status_time: None,
             group_name: default_group_name(),
             tags: Vec::new(),
             model_list: Vec::new(),

@@ -18,6 +18,7 @@ const SECTION_ORDER: OptionEntry["section"][] = [
   "operations",
   "security",
   "models",
+  "request_policies",
   "bootstrap",
 ];
 

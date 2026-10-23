@@ -27,6 +27,9 @@ pub enum OptionSection {
     Operations,
     Security,
     Models,
+    /// The reference's `request-policies` workspace: how a failing request is
+    /// retried, when a channel stands down, and how it is tested back up.
+    RequestPolicies,
     /// Values read once at startup, which therefore need a restart to take
     /// effect. Kept in their own group so the console can say so plainly instead
     /// of presenting them beside settings that apply immediately.
@@ -118,12 +121,32 @@ pub const OPTION_SCHEMA: &[OptionSchema] = &[
     schema!("SessionTtlDays", Auth, Int, "7", "Session lifetime in days"),
     schema!("MinPasswordLength", Auth, Int, "8", "Minimum accepted password length"),
     // Routing
-    // Read once when the scheduler is built, so they belong with the other
-    // startup values rather than beside the routing rules that apply live.
-    schema!("RetryTimes", Bootstrap, Int, "3", "How many times a failed channel is retried"),
-    schema!("RetryIntervalMs", Bootstrap, Int, "500", "Base delay between retries"),
-    schema!("RetryBackoff", Bootstrap, String, "exponential", "fixed | linear | exponential"),
-    schema!("ChannelDisableThreshold", Bootstrap, Int, "3", "Consecutive failures before auto-disabling a channel"),
+    // --- Request policies (the reference's `request-policies` workspace) -----
+    // The retry and backoff values used to be bootstrap-only: they were read
+    // once when the scheduler was built, so an operator's edit did nothing
+    // until a restart while the reference applies them on the next request.
+    // They now live here and are pushed into the running scheduler by
+    // `AppState::reload_request_policy`.
+    schema!("RetryTimes", RequestPolicies, Int, "3", "Additional attempts after the first, per request"),
+    schema!("RetryIntervalMs", RequestPolicies, Int, "500", "Base delay between retries"),
+    schema!("RetryBackoff", RequestPolicies, String, "exponential", "none | fixed | linear | exponential"),
+    schema!("AutomaticRetryStatusCodes", RequestPolicies, String, "100-199,300-399,401-407,409-499,500-503,505-523,525-599", "Status codes and ranges that are retried on another channel; 2xx, 504 and 524 are always excluded"),
+    // This key kept its old spelling when the scheduler's in-memory streak moved
+    // here: `ChannelDisableThreshold` now means what the reference means by it
+    // (the health test's response-time threshold, below), and the extension that
+    // stops selecting a channel after consecutive failures has its own name.
+    // `main.rs` carries an existing stored value over on first start.
+    schema!("ChannelFailureStreakThreshold", RequestPolicies, Int, "3", "Consecutive failures before the scheduler stops selecting a channel (0 disables; OxygenRouter extension)"),
+    schema!("ChannelDisableThreshold", RequestPolicies, Float, "5", "Seconds; a scheduled channel test slower than this is treated as a failure (0 or empty disables)"),
+    schema!("AutomaticDisableChannelEnabled", RequestPolicies, Bool, "false", "Disable a channel after a matched failure (per-channel auto-ban still applies)"),
+    schema!("AutomaticDisableStatusCodes", RequestPolicies, String, "401", "Status codes and ranges that disable a channel"),
+    schema!("AutomaticDisableKeywords", RequestPolicies, String, "Your credit balance is too low\nThis organization has been disabled.\nYou exceeded your current quota\nPermission denied\nThe security token included in the request is invalid\nOperation not allowed\nYour account is not authorized", "One keyword per line; a failure whose message contains one disables the channel"),
+    schema!("AutomaticEnableChannelEnabled", RequestPolicies, Bool, "false", "Re-enable an auto-disabled channel when a test succeeds"),
+    schema!("monitor_setting.auto_test_channel_enabled", RequestPolicies, Bool, "false", "Run the scheduled channel health test"),
+    schema!("monitor_setting.auto_test_channel_minutes", RequestPolicies, Float, "10", "Minutes between scheduled channel health tests"),
+    schema!("monitor_setting.channel_test_mode", RequestPolicies, String, "scheduled_all", "scheduled_all | auto_ban_only | passive_recovery"),
+    schema!("monitor_setting.channel_test_concurrency", RequestPolicies, Int, "1", "Channels tested at once, 1-32"),
+    // --- General routing -----------------------------------------------------
     // Consulted per request, so it lives with the routing rules.
     schema!("DefaultGroup", Routing, String, "default", "Group used when no token group is set"),
     // A structured setting, not the boolean this key used to be. The reference's
@@ -303,6 +326,56 @@ pub fn validate_for_key(key: &str, kind: OptionKind, value: &str) -> Result<(), 
         "ApiInfo" | "Announcements" | "Faq" | "UptimeKumaGroups" => {
             validate_json_array(key, value)
         }
+        // The reference refuses a malformed rule string while the editor is
+        // still open (`controller/option.go:377,386`); the same parser the proxy
+        // reads with is used here so the two can never disagree.
+        "AutomaticRetryStatusCodes" | "AutomaticDisableStatusCodes" => {
+            crate::status_ranges::parse_http_status_ranges(value).map(|_| ())
+        }
+        "monitor_setting.channel_test_mode" => match value.trim() {
+            "scheduled_all" | "auto_ban_only" | "passive_recovery" => Ok(()),
+            other => Err(format!(
+                "channel test mode must be scheduled_all, auto_ban_only or passive_recovery, got {other:?}"
+            )),
+        },
+        "monitor_setting.channel_test_concurrency" => {
+            let concurrency = value
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("expected an integer, got {value:?}"))?;
+            if !(1..=32).contains(&concurrency) {
+                return Err(format!(
+                    "channel test concurrency must be between 1 and 32, got {concurrency}"
+                ));
+            }
+            Ok(())
+        }
+        "monitor_setting.auto_test_channel_minutes" | "ChannelDisableThreshold" => {
+            let number = value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("expected a number, got {value:?}"))?;
+            if number < 0.0 || !number.is_finite() {
+                return Err(format!("{key} must be a non-negative number, got {value:?}"));
+            }
+            Ok(())
+        }
+        "RetryTimes" | "RetryIntervalMs" | "ChannelFailureStreakThreshold" => {
+            let number = value
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("expected an integer, got {value:?}"))?;
+            if number < 0 {
+                return Err(format!("{key} must not be negative, got {number}"));
+            }
+            Ok(())
+        }
+        "RetryBackoff" => match value.trim() {
+            "none" | "fixed" | "linear" | "exponential" => Ok(()),
+            other => Err(format!(
+                "retry backoff must be none, fixed, linear or exponential, got {other:?}"
+            )),
+        },
         _ => Ok(()),
     }
 }
@@ -330,5 +403,43 @@ mod tests {
         assert!(validate_for_key("ApiInfo", OptionKind::String, "[]").is_ok());
         assert!(validate_for_key("ApiInfo", OptionKind::String, "not json").is_err());
         assert!(validate_for_key("SiteName", OptionKind::String, "not json").is_ok());
+    }
+
+    #[test]
+    fn request_policy_options_are_validated_like_the_reference() {
+        // Rule strings go through the same parser the proxy reads with.
+        assert!(validate_for_key(
+            "AutomaticRetryStatusCodes",
+            OptionKind::String,
+            "429,500-503"
+        )
+        .is_ok());
+        assert!(
+            validate_for_key("AutomaticRetryStatusCodes", OptionKind::String, "600").is_err()
+        );
+        assert!(
+            validate_for_key("AutomaticDisableStatusCodes", OptionKind::String, "503-500")
+                .is_err()
+        );
+        // The monitor knobs mirror `ValidateChannelTestConcurrency` and the
+        // three accepted test modes.
+        assert!(
+            validate_for_key("monitor_setting.channel_test_concurrency", OptionKind::Int, "1")
+                .is_ok()
+        );
+        assert!(
+            validate_for_key("monitor_setting.channel_test_concurrency", OptionKind::Int, "33")
+                .is_err()
+        );
+        assert!(
+            validate_for_key("monitor_setting.channel_test_mode", OptionKind::String, "scheduled_all")
+                .is_ok()
+        );
+        assert!(
+            validate_for_key("monitor_setting.channel_test_mode", OptionKind::String, "sometimes")
+                .is_err()
+        );
+        assert!(validate_for_key("RetryTimes", OptionKind::Int, "-1").is_err());
+        assert!(validate_for_key("RetryBackoff", OptionKind::String, "jittered").is_err());
     }
 }

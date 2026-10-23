@@ -6,6 +6,7 @@ mod client;
 pub mod affinity;
 mod dispatch;
 pub mod limits;
+pub mod policy;
 mod router;
 mod scheduler;
 pub mod selection;
@@ -15,9 +16,10 @@ mod upstream;
 
 pub use client::UpstreamClient;
 pub use dispatch::{relay_format_for_path, RelayClient, RelayOutcome};
+pub use policy::{BackoffMode, ChannelTestMode, HealthTestPolicy, RequestPolicy};
 pub use router::{ModelRouter, RouteDecision};
 pub use scheduler::ChannelScheduler;
-pub use tester::test_channel;
+pub use tester::{probe_channel, test_channel, ChannelProbe};
 pub use upstream::{ModelContextExceeded, ProxyError, ProxyRequest, ProxyResult};
 /// Re-exported so downstream crates can name the usage type without depending on
 /// `oxygenrouter-relay` directly.

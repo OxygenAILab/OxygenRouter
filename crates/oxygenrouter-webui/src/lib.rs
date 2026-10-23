@@ -5,6 +5,7 @@
 pub mod api;
 pub mod artifact_limit;
 pub mod billing_store;
+pub mod channel_health;
 pub mod embed;
 pub mod model_list;
 pub mod perf_metrics;
